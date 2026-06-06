@@ -10,7 +10,7 @@ use uart::Uart;
 
 core::arch::global_asm!(include_str!("arch/aarch64/boot.S"));
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_main() -> ! {
     // Instancia o nosso driver UART
     let mut serial = Uart;
@@ -34,7 +34,7 @@ pub extern "C" fn kernel_main() -> ! {
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     // Caso o kernel entre em colapso futuramente, avisa pela UART
-    let mut serial = Uart;
+    let serial = Uart;
     let _ = serial.write_string("\n!!! KERNEL PANIC !!!\n");
     
     loop {
