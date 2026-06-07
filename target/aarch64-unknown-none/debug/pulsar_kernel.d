@@ -1,1 +1,0 @@
-/home/ubuntu/Documentos/GitHub/Pulsar_OS/target/aarch64-unknown-none/debug/pulsar_kernel: /home/ubuntu/Documentos/GitHub/Pulsar_OS/kernel/src/arch/aarch64/boot.S /home/ubuntu/Documentos/GitHub/Pulsar_OS/kernel/src/main.rs /home/ubuntu/Documentos/GitHub/Pulsar_OS/kernel/src/uart.rs
