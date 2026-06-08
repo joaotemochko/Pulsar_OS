@@ -1,15 +1,20 @@
 #![no_std]
 #![no_main]
 
+mod context;
 mod cpu;
 mod exceptions;
 mod frame_allocator;
+mod gic;
+mod irq;
+mod loader;
 mod mmu;
+mod process;
+mod pulse;
 mod syscall;
+mod timer;
 mod uart;
 mod user;
-mod loader;
-mod pulse;
 
 use core::arch::asm;
 use core::fmt::Write;
@@ -44,23 +49,24 @@ pub extern "C" fn kernel_main() -> ! {
     serial.write_string("Ligando MMU agora...\n");
     unsafe { mmu::init() };
     let _ = write!(serial, "MMU ativada: M = {}\n", mmu::is_enabled() as u32);
-    let _ = write!(serial, "Frames livres apos montar tabelas: {}\n", frame_allocator::free_count());
 
-    serial.write_string("Carregando programa .pulse...\n");
-    let entry = unsafe {
-        loader::load_pulse(&user::pulse_file_start as *const u8)
-    };
+    // GIC + timer (preempcao)
+    serial.write_string("Inicializando GIC + timer...\n");
+    gic::init();
+    gic::enable_irq(timer::TIMER_IRQ);
+    timer::arm(10);
+    unsafe { asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags)); }
 
-    match entry {
-        Some(ep) => {
-            let _ = write!(serial, "Saltando para EL0 no entry {:#x}...\n", ep);
-            unsafe { cpu::enter_el0(ep, mmu::USER_STACK_TOP) };
-        }
-        None => {
-            serial.write_string("[loader] FALHOU ao carregar .pulse\n");
-            loop { unsafe { asm!("wfe") }; }
-        }
-    }
+    // Cria dois processos que NAO cooperam (loops infinitos sem yield)
+    serial.write_string("Carregando processos A e B...\n");
+    let entry_a = unsafe { loader::load_pulse(&user::pulse_a_start as *const u8) }.unwrap();
+    let _pid_a = process::create(entry_a, 0x4010_2000);
+    let entry_b = unsafe { loader::load_pulse(&user::pulse_b_start as *const u8) }.unwrap();
+    let _pid_b = process::create(entry_b, 0x4011_2000);
+
+    serial.write_string("Preempcao ativa. Os processos NAO dao yield — o timer forca a troca:\n");
+    let first = unsafe { process::first_context() };
+    unsafe { cpu::start_first(&first) };
 }
 
 #[panic_handler]

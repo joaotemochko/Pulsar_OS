@@ -1,42 +1,62 @@
 use crate::uart::Uart;
+use crate::context::Context;
+use crate::process;
 use core::fmt::Write;
 use core::slice;
 use core::str;
 
 const SYS_WRITE: u64 = 1;
+const SYS_YIELD: u64 = 2;
 
-/// Classificador de exceções síncronas de EL0 (indice 8 da tabela de vetores).
-/// Decide entre syscall (SVC) e fault, lendo o EC do ESR.
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_el0_sync_handler(
-    arg1: u64, arg2: u64, arg3: u64, syscall_num: u64, esr: u64,
-) -> i64 {
-    let ec = (esr >> 26) & 0x3F;
-    if ec == 0x15 {
-        // SVC: syscall de verdade
-        rust_syscall_dispatch(arg1, arg2, arg3, syscall_num)
-    } else {
-        // Qualquer outra exceção sincrona de EL0 = fault do programa
+pub extern "C" fn rust_el0_sync_handler(frame: *mut Context) {
+    let ctx = unsafe { &mut *frame };
+
+    let esr_val: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, esr_el1", out(reg) esr_val,
+            options(nomem, nostack, preserves_flags));
+    }
+    let ec = (esr_val >> 26) & 0x3F;
+
+    if ec != 0x15 {
+        // Qualquer exceção sincrona de EL0 que NAO seja SVC = fault do programa.
+        // Reporta, mata o processo faltoso e troca para o proximo.
         let mut serial = Uart;
         let far: u64;
         unsafe {
             core::arch::asm!("mrs {}, far_el1", out(reg) far,
                 options(nomem, nostack, preserves_flags));
         }
-        let _ = write!(serial,
-            "\n[FAULT EL0] programa violou permissao! EC={:#x} FAR={:#x}\n", ec, far);
-        let _ = write!(serial,
-            "  (data abort em pagina R+X = tentativa de ESCRITA em codigo -> W^X funcionou!)\n");
-        loop { unsafe { core::arch::asm!("wfe") }; }
-    }
-}
+        let _ = write!(serial, "\n[FAULT EL0] EC={:#x} FAR={:#x} — matando processo.\n", ec, far);
 
-/// Dispatcher de syscalls propriamente dito.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_syscall_dispatch(arg1: u64, arg2: u64, _arg3: u64, num: u64) -> i64 {
+        let (dead, has_next) = unsafe { process::exit_current(frame) };
+        let _ = write!(serial, "[kernel] processo {} terminado.\n", dead);
+
+        if !has_next {
+            let _ = write!(serial, "[kernel] nenhum processo restante. Sistema ocioso.\n");
+            loop { unsafe { core::arch::asm!("wfe") }; }
+        }
+        // ha proximo: exit_current ja colocou o contexto dele no frame;
+        // o RESTORE_CONTEXT/eret do vetor vai retomar esse proximo processo.
+        return;
+    }
+
+    // SVC: syscall de verdade. Numero em x8, args em x0..x2 (lidos do frame).
+    let num = ctx.x[8];
+    let a1 = ctx.x[0];
+    let a2 = ctx.x[1];
+
     match num {
-        SYS_WRITE => sys_write(arg1, arg2),
-        _ => -1,
+        SYS_WRITE => {
+            ctx.x[0] = sys_write(a1, a2) as u64;
+        }
+        SYS_YIELD => {
+            unsafe { process::schedule(frame); }
+        }
+        _ => {
+            ctx.x[0] = (-1i64) as u64;
+        }
     }
 }
 

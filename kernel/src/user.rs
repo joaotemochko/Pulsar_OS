@@ -1,57 +1,79 @@
 use core::arch::global_asm;
 
-// Um arquivo .pulse COMPLETO montado a mao em assembly:
-// [PulseHeader][PulseSegment][codigo+dados do programa]
-// O programa: SYS_WRITE de uma mensagem, depois loop.
+// Processo A: imprime "A" em loop infinito, SEM yield (nao coopera).
 global_asm!(
     ".section .rodata",
-    ".global pulse_file_start",
-    ".global pulse_file_end",
+    ".global pulse_a_start",
     ".balign 8",
-    "pulse_file_start:",
-    // --- PulseHeader (24 bytes) ---
-    "    .word 0x534C5550",        // magic "PULS"
-    "    .hword 1",                // version
-    "    .hword 1",                // seg_count = 1
-    "    .quad  0x40100000",       // entry (VA do entry point)
-    "    .word  (seg_table - pulse_file_start)", // seg_table_off
-    "    .word  0",                // reserved
-    // --- PulseSegment (24 bytes) ---
-    "seg_table:",
-    "    .word  (prog_code - pulse_file_start)",  // file_off
-    "    .word  (prog_end - prog_code)",          // file_size
-    "    .quad  0x40100000",       // vaddr
-    "    .word  (prog_end - prog_code)",          // mem_size
-    "    .word  0b101",            // flags: R+X (sem W -> W^X!)
-    // --- codigo do programa ---
+    "pulse_a_start:",
+    "    .word 0x534C5550",
+    "    .hword 1",
+    "    .hword 1",
+    "    .quad  0x40100000",
+    "    .word  (a_seg - pulse_a_start)",
+    "    .word  0",
+    "a_seg:",
+    "    .word  (a_code - pulse_a_start)",
+    "    .word  (a_end - a_code)",
+    "    .quad  0x40100000",
+    "    .word  (a_end - a_code)",
+    "    .word  0b101",
     ".balign 4",
-    "prog_code:",
+    "a_code:",
+    "a_loop:",
     "    mov   x8, #1",
-    "    adr   x0, prog_msg",
-    "    mov   x1, #(prog_msg_end - prog_msg)",
-    "    svc   #0",                  // imprime a mensagem (prova que rodou)
-    // --- TESTE W^X: tenta escrever na propria pagina de codigo ---
-    "    adr   x2, prog_code",       // x2 = endereco do proprio codigo (R+X, sem W)
-    "    mov   x3, #0xDEAD",
-    "    str   x3, [x2]",            // ESCRITA em pagina nao-gravavel -> deve faultar
-    // se chegar aqui, o W^X FALHOU (nao deveria executar):
-    "    mov   x8, #1",
-    "    adr   x0, fail_msg",
-    "    mov   x1, #(fail_msg_end - fail_msg)",
+    "    adr   x0, a_msg",
+    "    mov   x1, #1",
     "    svc   #0",
-    "1:  wfe",
-    "    b     1b",
+    // espera um pouco (busy loop) so pra nao floodar a tela rapido demais
+    "    mov   x9, #0x400000",
+    "a_delay:",
+    "    sub   x9, x9, #1",
+    "    cbnz  x9, a_delay",
+    "    b     a_loop",          // <- SEM yield: loop infinito puro
     ".balign 4",
-    "prog_msg:",
-    "    .ascii \"  [.pulse/EL0] Programa carregado pelo loader!\\n\"",
-    "prog_msg_end:",
-    "fail_msg:",
-    "    .ascii \"  [.pulse/EL0] ERRO: escrita em codigo funcionou (W^X FALHOU)!\\n\"",
-    "fail_msg_end:",
-    "prog_end:",
+    "a_msg:",
+    "    .ascii \"A\"",
+    "a_end:",
+);
+
+// Processo B: imprime "B" em loop infinito, SEM yield.
+global_asm!(
+    ".section .rodata",
+    ".global pulse_b_start",
+    ".balign 8",
+    "pulse_b_start:",
+    "    .word 0x534C5550",
+    "    .hword 1",
+    "    .hword 1",
+    "    .quad  0x40110000",
+    "    .word  (b_seg - pulse_b_start)",
+    "    .word  0",
+    "b_seg:",
+    "    .word  (b_code - pulse_b_start)",
+    "    .word  (b_end - b_code)",
+    "    .quad  0x40110000",
+    "    .word  (b_end - b_code)",
+    "    .word  0b101",
+    ".balign 4",
+    "b_code:",
+    "b_loop:",
+    "    mov   x8, #1",
+    "    adr   x0, b_msg",
+    "    mov   x1, #1",
+    "    svc   #0",
+    "    mov   x9, #0x400000",
+    "b_delay:",
+    "    sub   x9, x9, #1",
+    "    cbnz  x9, b_delay",
+    "    b     b_loop",          // <- SEM yield
+    ".balign 4",
+    "b_msg:",
+    "    .ascii \"B\"",
+    "b_end:",
 );
 
 unsafe extern "C" {
-    pub static pulse_file_start: u8;
-    pub static pulse_file_end: u8;
+    pub static pulse_a_start: u8;
+    pub static pulse_b_start: u8;
 }

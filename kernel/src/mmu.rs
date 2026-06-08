@@ -110,8 +110,12 @@ pub unsafe fn map_range_identity(start: u64, size: u64, flags: PageFlags) {
 
 pub unsafe fn init() {
     unsafe {
-        // UART (PL011) em 0x09000000: uma pagina device.
+        // UART (PL011) em 0x09000000
         map_page(0x0900_0000, 0x0900_0000, PageFlags::device());
+
+        // GICv2: distribuidor (GICD) e interface de CPU (GICC)
+        map_page(0x0800_0000, 0x0800_0000, PageFlags::device()); // GICD
+        map_page(0x0801_0000, 0x0801_0000, PageFlags::device()); // GICC
 
         // Kernel + stacks: identity em 0x40000000, 2MB, kernel_rwx.
         map_range_identity(0x4000_0000, 0x20_0000, PageFlags::kernel_rwx());
@@ -120,9 +124,13 @@ pub unsafe fn init() {
         // ler/editar tabelas com a MMU ja ligada. Mapeia os primeiros 16MB.
         map_range_identity(0x4020_0000, 0x100_0000, PageFlags::kernel_rwx());
 
-        // Regiao de usuario: codigo + stack (sobrescreve as paginas de usuario).
-        map_page(USER_CODE_VA,          USER_CODE_VA,          PageFlags::user_code());
-        map_page(USER_CODE_VA + 0x1000, USER_CODE_VA + 0x1000, PageFlags::user_data());
+        // Regiao de usuario A: codigo + stack
+        map_page(0x4010_0000, 0x4010_0000, PageFlags::user_code());
+        map_page(0x4010_1000, 0x4010_1000, PageFlags::user_data());
+
+        // Regiao de usuario B: codigo + stack
+        map_page(0x4011_0000, 0x4011_0000, PageFlags::user_code());
+        map_page(0x4011_1000, 0x4011_1000, PageFlags::user_data());
     }
 
     MAIR_EL1.write(
