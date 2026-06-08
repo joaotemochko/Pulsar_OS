@@ -2,12 +2,9 @@
 name = "pulsar_kernel"
 version = "0.1.0"
 edition = "2024"
-authors = ["Joao Antonio Temochko Andre"]
-description = "Pulsar Microkernel to ARM64"
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
+authors = ["João Antônio Temochko Andre"]
+description = "Pulsar Microkernel for AArch64"
 
 [dependencies]
+aarch64-cpu = "10.0"
+tock-registers = "0.9"

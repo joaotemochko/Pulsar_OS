@@ -2,8 +2,7 @@
 target = "aarch64-unknown-none"
 
 [target.aarch64-unknown-none]
-runner = "qemu-system-aarch64 -machine raspi3b -nographic -kernel"
-
+runner = "qemu-system-aarch64 -machine virt -cpu cortex-a53 -nographic -kernel"
 rustflags = [
     "-C", "link-arg=-Tkernel/src/arch/aarch64/linker.ld",
 ]

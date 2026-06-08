@@ -1,24 +1,25 @@
 use core::fmt;
-use core::ptr::write_volatile;
+use core::ptr::{read_volatile, write_volatile};
 
-// Endereço base do registrador de dados da UART0 (PL011)
-const UART0_DR: *mut u32 = 0x3F20_1000 as *mut u32;
+const UART0_BASE: usize = 0x0900_0000;
+const UART0_DR: *mut u32 = UART0_BASE as *mut u32;              // Data Register
+const UART0_FR: *const u32 = (UART0_BASE + 0x18) as *const u32; // Flag Register
+const FR_TXFF: u32 = 1 << 5;                                    // Transmit FIFO Full
 
 pub struct Uart;
 
 impl Uart {
-    /// Envia um único byte bruto para a interface serial
     pub fn write_byte(&self, byte: u8) {
         unsafe {
-            // Escreve o byte diretamente no endereço mapeado da UART
+            while read_volatile(UART0_FR) & FR_TXFF != 0 {} // espera a FIFO esvaziar
             write_volatile(UART0_DR, byte as u32);
         }
     }
 
-    /// Envia uma sequência de texto (string) caractere por caractere
     pub fn write_string(&self, s: &str) {
-        for byte in s.bytes() {
-            self.write_byte(byte);
+        for b in s.bytes() {
+            if b == b'\n' { self.write_byte(b'\r'); }
+            self.write_byte(b);
         }
     }
 }
