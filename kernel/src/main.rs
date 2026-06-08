@@ -3,10 +3,13 @@
 
 mod cpu;
 mod exceptions;
+mod frame_allocator;
 mod mmu;
 mod syscall;
 mod uart;
 mod user;
+mod loader;
+mod pulse;
 
 use core::arch::asm;
 use core::fmt::Write;
@@ -34,23 +37,30 @@ pub extern "C" fn kernel_main() -> ! {
     cpu::set_vbar_el1(vbar);
     let _ = write!(serial, "VBAR_EL1 instalado em {:#x}\n", vbar);
 
+    serial.write_string("Inicializando frame allocator...\n");
+    frame_allocator::init();
+    let _ = write!(serial, "Frames livres: {}\n", frame_allocator::free_count());
+
     serial.write_string("Ligando MMU agora...\n");
     unsafe { mmu::init() };
     let _ = write!(serial, "MMU ativada: M = {}\n", mmu::is_enabled() as u32);
+    let _ = write!(serial, "Frames livres apos montar tabelas: {}\n", frame_allocator::free_count());
 
-    // Copia o programa de usuario (assembly PIC) para a regiao EL0 mapeada
-    serial.write_string("Copiando programa de usuario para regiao EL0...\n");
-    unsafe {
-        let start = &user::user_program_start as *const u8;
-        let end = &user::user_program_end as *const u8;
-        let len = end as usize - start as usize;
-        core::ptr::copy_nonoverlapping(start, mmu::USER_CODE_VA as *mut u8, len);
-        asm!("dsb ish", "ic iallu", "dsb ish", "isb", options(nostack, preserves_flags));
+    serial.write_string("Carregando programa .pulse...\n");
+    let entry = unsafe {
+        loader::load_pulse(&user::pulse_file_start as *const u8)
+    };
+
+    match entry {
+        Some(ep) => {
+            let _ = write!(serial, "Saltando para EL0 no entry {:#x}...\n", ep);
+            unsafe { cpu::enter_el0(ep, mmu::USER_STACK_TOP) };
+        }
+        None => {
+            serial.write_string("[loader] FALHOU ao carregar .pulse\n");
+            loop { unsafe { asm!("wfe") }; }
+        }
     }
-    let _ = write!(serial, "Programa de usuario copiado.\n");
-
-    serial.write_string("Saltando para EL0 (espaco de usuario)...\n");
-    unsafe { cpu::enter_el0(mmu::USER_CODE_VA, mmu::USER_STACK_TOP) };
 }
 
 #[panic_handler]

@@ -40,9 +40,7 @@
     add     sp,  sp,  #256
 .endm
 
-/* Exceção nao tratada: salva contexto, reporta via Rust (indice, ESR, ELR),
-   e trava de forma controlada. NAO retorna — um fault sincrono nao tratado
-   re-dispararia na mesma instrucao se fizesse eret. */
+/* Exceção nao tratada: reporta via Rust e trava controlado. */
 .macro VENTRY idx
 .balign 0x80
     SAVE_CONTEXT
@@ -54,13 +52,15 @@
     b       1b
 .endm
 
-/* Syscall (svc de EL0): salva contexto, despacha, grava retorno em x0, retorna. */
-.macro VENTRY_SYSCALL
+/* EL0 sincrona (indice 8): pode ser syscall (SVC) ou fault.
+   Passa ESR ao Rust, que classifica e trata. */
+.macro VENTRY_EL0_SYNC
 .balign 0x80
     SAVE_CONTEXT
-    mov     x3, x8                 /* 4o arg = numero da syscall */
-    bl      rust_syscall_dispatch
-    str     x0, [sp, #16 * 0]      /* grava retorno no slot salvo de x0 */
+    mrs     x4, esr_el1            /* x4 = ESR (5o arg) */
+    mov     x3, x8                 /* x3 = numero da syscall (4o arg) */
+    bl      rust_el0_sync_handler
+    str     x0, [sp, #16 * 0]      /* retorno em x0 */
     RESTORE_CONTEXT
     eret
 .endm
@@ -76,7 +76,7 @@ vector_table:
     VENTRY 5           /* 0x280  EL atual SPx,  IRQ      */
     VENTRY 6           /* 0x300  EL atual SPx,  FIQ      */
     VENTRY 7           /* 0x380  EL atual SPx,  SError   */
-    VENTRY_SYSCALL     /* 0x400  EL inferior A64, Sincrona <- svc de EL0 */
+    VENTRY_EL0_SYNC    /* 0x400  EL inferior A64, Sincrona <- syscall OU fault de EL0 */
     VENTRY 9           /* 0x480  EL inferior A64, IRQ     */
     VENTRY 10          /* 0x500  EL inferior A64, FIQ     */
     VENTRY 11          /* 0x580  EL inferior A64, SError  */

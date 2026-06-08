@@ -1,69 +1,128 @@
 use core::arch::asm;
 use aarch64_cpu::registers::*;
 use tock_registers::interfaces::{Readable, Writeable};
+use crate::frame_allocator;
 
 #[repr(C, align(4096))]
 struct Table { e: [u64; 512] }
 
-static mut L0:     Table = Table { e: [0; 512] };
-static mut L1:     Table = Table { e: [0; 512] };
-static mut L2_DEV: Table = Table { e: [0; 512] };
-static mut L3_DEV: Table = Table { e: [0; 512] };
-static mut L2_RAM: Table = Table { e: [0; 512] };
-static mut L3_RAM: Table = Table { e: [0; 512] };
+// So a L0 raiz continua estatica — e o ponto de entrada do walk.
+// Todas as outras tabelas (L1/L2/L3) sao alocadas dinamicamente.
+static mut L0: Table = Table { e: [0; 512] };
 
-const TABLE: u64 = 0b11;
-const PAGE:  u64 = 0b11;
-const AF:    u64 = 1 << 10;
+const TABLE: u64 = 0b11;   // descritor de tabela (aponta p/ proximo nivel)
+const PAGE:  u64 = 0b11;   // descritor de pagina (L3)
+const VALID_MASK: u64 = 0b11;
 
-const AP_KERNEL: u64 = 0b00 << 6;   // RW so EL1 -> executavel em EL1
-const AP_USER:   u64 = 0b01 << 6;   // RW EL0+EL1 -> executavel em EL0 (PXN em EL1)
-const SH_IS:     u64 = 0b11 << 8;
-const IDX_DEV:   u64 = 0 << 2;
-const IDX_NRM:   u64 = 1 << 2;
-const PXN:       u64 = 1 << 53;
-const UXN:       u64 = 1 << 54;
+// Flags de pagina, agrupados numa struct para clareza no loader.
+#[derive(Clone, Copy)]
+pub struct PageFlags {
+    pub bits: u64,
+}
 
-// Enderecos da regiao de usuario (dentro dos 2MB cobertos pela L3_RAM)
-pub const USER_CODE_VA:  u64 = 0x4010_0000;   // pagina de codigo de EL0
-pub const USER_STACK_TOP: u64 = 0x4010_2000;  // topo da stack de EL0 (cresce p/ baixo)
+impl PageFlags {
+    const AF:    u64 = 1 << 10;
+    const SH_IS: u64 = 0b11 << 8;
+    const IDX_DEV: u64 = 0 << 2;
+    const IDX_NRM: u64 = 1 << 2;
+    const AP_KERNEL: u64 = 0b00 << 6;  // RW so EL1 -> executavel em EL1
+    const AP_USER:   u64 = 0b01 << 6;  // RW EL0+EL1 -> executavel em EL0
+    const AP_USER_RO: u64 = 0b11 << 6;  // RO EL0+EL1 (nao-gravavel)
+    const PXN: u64 = 1 << 53;
+    const UXN: u64 = 1 << 54;
+
+    /// Codigo/dados do kernel: Normal, RW so EL1, executavel em EL1.
+    pub fn kernel_rwx() -> Self {
+        Self { bits: Self::IDX_NRM | Self::AP_KERNEL | Self::AF | Self::SH_IS }
+    }
+
+    /// Periferico (UART/GIC): Device, RW so EL1, nunca executavel.
+    pub fn device() -> Self {
+        Self { bits: Self::IDX_DEV | Self::AP_KERNEL | Self::AF | Self::PXN | Self::UXN }
+    }
+
+    /// Codigo de usuario: Normal, RW EL0+EL1, executavel em EL0, nao-exec em EL1.
+    pub fn user_code() -> Self {
+        Self { bits: Self::IDX_NRM | Self::AP_USER_RO | Self::AF | Self::SH_IS | Self::PXN }
+    }
+
+    /// Dados/stack de usuario: Normal, RW EL0+EL1, nao-executavel.
+    pub fn user_data() -> Self {
+        Self { bits: Self::IDX_NRM | Self::AP_USER | Self::AF | Self::SH_IS | Self::PXN | Self::UXN }
+    }
+}
+
+pub const USER_CODE_VA:   u64 = 0x4010_0000;
+pub const USER_STACK_TOP: u64 = 0x4010_2000;
+
+/// Indices de cada nivel para um dado VA (4KB granule, VA 48 bits).
+#[inline]
+fn indices(va: u64) -> (usize, usize, usize, usize) {
+    (
+        ((va >> 39) & 0x1FF) as usize,
+        ((va >> 30) & 0x1FF) as usize,
+        ((va >> 21) & 0x1FF) as usize,
+        ((va >> 12) & 0x1FF) as usize,
+    )
+}
+
+/// Garante que a entrada `idx` da tabela em `table_pa` aponta para uma
+/// tabela do proximo nivel; aloca uma nova (zerada) se necessario.
+/// Retorna o endereco fisico da tabela do proximo nivel.
+unsafe fn next_table(table_pa: u64, idx: usize) -> u64 {
+    unsafe {
+        let entry_ptr = (table_pa as *mut u64).add(idx);
+        let entry = entry_ptr.read_volatile();
+        if entry & VALID_MASK == TABLE {
+            entry & 0x0000_FFFF_FFFF_F000
+        } else {
+            let new_pa = frame_allocator::alloc_frame().expect("sem frames para page table");
+            core::ptr::write_bytes(new_pa as *mut u8, 0, 4096);
+            entry_ptr.write_volatile(new_pa | TABLE);
+            new_pa
+        }
+    }
+}
+
+/// Mapeia uma pagina de 4KB: VA -> PA com os flags dados.
+/// Constroi os niveis intermediarios sob demanda via frame allocator.
+pub unsafe fn map_page(va: u64, pa: u64, flags: PageFlags) {
+    let (i0, i1, i2, i3) = indices(va);
+    let l0_pa = (&raw const L0) as u64;
+    unsafe {
+        let l1_pa = next_table(l0_pa, i0);
+        let l2_pa = next_table(l1_pa, i1);
+        let l3_pa = next_table(l2_pa, i2);
+        // descritor de pagina final no L3
+        let l3_entry = (l3_pa as *mut u64).add(i3);
+        l3_entry.write_volatile((pa & 0x0000_FFFF_FFFF_F000) | PAGE | flags.bits);
+    }
+}
+
+/// Mapeia um intervalo [va, va+size) identity (VA==PA) com os flags dados.
+pub unsafe fn map_range_identity(start: u64, size: u64, flags: PageFlags) {
+    let mut off = 0u64;
+    while off < size {
+        unsafe { map_page(start + off, start + off, flags); }
+        off += 4096;
+    }
+}
 
 pub unsafe fn init() {
     unsafe {
-        let l0  = (&raw mut L0).cast::<u64>();
-        let l1  = (&raw mut L1).cast::<u64>();
-        let l2d = (&raw mut L2_DEV).cast::<u64>();
-        let l3d = (&raw mut L3_DEV).cast::<u64>();
-        let l2r = (&raw mut L2_RAM).cast::<u64>();
-        let l3r = (&raw mut L3_RAM).cast::<u64>();
+        // UART (PL011) em 0x09000000: uma pagina device.
+        map_page(0x0900_0000, 0x0900_0000, PageFlags::device());
 
-        l0.add(0).write_volatile((&raw const L1 as u64) | TABLE);
-        l1.add(0).write_volatile((&raw const L2_DEV as u64) | TABLE);
-        l1.add(1).write_volatile((&raw const L2_RAM as u64) | TABLE);
+        // Kernel + stacks: identity em 0x40000000, 2MB, kernel_rwx.
+        map_range_identity(0x4000_0000, 0x20_0000, PageFlags::kernel_rwx());
 
-        l2d.add(72).write_volatile((&raw const L3_DEV as u64) | TABLE);
-        l3d.add(0).write_volatile(0x0900_0000 | PAGE | IDX_DEV | AP_KERNEL | AF | PXN | UXN);
+        // frames que o loader vai alocar) — identity, para o kernel poder
+        // ler/editar tabelas com a MMU ja ligada. Mapeia os primeiros 16MB.
+        map_range_identity(0x4020_0000, 0x100_0000, PageFlags::kernel_rwx());
 
-        // RAM do kernel: tudo AP_KERNEL (so EL1, executavel em EL1)
-        l2r.add(0).write_volatile((&raw const L3_RAM as u64) | TABLE);
-        for i in 0..512u64 {
-            let pa = 0x4000_0000 + i * 0x1000;
-            l3r.add(i as usize).write_volatile(pa | PAGE | IDX_NRM | AP_KERNEL | AF | SH_IS);
-        }
-
-        // --- Sobrescreve as paginas de USUARIO com permissao de EL0 ---
-        // indice L3 = (VA - 0x40000000) / 4KB
-        let code_idx  = ((USER_CODE_VA  - 0x4000_0000) / 0x1000) as usize;  // 0x100
-        let stack_idx = code_idx + 1;  // pagina seguinte para a stack
-
-        // Codigo de usuario: AP_USER + executavel em EL0 (UXN=0), nao-exec em EL1 (PXN=1)
-        l3r.add(code_idx).write_volatile(
-            USER_CODE_VA | PAGE | IDX_NRM | AP_USER | AF | SH_IS | PXN
-        );
-        // Stack de usuario: AP_USER, nao-executavel (UXN+PXN)
-        l3r.add(stack_idx).write_volatile(
-            (USER_CODE_VA + 0x1000) | PAGE | IDX_NRM | AP_USER | AF | SH_IS | PXN | UXN
-        );
+        // Regiao de usuario: codigo + stack (sobrescreve as paginas de usuario).
+        map_page(USER_CODE_VA,          USER_CODE_VA,          PageFlags::user_code());
+        map_page(USER_CODE_VA + 0x1000, USER_CODE_VA + 0x1000, PageFlags::user_data());
     }
 
     MAIR_EL1.write(
@@ -82,7 +141,7 @@ pub unsafe fn init() {
         + TCR_EL1::IPS::Bits_40,
     );
 
-    TTBR0_EL1.set(&raw const L0 as u64);
+    TTBR0_EL1.set((&raw const L0) as u64);
 
     unsafe { asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb", options(nostack, preserves_flags)); }
 
