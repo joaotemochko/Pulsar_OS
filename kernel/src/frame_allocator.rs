@@ -72,3 +72,33 @@ pub fn free_frame(addr: u64) {
 pub fn free_count() -> usize {
     (0..NUM_FRAMES).filter(|&i| is_free(i)).count()
 }
+/// Aloca `n` frames FISICAMENTE CONTIGUOS. Retorna o endereco do primeiro.
+/// Usado para buffers de arquivo (leitura de disco) e stacks de processo.
+pub fn alloc_contig(n: usize) -> Option<u64> {
+    let mut run = 0usize;
+    let mut start = 0usize;
+    for idx in 0..NUM_FRAMES {
+        if is_free(idx) {
+            if run == 0 {
+                start = idx;
+            }
+            run += 1;
+            if run == n {
+                for i in start..start + n {
+                    set_used(i);
+                }
+                return Some(HEAP_START + (start as u64) * PAGE_SIZE);
+            }
+        } else {
+            run = 0;
+        }
+    }
+    None
+}
+
+/// Libera `n` frames contiguos a partir de `addr`.
+pub fn free_contig(addr: u64, n: usize) {
+    for i in 0..n {
+        free_frame(addr + (i as u64) * PAGE_SIZE);
+    }
+}

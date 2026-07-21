@@ -1,8 +1,8 @@
 [build]
-target = "aarch64-unknown-none"
+target = "aarch64-unknown-none-softfloat"
 
-[target.aarch64-unknown-none]
-runner = "qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a53 -nographic -kernel"
-rustflags = [
-    "-C", "link-arg=-Tkernel/src/arch/aarch64/linker.ld",
-]
+[target.aarch64-unknown-none-softfloat]
+runner = "qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a53 -serial mon:stdio -global virtio-mmio.force-legacy=false -device virtio-gpu-device -device virtio-keyboard-device -device virtio-tablet-device -drive file=disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -netdev user,id=n0 -device virtio-net-device,netdev=n0 -kernel"
+
+[unstable]
+build-std = ["core", "compiler_builtins"]

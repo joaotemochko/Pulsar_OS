@@ -4,6 +4,14 @@ pub const TIMER_IRQ: u32 = 30; // PPI do timer fisico EL1
 
 /// Arma o timer para disparar daqui a `ticks_fraction` da frequencia.
 /// Ex.: fraction=10 -> dispara a cada 1/10 de segundo.
+pub static mut UPTIME_TICKS: u64 = 0;
+
+/// Incrementa o contador de uptime (chamado pelo IRQ do timer a 100Hz).
+pub fn tick() { unsafe { UPTIME_TICKS += 1; } }
+
+/// Ticks desde o boot (100Hz -> cada tick = 10ms).
+pub fn uptime() -> u64 { unsafe { UPTIME_TICKS } }
+
 pub fn arm(fraction: u64) {
     unsafe {
         let freq: u64;

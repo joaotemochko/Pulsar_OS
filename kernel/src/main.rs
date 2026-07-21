@@ -1,20 +1,28 @@
 #![no_std]
 #![no_main]
 
+mod blk;
 mod context;
 mod cpu;
 mod exceptions;
+mod fb;
 mod frame_allocator;
 mod gic;
+mod gpu;
+mod input;
 mod irq;
 mod loader;
 mod mmu;
+mod pfs;
+mod nbfs;
+mod fs;
 mod process;
 mod pulse;
 mod syscall;
 mod timer;
 mod uart;
-mod user;
+mod virtio;
+mod net;
 
 use core::arch::asm;
 use core::fmt::Write;
@@ -50,21 +58,64 @@ pub extern "C" fn kernel_main() -> ! {
     unsafe { mmu::init() };
     let _ = write!(serial, "MMU ativada: M = {}\n", mmu::is_enabled() as u32);
 
-    // GIC + timer (preempcao)
+    // GPU (virtio-gpu 2D): framebuffer + padrao de teste
+    serial.write_string("Inicializando virtio-gpu...\n");
+    match gpu::init() {
+        Some((w, h)) => {
+            fb::init(w, h);
+            fb::draw_test_pattern();
+            gpu::present();
+            let _ = write!(serial, "[gpu] frame apresentado ({}x{})\n", w, h);
+        }
+        None => serial.write_string("[gpu] nao encontrado — seguindo sem video\n"),
+    }
+
+    // GIC + timer prontos, mas IRQs ainda MASCARADAS: o boot nao pode
+    // ser preemptado no meio (leitura de disco, carga do shell).
     serial.write_string("Inicializando GIC + timer...\n");
     gic::init();
     gic::enable_irq(timer::TIMER_IRQ);
-    timer::arm(10);
+
+    // Armazenamento + sistema de arquivos
+    serial.write_string("Inicializando virtio-blk...\n");
+    if blk::init().is_none() {
+        serial.write_string("[kernel] sem disco — nada a executar. Parando.\n");
+        loop { unsafe { asm!("wfe") }; }
+    }
+    if fs::mount().is_none() {
+        serial.write_string("[kernel] PulsarFS invalido. Parando.\n");
+        loop { unsafe { asm!("wfe") }; }
+    }
+
+    // Input (teclado + tablet)
+    let n_input = input::init();
+    let _ = write!(serial, "[input] {} dispositivo(s) de entrada\n", n_input);
+
+    // Rede (virtio-net). Nao-fatal: o SO funciona sem rede.
+    if net::init() {
+        // tenta resolver o gateway via ARP (prova que RX/TX funcionam)
+        net::resolve_gateway();
+        // envia um datagrama UDP de teste ao gateway (porta 9)
+        if net::udp_send(&net::GW_IP, 9, 40000, b"Pulsar OS online") {
+            let _ = write!(serial, "[net] datagrama UDP de teste enviado ao gateway\n");
+        }
+    }
+
+    // Carrega o shell grafico do disco
+    // Inicia o filesystem daemon PRIMEIRO (pid 0) para registrar SVC_FS,
+    // depois o shell (pid 1). O shell espera o fsd via lookup antes de usar.
+    serial.write_string("Iniciando filesystem daemon (fsd.pulse)...\n");
+    loader::spawn_from_fs("fsd.pulse");
+    serial.write_string("Carregando shell.pulse do disco...\n");
+    if loader::spawn_from_fs("shell.pulse").is_none() {
+        loop { unsafe { asm!("wfe") }; }
+    }
+
+    // So agora habilita preempcao e entra em EL0
+    timer::arm(100); // 100 Hz: cursor fluido
     unsafe { asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags)); }
 
-    // Cria dois processos que NAO cooperam (loops infinitos sem yield)
-    serial.write_string("Carregando processos A e B...\n");
-    let entry_a = unsafe { loader::load_pulse(&user::pulse_a_start as *const u8) }.unwrap();
-    let _pid_a = process::create(entry_a, 0x4010_2000);
-    let entry_b = unsafe { loader::load_pulse(&user::pulse_b_start as *const u8) }.unwrap();
-    let _pid_b = process::create(entry_b, 0x4011_2000);
-
-    serial.write_string("Preempcao ativa. Os processos NAO dao yield — o timer forca a troca:\n");
+    serial.write_string("Entrando no shell (EL0)...\n");
     let first = unsafe { process::first_context() };
     unsafe { cpu::start_first(&first) };
 }

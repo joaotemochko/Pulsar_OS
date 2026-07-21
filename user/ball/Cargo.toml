@@ -1,0 +1,14 @@
+[package]
+name = "ball"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+plib = { path = "../plib" }
+
+[workspace]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

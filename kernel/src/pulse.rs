@@ -5,12 +5,16 @@ pub const PULSE_MAGIC: u32 = 0x534C5550; // 'P','U','L','S'
 #[derive(Clone, Copy)]
 pub struct PulseHeader {
     pub magic: u32,        // PULSE_MAGIC
-    pub version: u16,      // versao do formato
+    pub version: u16,      // versao do formato (2 = com stack_top)
     pub seg_count: u16,    // numero de segmentos
     pub entry: u64,        // VA do ponto de entrada
     pub seg_table_off: u32, // offset (no arquivo) da tabela de segmentos
     pub _reserved: u32,
+    pub stack_top: u64,    // v2: topo da stack EL0 (loader mapeia abaixo)
 }
+
+/// Paginas de stack que o loader mapeia abaixo de `stack_top` (32 KB).
+pub const STACK_PAGES: u64 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

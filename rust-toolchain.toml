@@ -1,4 +1,4 @@
 [toolchain]
 channel = "nightly"
 components = ["rust-src", "rustfmt", "llvm-tools"]
-targets = ["aarch64-unknown-none"]
+targets = ["aarch64-unknown-none-softfloat"]
