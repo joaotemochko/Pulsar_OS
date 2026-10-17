@@ -1,8 +1,10 @@
 //! Transporte virtio-mmio (versao 2, "moderno") para a maquina QEMU virt.
 //!
-//! A `virt` expoe 32 slots virtio-mmio a partir de 0x0a000000, com stride
-//! de 0x200. Cada slot pode conter um dispositivo (GPU=16, block=2,
-//! input=18, ...) ou estar vazio (DeviceID=0).
+//! A `virt` expoe slots virtio-mmio num endereco que depende da
+//! arquitetura (AArch64: 32 slots em 0x0a000000, stride 0x200; RISC-V:
+//! 8 slots em 0x10001000, stride 0x1000 — ver arch::platform). Cada slot
+//! pode conter um dispositivo (GPU=16, block=2, input=18, ...) ou estar
+//! vazio (DeviceID=0).
 //!
 //! IMPORTANTE: exige `-global virtio-mmio.force-legacy=false` no QEMU,
 //! pois implementamos apenas a interface moderna (Version=2).
@@ -14,9 +16,7 @@
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
-pub const VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
-pub const VIRTIO_MMIO_STRIDE: u64 = 0x200;
-pub const VIRTIO_MMIO_SLOTS: u64 = 32;
+use crate::arch::platform::{VIRTIO_MMIO_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE};
 
 // Offsets dos registradores (interface moderna, v2)
 const MAGIC_VALUE: u64 = 0x000; // deve ler 0x74726976 ("virt")
@@ -271,12 +271,12 @@ impl VirtQueue {
         fence(Ordering::SeqCst);
         let new_idx = q.avail.idx.wrapping_add(1);
         unsafe { write_volatile(&raw mut q.avail.idx, new_idx) };
-        fence(Ordering::SeqCst);
+        crate::arch::mb();
 
         reg_write(self.base, QUEUE_NOTIFY, self.index);
 
         loop {
-            fence(Ordering::SeqCst);
+            crate::arch::mb();
             let used_idx = unsafe { read_volatile(&raw const q.used.idx) };
             if used_idx != self.last_used {
                 break;
@@ -300,7 +300,7 @@ impl VirtQueue {
         fence(Ordering::SeqCst);
         let new_idx = q.avail.idx.wrapping_add(1);
         unsafe { write_volatile(&raw mut q.avail.idx, new_idx) };
-        fence(Ordering::SeqCst);
+        crate::arch::mb();
         reg_write(self.base, QUEUE_NOTIFY, self.index);
     }
 

@@ -1,0 +1,9 @@
+Noto Sans, Noto Sans Mono, Noto Serif (subconjuntos)
+Copyright 2010-2020 Google LLC / Google Inc.
+
+Licenciadas sob a SIL Open Font License, Version 1.1:
+https://openfontlicense.org
+
+Os arquivos aqui sao subconjuntos (pyftsubset) das fontes do pacote Debian
+fonts-noto-core 20201225-2. A OFL permite redistribuir e modificar as fontes,
+inclusive embutidas em software, desde que nao sejam vendidas isoladamente.

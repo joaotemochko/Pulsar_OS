@@ -1,10 +1,10 @@
 [package]
 name = "pulsar_kernel"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["João Antônio Temochko Andre"]
-description = "Pulsar Microkernel for AArch64"
+description = "Pulsar Microkernel for AArch64 and RISC-V RV64"
 
-[dependencies]
+[target.'cfg(target_arch = "aarch64")'.dependencies]
 aarch64-cpu = "10.0"
 tock-registers = "0.9"

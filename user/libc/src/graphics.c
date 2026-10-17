@@ -1,167 +1,198 @@
-/* graphics.c — framebuffer e primitivas de desenho por software. */
+/* graphics.c — primitivas de desenho com anti-aliasing (espelho da plib). */
 #include "pulsar.h"
 
-Fb fb_open(void){
-    Fb fb;
-    fb.base = (u32*)sys_fb_map();
-    u64 info = sys_fb_info();
-    fb.w = (u32)(info >> 32);
-    fb.h = (u32)(info & 0xFFFFFFFF);
-    return fb;
-}
-void fb_pixel(Fb* fb, u32 x, u32 y, u32 color){
-    if(x<fb->w && y<fb->h) fb->base[y*fb->w+x]=color;
-}
-void fb_fill(Fb* fb, u32 x, u32 y, u32 w, u32 h, u32 color){
-    u32 x1=x+w, y1=y+h;
-    if(x1>fb->w) x1=fb->w;
-    if(y1>fb->h) y1=fb->h;
-    for(u32 yy=y; yy<y1; yy++){
-        u32* row=&fb->base[yy*fb->w];
-        for(u32 xx=x; xx<x1; xx++) row[xx]=color;
-    }
-}
-void fb_blend(Fb* fb, u32 x, u32 y, u32 color, u32 a){
-    if(x>=fb->w||y>=fb->h) return;
-    if(a>=255){ fb->base[y*fb->w+x]=color; return; }
-    if(a==0) return;
-    u32 bg=fb->base[y*fb->w+x];
-    u32 inv=255-a;
-    u32 r=(((color>>16)&0xFF)*a+((bg>>16)&0xFF)*inv)/255;
-    u32 g=(((color>>8)&0xFF)*a+((bg>>8)&0xFF)*inv)/255;
-    u32 b=((color&0xFF)*a+(bg&0xFF)*inv)/255;
-    fb->base[y*fb->w+x]=(r<<16)|(g<<8)|b;
+Rect rect_and(Rect a, Rect b){
+    i32 x0=a.x>b.x?a.x:b.x, y0=a.y>b.y?a.y:b.y;
+    i32 x1=(a.x+a.w)<(b.x+b.w)?(a.x+a.w):(b.x+b.w);
+    i32 y1=(a.y+a.h)<(b.y+b.h)?(a.y+a.h):(b.y+b.h);
+    if(x1<=x0||y1<=y0) return rect(0,0,0,0);
+    return rect(x0,y0,x1-x0,y1-y0);
 }
 
-/* ===== primitivas de UI (portadas do plib Rust, estilo Pulsar Aqua) ===== */
+u32 mix(u32 bg, u32 fg, u32 a){
+    if(a>=255) return fg;
+    a+=a>>7;
+    u32 ia=256-a;
+    u32 rb=((fg&0xFF00FF)*a+(bg&0xFF00FF)*ia)>>8;
+    u32 g=((fg&0x00FF00)*a+(bg&0x00FF00)*ia)>>8;
+    return (rb&0xFF00FF)|(g&0x00FF00);
+}
+u32 shade(u32 c, i32 t){ return t>=0?mix(c,0xFFFFFF,(u32)t):mix(c,0,(u32)(-t)); }
 
 u32 isqrt_u(u32 n){
-    if(n==0) return 0;
-    u32 x=n, y=(x+1)/2;
-    while(y<x){ x=y; y=(x + n/x)/2; }
-    return x;
+    u32 x=n, r=0, bit=1u<<30;
+    while(bit>x) bit>>=2;
+    while(bit){ if(x>=r+bit){ x-=r+bit; r=(r>>1)+bit; } else r>>=1; bit>>=2; }
+    return r;
 }
-u32 lerp(u32 c0, u32 c1, u32 t){
-    if(t>255) t=255;
-    u32 it=255-t;
-    u32 r=(((c0>>16)&0xFF)*it+((c1>>16)&0xFF)*t)/255;
-    u32 g=(((c0>>8)&0xFF)*it+((c1>>8)&0xFF)*t)/255;
-    u32 b=((c0&0xFF)*it+(c1&0xFF)*t)/255;
-    return (r<<16)|(g<<8)|b;
+
+void fb_set_clip(Fb* fb, Rect r){ fb->clip=rect_and(r,rect(0,0,fb->w,fb->h)); }
+
+static inline u32* row(Fb* fb, i32 y){ return fb->base+(i64)y*fb->stride; }
+
+void fb_blend(Fb* fb, i32 x, i32 y, u32 c, u32 a){
+    if(a==0||!rect_has(fb->clip,x,y)) return;
+    u32* p=row(fb,y)+x; *p=mix(*p,c,a);
 }
+static void span(Fb* fb, i32 y, i32 x0, i32 x1, u32 c, u32 a){
+    Rect cl=fb->clip;
+    if(y<cl.y||y>=cl.y+cl.h) return;
+    if(x0<cl.x) x0=cl.x;
+    if(x1>cl.x+cl.w) x1=cl.x+cl.w;
+    if(x0>=x1||a==0) return;
+    u32* p=row(fb,y);
+    if(a>=255){ for(i32 x=x0;x<x1;x++) p[x]=c; }
+    else { for(i32 x=x0;x<x1;x++) p[x]=mix(p[x],c,a); }
+}
+void fb_fill_a(Fb* fb, Rect r, u32 c, u32 a){
+    r=rect_and(r,fb->clip);
+    for(i32 y=r.y;y<r.y+r.h;y++) span(fb,y,r.x,r.x+r.w,c,a);
+}
+void fb_fill(Fb* fb, Rect r, u32 c){ fb_fill_a(fb,r,c,255); }
+void fb_hline(Fb* fb, i32 x, i32 y, i32 w, u32 c, u32 a){ span(fb,y,x,x+w,c,a); }
 void fb_vgrad(Fb* fb, Rect r, u32 top, u32 bot){
-    i32 y1=r.y+r.h; if(y1>(i32)fb->h) y1=fb->h;
-    i32 x1=r.x+r.w; if(x1>(i32)fb->w) x1=fb->w;
-    u32 h=r.h>0?r.h:1;
-    for(i32 y=r.y<0?0:r.y; y<y1; y++){
-        u32 t=((y-r.y)*255)/h;
-        u32 c=lerp(top,bot,t);
-        u32* row=&fb->base[y*fb->w];
-        for(i32 x=r.x<0?0:r.x; x<x1; x++) row[x]=c;
+    Rect cr=rect_and(r,fb->clip); i32 h=r.h>0?r.h:1;
+    for(i32 y=cr.y;y<cr.y+cr.h;y++) span(fb,y,cr.x,cr.x+cr.w,mix(top,bot,(u32)((y-r.y)*255/h)),255);
+}
+
+/* cobertura AA (0..255) do pixel (dx,dy) num canto de raio r */
+static u32 corner_cov(i32 r, i32 dx, i32 dy){
+    i32 px=dx*16+8-r*16, py=dy*16+8-r*16;
+    i32 d=(i32)isqrt_u((u32)(px*px+py*py));
+    i32 c=r*16+8-d; if(c<0)c=0; if(c>16)c=16;
+    c*=16; return (u32)(c>255?255:c);
+}
+static void round_impl(Fb* fb, Rect r, i32 rad, u32 top, u32 bot, u32 a){
+    if(r.w<=0||r.h<=0) return;
+    if(rad>r.w/2) rad=r.w/2;
+    if(rad>r.h/2) rad=r.h/2;
+    if(rad<0) rad=0;
+    Rect cr=rect_and(r,fb->clip);
+    i32 h=r.h>0?r.h:1;
+    for(i32 y=cr.y;y<cr.y+cr.h;y++){
+        u32 c=top==bot?top:mix(top,bot,(u32)((y-r.y)*255/h));
+        i32 dy=y<r.y+rad?y-r.y:(y>=r.y+r.h-rad?r.y+r.h-1-y:-1);
+        if(dy<0||rad==0){ span(fb,y,r.x,r.x+r.w,c,a); continue; }
+        for(i32 dx=0;dx<rad;dx++){
+            u32 cov=corner_cov(rad,dx,dy);
+            if(!cov) continue;
+            fb_blend(fb,r.x+dx,y,c,cov*a/255);
+            fb_blend(fb,r.x+r.w-1-dx,y,c,cov*a/255);
+        }
+        span(fb,y,r.x+rad,r.x+r.w-rad,c,a);
     }
 }
-void fb_vgrad_a(Fb* fb, Rect r, u32 top, u32 bot, u32 a){
-    i32 y1=r.y+r.h; if(y1>(i32)fb->h) y1=fb->h;
-    i32 x1=r.x+r.w; if(x1>(i32)fb->w) x1=fb->w;
-    u32 h=r.h>0?r.h:1;
-    for(i32 y=r.y<0?0:r.y; y<y1; y++){
-        u32 t=((y-r.y)*255)/h; u32 c=lerp(top,bot,t);
-        for(i32 x=r.x<0?0:r.x; x<x1; x++) fb_blend(fb,x,y,c,a);
+void fb_round_rect(Fb* fb, Rect r, i32 rad, u32 c){ round_impl(fb,r,rad,c,c,255); }
+void fb_round_rect_a(Fb* fb, Rect r, i32 rad, u32 c, u32 a){ round_impl(fb,r,rad,c,c,a); }
+void fb_round_grad(Fb* fb, Rect r, i32 rad, u32 top, u32 bot){ round_impl(fb,r,rad,top,bot,255); }
+
+void fb_round_border(Fb* fb, Rect r, i32 rad, u32 c, u32 a){
+    if(rad>r.w/2) rad=r.w/2;
+    if(rad>r.h/2) rad=r.h/2;
+    if(rad<1) rad=1;
+    span(fb,r.y,r.x+rad,r.x+r.w-rad,c,a);
+    span(fb,r.y+r.h-1,r.x+rad,r.x+r.w-rad,c,a);
+    for(i32 y=r.y+rad;y<r.y+r.h-rad;y++){ fb_blend(fb,r.x,y,c,a); fb_blend(fb,r.x+r.w-1,y,c,a); }
+    for(i32 dy=0;dy<rad;dy++) for(i32 dx=0;dx<rad;dx++){
+        i32 o=(i32)corner_cov(rad,dx,dy);
+        i32 in=(rad>1&&dx>=1&&dy>=1)?(i32)corner_cov(rad-1,dx-1,dy-1):0;
+        i32 cv=o-in; if(cv<=0) continue;
+        u32 aa=(u32)cv*a/255;
+        fb_blend(fb,r.x+dx,r.y+dy,c,aa); fb_blend(fb,r.x+r.w-1-dx,r.y+dy,c,aa);
+        fb_blend(fb,r.x+dx,r.y+r.h-1-dy,c,aa); fb_blend(fb,r.x+r.w-1-dx,r.y+r.h-1-dy,c,aa);
     }
 }
-static u32 corner_alpha(i32 dx, i32 dy, i32 radius){
-    i32 d2=dx*dx+dy*dy;
-    if(d2<=(radius-1)*(radius-1)) return 255;
-    if(d2>=(radius+1)*(radius+1)) return 0;
-    i32 d=(i32)isqrt_u((u32)d2);
-    i32 frac=radius+1-d; if(frac<0)frac=0; if(frac>2)frac=2;
-    u32 v=(u32)frac*127; return v>255?255:v;
-}
-void fb_round_rect_grad(Fb* fb, Rect r, u32 radius, u32 top, u32 bot){
-    i32 rad=radius; if(rad>r.w/2)rad=r.w/2; if(rad>r.h/2)rad=r.h/2;
-    i32 x0=r.x,y0=r.y,x1=r.x+r.w,y1=r.y+r.h; u32 h=r.h>0?r.h:1;
-    for(i32 y=y0; y<y1; y++){
-        if(y<0||y>=(i32)fb->h) continue;
-        u32 t=((u32)(y-y0)*255)/h; u32 c=lerp(top,bot,t);
-        for(i32 x=x0; x<x1; x++){
-            if(x<0||x>=(i32)fb->w) continue;
-            i32 cx=(x<x0+rad)?x0+rad:((x>=x1-rad)?x1-rad-1:x);
-            i32 cy=(y<y0+rad)?y0+rad:((y>=y1-rad)?y1-rad-1:y);
-            if(cx!=x||cy!=y){ u32 a=corner_alpha(x-cx,y-cy,rad); if(a) fb_blend(fb,x,y,c,a); }
-            else fb_blend(fb,x,y,c,255);
+
+void fb_shadow(Fb* fb, Rect r, i32 rad, i32 blur, i32 dy, u32 alpha){
+    Rect s=rect(r.x,r.y+dy,r.w,r.h);
+    Rect o=rect(s.x-blur,s.y-blur,s.w+2*blur,s.h+2*blur);
+    Rect cr=rect_and(o,fb->clip);
+    i32 b16=blur*16;
+    i32 sx0=(s.x+rad)*16, sx1=(s.x+s.w-rad)*16, sy0=(s.y+rad)*16, sy1=(s.y+s.h-rad)*16;
+    for(i32 y=cr.y;y<cr.y+cr.h;y++){
+        i32 py=y*16+8, qy=py<sy0?sy0-py:(py>sy1?py-sy1:0);
+        for(i32 x=cr.x;x<cr.x+cr.w;x++){
+            if(rect_has(rect(r.x+rad,r.y+rad,r.w-2*rad,r.h-2*rad),x,y)){ x=r.x+r.w-rad-1; continue; }
+            i32 px=x*16+8, qx=px<sx0?sx0-px:(px>sx1?px-sx1:0);
+            i32 d=(qx==0?qy:(qy==0?qx:(i32)isqrt_u((u32)(qx*qx+qy*qy))))-rad*16;
+            if(d>=b16) continue;
+            u32 a=alpha;
+            if(d>0){ u32 t=(u32)(256-d*256/b16); a=alpha*((t*t)>>8)>>8; }
+            if(a){ u32* p=row(fb,y)+x; *p=mix(*p,0,a); }
         }
     }
 }
-void fb_round_rect(Fb* fb, Rect r, u32 radius, u32 color){ fb_round_rect_grad(fb,r,radius,color,color); }
-void fb_round_frame(Fb* fb, Rect r, u32 radius, u32 color, u32 a){
-    i32 rad=radius; if(rad>r.w/2)rad=r.w/2; if(rad>r.h/2)rad=r.h/2;
-    i32 x0=r.x,y0=r.y,x1=r.x+r.w,y1=r.y+r.h;
-    for(i32 y=y0; y<y1; y++){
-        if(y<0||y>=(i32)fb->h) continue;
-        for(i32 x=x0; x<x1; x++){
-            if(x<0||x>=(i32)fb->w) continue;
-            i32 cx=(x<x0+rad)?x0+rad:((x>=x1-rad)?x1-rad-1:x);
-            i32 cy=(y<y0+rad)?y0+rad:((y>=y1-rad)?y1-rad-1:y);
-            int on_edge=(x==x0||x==x1-1||y==y0||y==y1-1);
-            if(cx!=x||cy!=y){
-                i32 d=(i32)isqrt_u((u32)((x-cx)*(x-cx)+(y-cy)*(y-cy)));
-                if(d>=rad-1&&d<=rad) fb_blend(fb,x,y,color,a);
-            } else if(on_edge) fb_blend(fb,x,y,color,a);
+
+void fb_disc(Fb* fb, i32 cx, i32 cy, i32 r, u32 c, u32 a){
+    Rect bb=rect(cx-r-1,cy-r-1,2*r+3,2*r+3);
+    Rect cr=rect_and(bb,fb->clip);
+    for(i32 y=cr.y;y<cr.y+cr.h;y++){
+        i32 py=y*16+8-cy*16;
+        for(i32 x=cr.x;x<cr.x+cr.w;x++){
+            i32 px=x*16+8-cx*16;
+            i32 d=(i32)isqrt_u((u32)(px*px+py*py));
+            i32 cov=r*16+8-d; if(cov<=0) continue; if(cov>16) cov=16;
+            u32 al=(u32)(cov*16); if(al>255) al=255;
+            fb_blend(fb,x,y,c,al*a/255);
         }
     }
 }
-void fb_drop_shadow(Fb* fb, Rect r, u32 radius, u32 spread){
-    u32 layers=spread>0?spread:1;
-    for(u32 i=0;i<layers;i++){
-        u32 off=layers-i; u32 a=6+i*4;
-        Rect sr={ r.x-(i32)off, r.y-(i32)off+2, r.w+(i32)off*2, r.h+(i32)off*2 };
-        fb_round_frame(fb,sr,radius+off,0x000000,a);
-    }
-}
-void fb_disc(Fb* fb, u32 cx, u32 cy, u32 radius, u32 color){
-    i32 r=radius, cxi=cx, cyi=cy;
-    for(i32 dy=-r; dy<=r; dy++) for(i32 dx=-r; dx<=r; dx++){
-        i32 d2=dx*dx+dy*dy;
-        u32 a=(d2<=(r-1)*(r-1))?255:((d2>=(r+1)*(r+1))?0:140);
-        if(a){ i32 x=cxi+dx,y=cyi+dy; if(x>=0&&y>=0) fb_blend(fb,x,y,color,a); }
-    }
-}
-void fb_thick_line(Fb* fb, i32 x0, i32 y0, i32 x1, i32 y1, u32 color, i32 thick){
-    i32 dx=x1-x0; if(dx<0)dx=-dx; i32 sx=x0<x1?1:-1;
-    i32 dy=y1-y0; if(dy<0)dy=-dy; dy=-dy; i32 sy=y0<y1?1:-1;
-    i32 err=dx+dy;
-    for(;;){
-        for(i32 t=0;t<thick;t++) if(x0>=0&&(y0+t)>=0) fb_blend(fb,x0,y0+t,color,255);
-        if(x0==x1&&y0==y1) break;
-        i32 e2=2*err;
-        if(e2>=dy){ err+=dy; x0+=sx; }
-        if(e2<=dx){ err+=dx; y0+=sy; }
-    }
-}
-void fb_pulsar_logo(Fb* fb, u32 cx, u32 cy, u32 r, u32 tint, int glow){
-    i32 cxi=cx, cyi=cy, ri=r;
-    if(glow){
-        for(i32 dy=-(ri+10); dy<=ri+10; dy++) for(i32 dx=-(ri+10); dx<=ri+10; dx++){
-            i32 d=(i32)isqrt_u((u32)(dx*dx+dy*dy));
-            if(d>ri&&d<=ri+10){ u32 a=((u32)(ri+10-d)*8); if(a>50)a=50;
-                i32 x=cxi+dx,y=cyi+dy; if(x>=0&&y>=0) fb_blend(fb,x,y,tint,a); }
+void fb_ring(Fb* fb, i32 cx, i32 cy, i32 r, i32 t, u32 c, u32 a){
+    Rect cr=rect_and(rect(cx-r-1,cy-r-1,2*r+3,2*r+3),fb->clip);
+    for(i32 y=cr.y;y<cr.y+cr.h;y++){
+        i32 py=y*16+8-cy*16;
+        for(i32 x=cr.x;x<cr.x+cr.w;x++){
+            i32 px=x*16+8-cx*16;
+            i32 d=(i32)isqrt_u((u32)(px*px+py*py));
+            i32 o=r*16+8-d, in=d-(r-t)*16+8;
+            i32 cov=o<in?o:in; if(cov<=0) continue; if(cov>16) cov=16;
+            u32 al=(u32)(cov*16); if(al>255) al=255;
+            fb_blend(fb,x,y,c,al*a/255);
         }
     }
-    /* disco translucido interno */
-    for(i32 dy=-ri; dy<=ri; dy++) for(i32 dx=-ri; dx<=ri; dx++){
-        i32 d2=dx*dx+dy*dy;
-        if(d2<=(ri-3)*(ri-3)){ i32 x=cxi+dx,y=cyi+dy; if(x>=0&&y>=0) fb_blend(fb,x,y,tint,28); }
+}
+void fb_line(Fb* fb, i32 x0, i32 y0, i32 x1, i32 y1, i32 width, u32 c, u32 a){
+    i32 X0=x0*16,Y0=y0*16,X1=x1*16,Y1=y1*16,hw=width*8;
+    i32 minx=(X0<X1?X0:X1)-hw, miny=(Y0<Y1?Y0:Y1)-hw;
+    i32 maxx=(X0>X1?X0:X1)+hw, maxy=(Y0>Y1?Y0:Y1)+hw;
+    Rect cr=rect_and(rect(minx/16-1,miny/16-1,(maxx-minx)/16+3,(maxy-miny)/16+3),fb->clip);
+    i64 dx=X1-X0, dy=Y1-Y0, len2=dx*dx+dy*dy; if(len2<1) len2=1;
+    for(i32 y=cr.y;y<cr.y+cr.h;y++){
+        i64 py=y*16+8;
+        for(i32 x=cr.x;x<cr.x+cr.w;x++){
+            i64 px=x*16+8;
+            i64 t=(px-X0)*dx+(py-Y0)*dy; if(t<0)t=0; if(t>len2)t=len2;
+            i64 qx=X0+dx*t/len2-px, qy=Y0+dy*t/len2-py;
+            i64 dd=qx*qx+qy*qy; if(dd>0xFFFFFFFFL) continue;
+            i32 d=(i32)isqrt_u((u32)dd);
+            i32 cov=hw+8-d; if(cov<=0) continue; if(cov>16) cov=16;
+            u32 al=(u32)(cov*16); if(al>255) al=255;
+            fb_blend(fb,x,y,c,al*a/255);
+        }
     }
-    /* anel */
-    for(i32 dy=-ri; dy<=ri; dy++) for(i32 dx=-ri; dx<=ri; dx++){
-        i32 d=(i32)isqrt_u((u32)(dx*dx+dy*dy));
-        if(d>=ri-3&&d<=ri){ u32 a=(d==ri||d==ri-3)?160:255;
-            i32 x=cxi+dx,y=cyi+dy; if(x>=0&&y>=0) fb_blend(fb,x,y,tint,a); }
+}
+
+Theme theme_make(int dark, u32 accent){
+    Theme t;
+    t.dark=dark; t.accent=accent?accent:0x0A84FF;
+    if(dark){
+        t.win_bg=0x1E1F24; t.side_bg=0x26272D; t.text=0xF2F2F7; t.text2=0xA1A1A8; t.text3=0x6C6C73;
+        t.sep=0x3A3A40; t.ctrl_bg=0x3A3B41; t.ctrl_border=0x4A4B52; t.field_bg=0x2A2B30; t.hover=0x3A3B42;
+    } else {
+        t.win_bg=0xFFFFFF; t.side_bg=0xF2F2F6; t.text=0x1D1D1F; t.text2=0x6E6E73; t.text3=0xA0A0A6;
+        t.sep=0xE2E2E7; t.ctrl_bg=0xFFFFFF; t.ctrl_border=0xD2D2D7; t.field_bg=0xFFFFFF; t.hover=0xE8E8ED;
     }
-    /* traçado de batimento (ECG) */
-    i32 span=(ri*7)/10;
-    i32 pts[7][2]={ {-span,0},{-span/2,0},{-span/4,-ri/6},{0,-ri/2},{span/6,ri/3},{span/2,0},{span,0} };
-    for(int k=0;k<6;k++)
-        fb_thick_line(fb, cxi+pts[k][0],cyi+pts[k][1], cxi+pts[k+1][0],cyi+pts[k+1][1], 0xFFFFFF, 2);
-    fb_disc(fb, cxi, cyi-ri/2, 3, 0xFFFFFF);
+    return t;
+}
+
+void ui_button(Fb* fb, Rect r, const char* label, const Theme* th, int primary, int hover){
+    if(primary){
+        fb_round_grad(fb,r,7,shade(th->accent,hover?40:20),th->accent);
+        text_center(fb,&FONT_UI_BOLD,r,label,0xFFFFFF);
+    } else {
+        fb_shadow(fb,r,7,3,1,25);
+        fb_round_rect(fb,r,7,hover?th->hover:th->ctrl_bg);
+        fb_round_border(fb,r,7,th->ctrl_border,255);
+        text_center(fb,&FONT_UI,r,label,th->text);
+    }
 }

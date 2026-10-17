@@ -1,3 +1,17 @@
-BEM VINDO AO PULSAR OS
-EDITOR DE TEXTO NATIVO
-DIGITE E SALVE COM CTRL S
+Bem-vindo ao Pulsar OS!
+
+Este é o Editor de texto. Experimente:
+  - digite com acentos (á, ã, ç, ê): o teclado ABNT2 tem teclas mortas;
+  - salve com Ctrl+S;
+  - use as setas, Home/End e PgUp/PgDn para navegar.
+
+Atalhos úteis do sistema:
+  Ctrl+Espaço      buscar apps, arquivos e comandos (aceita contas: 12*7)
+  Alt+Tab          alternar janelas
+  Super+Esq./Dir.  encaixar a janela na metade da tela
+  Ctrl+Shift+Esc   Monitor do Sistema (gerenciador de tarefas)
+  F1               lista completa de atalhos
+
+Tudo o que você muda em Configurações fica no arquivo pulsar.cfg.
+Abra-o aqui no Editor, altere (ex.: theme=dark) e salve: o desktop
+aplica na hora.

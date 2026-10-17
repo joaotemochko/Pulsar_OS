@@ -1,125 +1,322 @@
-/* terminal.c — app de terminal do Pulsar em C. Desenha na sua superfície,
- * aceita digitação (via WM), e interpreta comandos simples. */
+/* terminal.c — Terminal do Pulsar OS (C). Um shell com comandos no estilo
+ * Unix (ls, cat, ps, kill, open, date, free, uname, neofetch...), historico
+ * com as setas e completar com Tab. Desenha na propria superficie e segue o
+ * tema (claro/escuro) do sistema. */
 #include "pulsar.h"
 
-#define MAXLINE 128
-#define MAXHIST 14
-#define COL_BG    0x001A2230
-#define COL_FG    0x00D8E4F0
-#define COL_PROMPT 0x0057D497
-#define COL_DIM   0x007C8697
+#define COLS 160
+#define LINES 300
+#define MAXLINE 120
+#define HIST 16
 
-/* keymap evdev -> ascii (simplificado, minúsculas) */
-static char keymap(u16 code){
-    static const char* row1="1234567890";
-    static const char* row2="qwertyuiop";
-    static const char* row3="asdfghjkl";
-    static const char* row4="zxcvbnm";
-    if(code>=2 && code<=11) return row1[code-2];
-    if(code>=16 && code<=25) return row2[code-16];
-    if(code>=30 && code<=38) return row3[code-30];
-    if(code>=44 && code<=50) return row4[code-44];
-    if(code==57) return ' ';
-    if(code==52) return '.';
-    if(code==12) return '-';
-    return 0;
+typedef struct { char t[COLS]; u8 kind; } Line;   /* kind: 0 saida, 1 eco, 2 erro, 3 destaque */
+
+static Line lines[LINES];
+static int nlines = 0;
+static int scroll = 0;            /* linhas acima do fim */
+static char cmd[MAXLINE];
+static int cmdlen = 0, cur = 0;   /* bytes; cursor em bytes */
+static char hist[HIST][MAXLINE];
+static int nhist = 0, hpos = -1;
+static App app;
+
+static void out(const char* s, int kind){
+    if(nlines == LINES){ memmove(lines, lines + 1, sizeof(Line) * (LINES - 1)); nlines--; }
+    int n = 0;
+    while(s[n] && n < COLS - 1){ lines[nlines].t[n] = s[n]; n++; }
+    lines[nlines].t[n] = 0;
+    lines[nlines].kind = (u8)kind;
+    nlines++;
 }
 
-static char hist[MAXHIST][MAXLINE];
-static int  hist_len[MAXHIST];
-static int  nhist=0;
-static char line[MAXLINE];
-static int  linelen=0;
+static int word(const char* s, const char* w){
+    int n = strlen(w);
+    return strncmp(s, w, n) == 0 && (s[n] == 0 || s[n] == ' ');
+}
 
-static void push_hist(const char* s, int n){
-    if(nhist>=MAXHIST){
-        for(int i=1;i<MAXHIST;i++){ memcpy(hist[i-1],hist[i],MAXLINE); hist_len[i-1]=hist_len[i]; }
-        nhist=MAXHIST-1;
+static const char* arg1(const char* s){
+    while(*s && *s != ' ') s++;
+    while(*s == ' ') s++;
+    return s;
+}
+
+static int find_file(const char* name){
+    u8 st[44];
+    for(u64 i = 0; i < sys_fs_count(); i++){
+        if(sys_fs_stat(i, st) >= 0 && strcmp((char*)st, name) == 0) return (int)i;
     }
-    int k=n<MAXLINE?n:MAXLINE-1;
-    memcpy(hist[nhist],s,k); hist_len[nhist]=k; nhist++;
+    return -1;
 }
 
-static int streq(const char* a, const char* b, int n){
-    for(int i=0;i<n;i++) if(a[i]!=b[i]) return 0;
-    return 1;
+static void cmd_ls(void){
+    u8 st[44]; char b[COLS];
+    u64 n = sys_fs_count(), total = 0;
+    for(u64 i = 0; i < n; i++){
+        if(sys_fs_stat(i, st) < 0) continue;
+        u32 size = *(u32*)(st + 36), kind = *(u32*)(st + 40);
+        total += size;
+        char* p = b;
+        p = fmt_s(p, kind == 1 ? "  -rwx  " : "  -rw-  ");
+        char sz[24]; fmt_size(sz, size);
+        int pad = 10 - (int)strlen(sz);
+        while(pad-- > 0) *p++ = ' ';
+        p = fmt_s(p, sz); p = fmt_s(p, "   ");
+        fmt_s(p, (char*)st);
+        out(b, kind == 1 ? 3 : 0);
+    }
+    char* p = fmt_s(b, "  "); p = fmt_u(p, n); p = fmt_s(p, " arquivos, "); fmt_size(p, total);
+    out(b, 0);
 }
 
-/* interpreta o comando digitado, empurrando saída no histórico */
-static void run_cmd(void){
-    push_hist(line, linelen);  /* eco do comando com prompt embutido no draw */
-    if(linelen==0){ return; }
-    if(linelen>=4 && streq(line,"help",4)){
-        push_hist("comandos: help, echo, clear, ver, files", 40);
-    } else if(linelen>=5 && streq(line,"clear",5)){
-        nhist=0;
-    } else if(linelen>=4 && streq(line,"echo",4)){
-        int s=4; while(s<linelen && line[s]==' ') s++;
-        push_hist(line+s, linelen-s);
-    } else if(linelen>=3 && streq(line,"ver",3)){
-        push_hist("Pulsar OS - terminal em C (libc minima)", 40);
-    } else if(linelen>=5 && streq(line,"files",5)){
-        /* conta arquivos via IPC do fsd */
-        i64 fs=sys_lookup(SVC_FS);
-        if(fs>=0){
-            Msg m; memset(&m,0,sizeof m); m.tag=FS_OP_COUNT; ipc_send((u64)fs,&m);
-            char buf[32]; int p=0;
-            const char* pre="arquivos no disco: ";
-            for(const char* q=pre;*q;q++) buf[p++]=*q;
-            u64 n=m.data[0]; if(n==0) buf[p++]='0';
-            else { char tmp[8]; int t=0; while(n){tmp[t++]='0'+n%10;n/=10;} while(t) buf[p++]=tmp[--t]; }
-            push_hist(buf,p);
+static void cmd_cat(const char* name){
+    static char buf[16384];
+    int idx = find_file(name);
+    if(idx < 0){ out("cat: arquivo nao encontrado", 2); return; }
+    i64 n = sys_fs_read((u64)idx, buf, sizeof buf - 1);
+    if(n < 0){ out("cat: erro de leitura", 2); return; }
+    buf[n] = 0;
+    char line[COLS]; int k = 0;
+    for(i64 i = 0; i <= n; i++){
+        char c = buf[i];
+        if(c == '\n' || c == 0 || k == COLS - 2){
+            line[k] = 0; out(line, 0); k = 0;
+            if(c == 0) break;
+            if(c != '\n') line[k++] = c;
+        } else if((u8)c >= 32 || (u8)c >= 0x80) line[k++] = c;
+        else if(c == '\t'){ for(int t = 0; t < 4 && k < COLS - 2; t++) line[k++] = ' '; }
+    }
+}
+
+static void cmd_ps(void){
+    ProcInfo p; char b[COLS];
+    static const char* st[] = {"?", "rodando", "pronto", "dormindo", "esperando"};
+    out("  PID  CPU  ESTADO      TEMPO      NOME", 3);
+    for(u64 s = 0;; s++){
+        i64 r = sys_proc_info(s, &p);
+        if(r == -2) break;
+        if(r < 0) continue;
+        char* q = b; char t[24];
+        fmt_u(t, p.pid); int pad = 5 - (int)strlen(t); while(pad-- > 0) *q++ = ' ';
+        q = fmt_s(q, t); q = fmt_s(q, "  ");
+        q = fmt_u(q, p.cpu); q = fmt_s(q, "    ");
+        const char* sn = p.state < 5 ? st[p.state] : "?";
+        q = fmt_s(q, sn); pad = 12 - (int)strlen(sn); while(pad-- > 0) *q++ = ' ';
+        fmt_u(t, p.cpu_ms); q = fmt_s(q, t); q = fmt_s(q, " ms");
+        pad = 8 - (int)strlen(t); while(pad-- > 0) *q++ = ' ';
+        fmt_s(q, p.name);
+        out(b, 0);
+    }
+}
+
+static void cmd_date(void){
+    static const char* wd[] = {"domingo", "segunda", "terca", "quarta", "quinta", "sexta", "sabado"};
+    static const char* mo[] = {"jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"};
+    u32 y, m, d, h, mi, s, w;
+    civil_time(sys_rtc(), &y, &m, &d, &h, &mi, &s, &w);
+    char b[64], *p = b;
+    p = fmt_s(p, wd[w % 7]); p = fmt_s(p, ", "); p = fmt_u(p, d); p = fmt_s(p, " de ");
+    p = fmt_s(p, mo[(m + 11) % 12]); p = fmt_s(p, " de "); p = fmt_u(p, y); p = fmt_s(p, "  ");
+    if(h < 10) *p++ = '0'; p = fmt_u(p, h); *p++ = ':';
+    if(mi < 10) *p++ = '0'; p = fmt_u(p, mi); *p++ = ':';
+    if(s < 10) *p++ = '0'; p = fmt_u(p, s); fmt_s(p, " UTC");
+    out(b, 0);
+}
+
+static void cmd_free(void){
+    SysInfo si; sys_sysinfo(&si);
+    char b[COLS], *p = b;
+    out("         total        usado        livre", 3);
+    char t[24]; p = fmt_s(b, "Mem:  ");
+    fmt_size(t, (u64)si.mem_total_kb * 1024); p = fmt_s(p, t); p = fmt_s(p, "     ");
+    fmt_size(t, (u64)(si.mem_total_kb - si.mem_free_kb) * 1024); p = fmt_s(p, t); p = fmt_s(p, "     ");
+    fmt_size(t, (u64)si.mem_free_kb * 1024); fmt_s(p, t);
+    out(b, 0);
+}
+
+static void cmd_cpus(void){
+    char b[COLS];
+    for(u64 c = 0; c < 8; c++){
+        i64 l = sys_cpu_load(c);
+        if(l < 0) continue;
+        char* p = fmt_s(b, "cpu"); p = fmt_u(p, c); p = fmt_s(p, "  [");
+        for(int k = 0; k < 20; k++) *p++ = k < l / 5 ? '#' : '.';
+        p = fmt_s(p, "]  "); p = fmt_u(p, (u64)l); fmt_s(p, "%");
+        out(b, 0);
+    }
+}
+
+static void cmd_uname(void){
+    SysInfo si; sys_sysinfo(&si);
+    char b[COLS], *p = fmt_s(b, "Pulsar OS 0.2 (Nebulosa) ");
+    p = fmt_s(p, si.arch_name); p = fmt_s(p, " SMP "); p = fmt_u(p, si.ncpus); fmt_s(p, " CPU(s) microkernel");
+    out(b, 0);
+}
+
+static void cmd_neofetch(void){
+    SysInfo si; sys_sysinfo(&si);
+    static const char* logo[] = {
+        "     .-~~~-.     ", "   .'  .-.  '.   ", "  /   (   )   \\  ", " |  ~~/\\_/\\~~  | ",
+        "  \\   (   )   /  ", "   '.  '-'  .'   ", "     '-~~~-'     ",
+    };
+    char info[7][COLS]; char t[32];
+    fmt_s(info[0], "usuario@pulsar");
+    fmt_s(info[1], "--------------");
+    char* p = fmt_s(info[2], "SO: Pulsar OS 0.2 "); fmt_s(p, si.arch_name);
+    p = fmt_s(info[3], "Kernel: microkernel SMP, "); p = fmt_u(p, si.ncpus); fmt_s(p, " CPU(s)");
+    p = fmt_s(info[4], "Resolucao: "); p = fmt_u(p, si.fb_w); p = fmt_s(p, "x"); fmt_u(p, si.fb_h);
+    fmt_size(t, (u64)(si.mem_total_kb - si.mem_free_kb) * 1024);
+    p = fmt_s(info[5], "Memoria: "); p = fmt_s(p, t); p = fmt_s(p, " / "); fmt_size(t, (u64)si.mem_total_kb * 1024); fmt_s(p, t);
+    u64 up = si.uptime_ms / 1000;
+    p = fmt_s(info[6], "Ativo ha: "); p = fmt_u(p, up / 60); p = fmt_s(p, " min "); p = fmt_u(p, up % 60); fmt_s(p, " s");
+    for(int i = 0; i < 7; i++){
+        char b[COLS]; char* q = fmt_s(b, logo[i]); q = fmt_s(q, "  "); fmt_s(q, info[i]);
+        out(b, i == 0 ? 3 : 0);
+    }
+}
+
+static const char* CMDS[] = {"help", "clear", "echo", "ls", "cat", "ps", "kill", "open", "date",
+    "uptime", "free", "cpus", "uname", "neofetch", "history", "exit", "poweroff", 0};
+
+static void run(void){
+    char echo[COLS]; char* p = fmt_s(echo, "pulsar ~ $ "); fmt_s(p, cmd);
+    out(echo, 1);
+    const char* c = cmd;
+    while(*c == ' ') c++;
+    if(!*c) return;
+    if(nhist == HIST){ memmove(hist, hist + 1, sizeof(hist[0]) * (HIST - 1)); nhist--; }
+    strcpy(hist[nhist++], c);
+    if(word(c, "help")){
+        out("Comandos disponiveis:", 3);
+        out("  ls  cat <arq>  ps  kill <pid>  open <app>  date  uptime", 0);
+        out("  free  cpus  uname  neofetch  echo <txt>  history  clear  exit  poweroff", 0);
+        out("Apps: editor, calc, vela, netmon, sysmon, ball (ex.: open calc)", 0);
+        out("Setas: historico | Tab: completar | Ctrl+L: limpar", 0);
+    } else if(word(c, "clear")){ nlines = 0; }
+    else if(word(c, "echo")){ out(arg1(c), 0); }
+    else if(word(c, "ls")){ cmd_ls(); }
+    else if(word(c, "cat")){ cmd_cat(arg1(c)); }
+    else if(word(c, "ps")){ cmd_ps(); }
+    else if(word(c, "kill")){
+        const char* a = arg1(c); u64 pid = 0;
+        if(!*a){ out("uso: kill <pid>", 2); return; }
+        while(*a >= '0' && *a <= '9') pid = pid * 10 + (u64)(*a++ - '0');
+        i64 r = sys_kill(pid);
+        out(r == 0 ? "processo encerrado" : "kill: pid invalido", r == 0 ? 0 : 2);
+    } else if(word(c, "open")){
+        const char* a = arg1(c); char name[40];
+        char* q = fmt_s(name, a);
+        if(strlen(a) < 6 || strcmp(q - 6, ".pulse") != 0) fmt_s(q, ".pulse");
+        i64 pid = sys_spawn(name, strlen(name));
+        char b[64]; if(pid >= 0){ char* r = fmt_s(b, "iniciado: pid "); fmt_u(r, (u64)pid); out(b, 0); }
+        else out("open: programa nao encontrado", 2);
+    } else if(word(c, "date")){ cmd_date(); }
+    else if(word(c, "uptime")){
+        u64 s = sys_time_ms() / 1000; char b[64];
+        char* r = fmt_s(b, "ativo ha "); r = fmt_u(r, s / 3600); r = fmt_s(r, "h "); r = fmt_u(r, (s / 60) % 60);
+        r = fmt_s(r, "min "); r = fmt_u(r, s % 60); fmt_s(r, "s"); out(b, 0);
+    }
+    else if(word(c, "free")){ cmd_free(); }
+    else if(word(c, "cpus")){ cmd_cpus(); }
+    else if(word(c, "uname")){ cmd_uname(); }
+    else if(word(c, "neofetch")){ cmd_neofetch(); }
+    else if(word(c, "history")){ for(int i = 0; i < nhist; i++) out(hist[i], 0); }
+    else if(word(c, "exit")){ sys_exit(); }
+    else if(word(c, "poweroff")){ sys_poweroff(); }
+    else { char b[COLS]; char* r = fmt_s(b, c); fmt_s(r, ": comando nao encontrado (digite help)"); out(b, 2); }
+}
+
+static void complete(void){
+    for(int i = 0; CMDS[i]; i++){
+        if(cmdlen > 0 && strncmp(CMDS[i], cmd, cmdlen) == 0){
+            fmt_s(cmd, CMDS[i]); cmdlen = cur = strlen(cmd);
+            cmd[cmdlen++] = ' '; cmd[cmdlen] = 0; cur = cmdlen;
+            return;
         }
-    } else {
-        push_hist("comando desconhecido (tente 'help')", 35);
+    }
+}
+
+static void insert(u32 ch){
+    char e[4]; int n = utf8_encode(ch, e);
+    if(cmdlen + n >= MAXLINE - 1) return;
+    memmove(cmd + cur + n, cmd + cur, cmdlen - cur);
+    memcpy(cmd + cur, e, n);
+    cmdlen += n; cur += n; cmd[cmdlen] = 0;
+}
+
+static void key(WmEvent* e){
+    switch(e->key){
+    case KEY_ENTER: case KEY_KPENTER: run(); cmdlen = cur = 0; cmd[0] = 0; hpos = -1; scroll = 0; return;
+    case KEY_BACKSPACE:
+        if(cur > 0){
+            int s = cur - 1; while(s > 0 && ((u8)cmd[s] & 0xC0) == 0x80) s--;
+            memmove(cmd + s, cmd + cur, cmdlen - cur); cmdlen -= cur - s; cur = s; cmd[cmdlen] = 0;
+        }
+        return;
+    case KEY_LEFT: while(cur > 0){ cur--; if(((u8)cmd[cur] & 0xC0) != 0x80) break; } return;
+    case KEY_RIGHT: while(cur < cmdlen){ cur++; if(cur == cmdlen || ((u8)cmd[cur] & 0xC0) != 0x80) break; } return;
+    case KEY_HOME: cur = 0; return;
+    case KEY_END: cur = cmdlen; return;
+    case KEY_TAB: complete(); return;
+    case KEY_PGUP: scroll += 10; return;
+    case KEY_PGDN: scroll = scroll > 10 ? scroll - 10 : 0; return;
+    case KEY_UP: case KEY_DOWN:
+        if(nhist == 0) return;
+        if(e->key == KEY_UP) hpos = hpos < 0 ? nhist - 1 : (hpos > 0 ? hpos - 1 : 0);
+        else { if(hpos < 0) return; hpos++; if(hpos >= nhist){ hpos = -1; cmd[0] = 0; cmdlen = cur = 0; return; } }
+        fmt_s(cmd, hist[hpos]); cmdlen = cur = strlen(cmd);
+        return;
+    }
+    if((e->mods & MOD_CTRL) && e->key == 38){ nlines = 0; return; }   /* Ctrl+L */
+    if((e->mods & MOD_CTRL) && e->key == 46){ out("^C", 1); cmdlen = cur = 0; cmd[0] = 0; return; }
+    if(e->ch >= 32) insert(e->ch);
+}
+
+static void draw(int caret){
+    Fb* fb = &app.fb;
+    const Theme* th = &app.th;
+    u32 bg = th->dark ? 0x1C1C1E : 0xFFFFFF;
+    u32 fg = th->dark ? 0xE8E8ED : 0x1D1D1F;
+    u32 dim = th->dark ? 0x8E8E93 : 0x6E6E73;
+    u32 err = th->dark ? 0xFF6961 : 0xD70015;
+    u32 prompt = th->dark ? 0x64D27A : 0x1E8E3E;
+    fb_fill(fb, rect(0, 0, app.w, app.h), bg);
+    const Font* f = &FONT_MONO;
+    i32 lh = f->height + 1;
+    i32 rows = (app.h - 16) / lh;
+    int total = nlines + 1;
+    int maxs = total > rows ? total - rows : 0;
+    if(scroll > maxs) scroll = maxs;
+    int first = total - rows - scroll; if(first < 0) first = 0;
+    i32 y = 8;
+    for(int i = first; i < nlines && y < app.h - lh; i++, y += lh){
+        u32 c = lines[i].kind == 2 ? err : lines[i].kind == 3 ? th->accent : lines[i].kind == 1 ? dim : fg;
+        text_draw(fb, f, 10, y, lines[i].t, c);
+    }
+    if(scroll == 0){
+        i32 x = 10 + text_draw(fb, f, 10, y, "pulsar", prompt);
+        x += text_draw(fb, f, x, y, " ~ $ ", th->accent);
+        text_draw(fb, f, x, y, cmd, fg);
+        i32 cx = x + text_width_n(f, cmd, cur);
+        if(caret) fb_fill_a(fb, rect(cx, y + 2, 8, f->height - 2), fg, app.focused ? 160 : 60);
     }
 }
 
 int main(void){
-    puts_("[terminal] iniciando (C, superficie)\n");
-    u64 wm; { i64 p; do { p=sys_lookup(SVC_WM); if(p<0) sys_yield(); } while(p<0); wm=(u64)p; }
-    u64 slot; u32 cw=560, ch=380;
-    wm_hello(wm,5,&slot,&cw,&ch);   /* kind 5 = terminal */
-    Fb surf=surface_open(slot);
-
-    push_hist("Pulsar Terminal - digite 'help'", 31);
-
-    u32 blink=0;
+    app_init(&app, 5, "Terminal", 600, 380);
+    out("Pulsar OS - Terminal. Digite 'help' para ver os comandos.", 3);
+    int caret = 1; u64 blink = sys_time_ms();
+    draw(caret);
+    WmEvent e = app_commit(&app);
     for(;;){
-        WmEvent ev=wm_poll(wm);
-        if(ev.close) sys_exit();
-        /* acoes vindas da barra de menu do WM */
-        if(ev.menu==APP_MENU_CLEAR){ nhist=0; push_hist("(limpo pelo menu)",17); }
-        else if(ev.menu==APP_MENU_PASTE){ push_hist("colar: buffer vazio",19); }
-        else if(ev.menu==APP_MENU_COPY){ push_hist("copiar: ok",10); }
-        if(ev.key){
-            if(ev.key==28){ run_cmd(); linelen=0; }        /* enter */
-            else if(ev.key==14){ if(linelen>0) linelen--; } /* backspace */
-            else { char c=keymap(ev.key); if(c && linelen<MAXLINE-1) line[linelen++]=c; }
-        }
-
-        /* desenha o terminal na superfície */
-        fb_fill(&surf,0,0,cw,ch,COL_BG);
-        i32 y=12;
-        for(int i=0;i<nhist;i++){
-            /* linhas do histórico; a última pode ser eco de comando */
-            char tmp[MAXLINE+1];
-            int n=hist_len[i]; if(n>MAXLINE)n=MAXLINE;
-            memcpy(tmp,hist[i],n); tmp[n]=0;
-            text_ui_a(&surf,12,y,tmp,COL_FG,230);
-            y+=22;
-        }
-        /* linha de prompt atual */
-        text_ui(&surf,12,y,"pulsar$",COL_PROMPT);
-        char cur[MAXLINE+1]; memcpy(cur,line,linelen); cur[linelen]=0;
-        i32 px=12+text_ui_width("pulsar$")+8;
-        px+=text_ui(&surf,px,y,cur,COL_FG);
-        /* cursor piscando */
-        blink++;
-        if((blink/20)%2==0) fb_fill(&surf,px+2,y+2,2,16,COL_FG);
-
-        wm_commit(wm,slot);
-        sys_yield();
+        if(e.close) sys_exit();
+        int dirty = e.changed;
+        if(e.menu == APP_MENU_CLEAR){ nlines = 0; dirty = 1; }
+        if(e.key){ key(&e); caret = 1; blink = sys_time_ms(); dirty = 1; }
+        if(e.wheel){ scroll += e.wheel * 3; if(scroll < 0) scroll = 0; dirty = 1; }
+        if(sys_time_ms() - blink > 530){ caret = !caret; blink = sys_time_ms(); dirty = 1; }
+        if(e.more){ e = app_poll(&app); continue; }
+        if(dirty){ draw(caret); e = app_commit(&app); }
+        else e = app_poll(&app);
     }
     return 0;
 }

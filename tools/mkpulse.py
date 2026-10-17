@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""mkpulse.py — converte um ELF64 AArch64 em executavel .pulse v2.
+"""mkpulse.py — converte um ELF64 (AArch64 ou RISC-V RV64) em executavel .pulse v2.
 
 Uso: mkpulse.py <entrada.elf> <saida.pulse> <stack_top_hex>
 
 Le os program headers PT_LOAD e gera um segmento .pulse para cada um,
 preservando as flags R/W/X (o loader do kernel aplica W^X por segmento).
-O entry point vem do e_entry do ELF.
+O entry point vem do e_entry do ELF. A arquitetura (e_machine) e gravada
+no cabecalho: o kernel recusa executaveis de outra arquitetura.
 """
 import struct, sys
 
@@ -13,6 +14,8 @@ PULSE_MAGIC = 0x534C5550  # "PULS"
 PT_LOAD = 1
 PF_X, PF_W, PF_R = 1, 2, 4
 SEG_R, SEG_W, SEG_X = 1, 2, 4
+EM_AARCH64, EM_RISCV = 183, 243
+ARCH_IDS = {EM_AARCH64: (1, "AArch64"), EM_RISCV: (2, "RISC-V RV64")}
 
 def main():
     if len(sys.argv) != 4:
@@ -21,6 +24,9 @@ def main():
 
     data = open(elf_path, 'rb').read()
     assert data[:4] == b'\x7fELF' and data[4] == 2, "esperado ELF64"
+    e_machine = struct.unpack_from('<H', data, 18)[0]
+    assert e_machine in ARCH_IDS, f"arquitetura ELF nao suportada: {e_machine}"
+    arch_id, arch_name = ARCH_IDS[e_machine]
     e_entry, e_phoff = struct.unpack_from('<QQ', data, 24)
     e_phentsize, e_phnum = struct.unpack_from('<HH', data, 54)
 
@@ -46,7 +52,7 @@ def main():
 
     out = bytearray()
     out += struct.pack('<IHHQIIQ', PULSE_MAGIC, 2, len(segs), e_entry,
-                       table_off, 0, stack_top)
+                       table_off, arch_id, stack_top)
     blobs = bytearray()
     for p_offset, p_filesz, p_vaddr, p_memsz, flags in segs:
         file_off = data_off + len(blobs)
@@ -55,7 +61,7 @@ def main():
     out += blobs
 
     open(out_path, 'wb').write(out)
-    print(f"[mkpulse] {out_path}: entry={e_entry:#x} stack={stack_top:#x} "
+    print(f"[mkpulse] {out_path} ({arch_name}): entry={e_entry:#x} stack={stack_top:#x} "
           f"{len(segs)} seg(s), {len(out)} bytes")
     for i, (_, fsz, va, msz, fl) in enumerate(segs):
         perm = ('R' if fl & SEG_R else '-') + ('W' if fl & SEG_W else '-') + \

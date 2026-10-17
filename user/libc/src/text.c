@@ -1,22 +1,46 @@
-/* text.c — renderizador de texto anti-aliased (fonte Poppins). */
+/* text.c — texto anti-aliased UTF-8 (ASCII + Latin-1) com as fontes Noto. */
 #include "pulsar.h"
-#include "font_ui.h"
 
-static i32 draw_glyphs(Fb* fb, i32 x, i32 y, const char* s, u32 color, u32 alpha){
-    i32 pen=x;
-    for(const u8* p=(const u8*)s; *p; p++){
-        u8 c=*p;
-        if(c<32||c>126){ pen+=6; continue; }
-        const Glyph* g=&FONTUI_GLYPHS[c-32];
-        i32 gx=pen+g->left;
-        i32 gy=y+FONTUI_ASCENT+g->top;
-        const u8* data=&FONTUI_PIX[g->off];
-        for(i32 row=0; row<g->h; row++){
-            for(i32 col=0; col<g->w; col++){
-                u32 a=data[row*g->w+col];
-                if(a){
-                    i32 pxx=gx+col, pyy=gy+row;
-                    if(pxx>=0&&pyy>=0) fb_blend(fb,pxx,pyy,color,a*alpha/255);
+u32 utf8_next(const char* s, int* i){
+    u8 b=(u8)s[*i]; (*i)++;
+    if(b<0x80) return b;
+    int len; u32 cp;
+    if((b&0xE0)==0xC0){ len=1; cp=b&0x1F; }
+    else if((b&0xF0)==0xE0){ len=2; cp=b&0x0F; }
+    else if((b&0xF8)==0xF0){ len=3; cp=b&0x07; }
+    else return '?';
+    for(int k=0;k<len;k++){
+        u8 c=(u8)s[*i];
+        if((c&0xC0)!=0x80) return '?';
+        cp=(cp<<6)|(c&0x3F); (*i)++;
+    }
+    return cp;
+}
+
+static const Glyph* glyph(const Font* f, u32 cp){
+    int idx;
+    if(cp>=32&&cp<=126) idx=(int)cp-32;
+    else if(cp>=160&&cp<=255) idx=(int)cp-160+95;
+    else idx='?'-32;
+    return &f->glyphs[idx];
+}
+
+i32 text_draw_n(Fb* fb, const Font* f, i32 x, i32 y, const char* s, int n, u32 c){
+    i32 pen=x; int i=0;
+    Rect cl=fb->clip;
+    while(i<n && s[i]){
+        u32 cp=utf8_next(s,&i);
+        const Glyph* g=glyph(f,cp);
+        i32 gx=pen+g->left, gy=y+f->ascent+g->top;
+        if(g->w && gx<cl.x+cl.w && gx+g->w>cl.x && gy<cl.y+cl.h && gy+g->h>cl.y){
+            const u8* d=f->pix+g->off;
+            for(i32 r=0;r<g->h;r++){
+                i32 py=gy+r; if(py<cl.y||py>=cl.y+cl.h) continue;
+                u32* row=fb->base+(i64)py*fb->stride;
+                for(i32 k=0;k<g->w;k++){
+                    u32 a=d[r*g->w+k]; if(!a) continue;
+                    i32 px=gx+k; if(px<cl.x||px>=cl.x+cl.w) continue;
+                    row[px]=mix(row[px],c,a);
                 }
             }
         }
@@ -24,14 +48,18 @@ static i32 draw_glyphs(Fb* fb, i32 x, i32 y, const char* s, u32 color, u32 alpha
     }
     return pen-x;
 }
-i32 text_ui(Fb* fb, i32 x, i32 y, const char* s, u32 color){ return draw_glyphs(fb,x,y,s,color,255); }
-i32 text_ui_a(Fb* fb, i32 x, i32 y, const char* s, u32 color, u32 alpha){ return draw_glyphs(fb,x,y,s,color,alpha); }
-i32 text_ui_width(const char* s){
-    i32 w=0;
-    for(const u8* p=(const u8*)s; *p; p++){
-        u8 c=*p;
-        if(c<32||c>126){ w+=6; continue; }
-        w+=FONTUI_GLYPHS[c-32].adv;
-    }
+i32 text_draw(Fb* fb, const Font* f, i32 x, i32 y, const char* s, u32 c){
+    return text_draw_n(fb,f,x,y,s,0x7FFFFFFF,c);
+}
+i32 text_width_n(const Font* f, const char* s, int n){
+    i32 w=0; int i=0;
+    while(i<n && s[i]) w+=glyph(f,utf8_next(s,&i))->adv;
     return w;
+}
+i32 text_width(const Font* f, const char* s){ return text_width_n(f,s,0x7FFFFFFF); }
+void text_center(Fb* fb, const Font* f, Rect r, const char* s, u32 c){
+    text_draw(fb,f,r.x+(r.w-text_width(f,s))/2,r.y+(r.h-f->height)/2,s,c);
+}
+i32 text_right(Fb* fb, const Font* f, i32 right, i32 y, const char* s, u32 c){
+    i32 w=text_width(f,s); text_draw(fb,f,right-w,y,s,c); return w;
 }

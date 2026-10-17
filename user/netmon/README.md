@@ -1,17 +1,7 @@
-# Monitor de Rede do Pulsar (netmon, em C)
+# Rede (C)
 
-Primeiro app com REDE do Pulsar OS. Usa as syscalls de rede do kernel
-(SYS_NET_STATUS, SYS_NET_UDP_SEND) sobre o driver virtio-net.
+Monitor da rede virtio-net: estado da conexão, IP, gateway e DNS do modo
+`user` (SLIRP) do QEMU, e envio de pings UDP de teste ao gateway pela
+syscall `NET_UDP_SEND`. Atalhos: Enter envia um ping; menu **Rede > Atualizar**.
 
-## Recursos
-- Mostra o status da rede (online/offline) e o IP obtido.
-- Botao "Enviar Ping UDP": dispara um datagrama UDP ao gateway (10.0.2.2:9)
-  e conta quantos foram enviados.
-
-## Rede no Pulsar
-O kernel implementa virtio-net + Ethernet + ARP + IPv4 + UDP (kernel/src/net.rs).
-No boot resolve o MAC do gateway via ARP e envia um datagrama de teste.
-O QEMU precisa das flags: -netdev user,id=n0 -device virtio-net-device,netdev=n0
-(ja incluidas no runner do .cargo/config.toml e nos scripts de teste).
-
-Endereco padrao (SLIRP do QEMU): IP 10.0.2.15, gateway 10.0.2.2.
+Compilado pelo `Makefile` da raiz.

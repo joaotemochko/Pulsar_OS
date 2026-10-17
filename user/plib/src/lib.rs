@@ -1,36 +1,31 @@
-//! plib — biblioteca de userspace do Pulsar OS.
-//! Wrappers de syscall, acesso ao framebuffer e fonte 8x8.
+//! plib — biblioteca de userspace do Pulsar OS (Rust).
+//!
+//! * syscalls (AArch64 `svc` / RISC-V `ecall`, mesma numeracao)
+//! * IPC sincrono e protocolos dos servidores (fsd, WM)
+//! * graficos (gfx), texto (text/fonts), icones (icons) e temas (theme)
+//! * teclado com layouts US e ABNT2 (teclas mortas para acentos)
+//! * `App`: esqueleto de cliente do WM (superficie, eventos, tema)
 #![no_std]
 
-mod font_ui;
-mod font_big;
-pub use font_ui::*;
-pub use font_ui::Glyph;
-pub use font_big::*;
+pub mod fonts;
+pub mod gfx;
+pub mod icons;
+pub mod text;
+pub mod theme;
+
+pub use fonts::*;
+pub use gfx::{Fb, Rect};
+pub use theme::Theme;
 
 use core::arch::asm;
 
 // ---------------------------------------------------------------- syscalls
+// AArch64 `svc #0` (numero em x8); RISC-V `ecall` (numero em a7).
+// Argumentos e retorno em x0../a0.. nas duas.
 
+#[cfg(target_arch = "aarch64")]
 #[inline]
-fn syscall2(num: u64, a0: u64, a1: u64) -> u64 {
-    let ret: u64;
-    unsafe {
-        asm!("svc #0", in("x8") num, inout("x0") a0 => ret, in("x1") a1,
-             options(nostack));
-    }
-    ret
-}
-
-#[inline]
-fn syscall0(num: u64) -> u64 {
-    let ret: u64;
-    unsafe { asm!("svc #0", in("x8") num, out("x0") ret, options(nostack)); }
-    ret
-}
-
-#[inline]
-fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+pub fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     let ret: u64;
     unsafe {
         asm!("svc #0", in("x8") num, inout("x0") a0 => ret, in("x1") a1, in("x2") a2,
@@ -39,12 +34,27 @@ fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     ret
 }
 
-pub fn write(s: &str) {
-    syscall2(1, s.as_ptr() as u64, s.len() as u64);
+#[cfg(target_arch = "riscv64")]
+#[inline]
+pub fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!("ecall", in("a7") num, inlateout("a0") a0 => ret, in("a1") a1, in("a2") a2,
+             options(nostack));
+    }
+    ret
 }
-pub fn yield_now() {
-    syscall0(2);
-}
+
+#[inline]
+fn syscall2(num: u64, a0: u64, a1: u64) -> u64 { syscall3(num, a0, a1, 0) }
+#[inline]
+fn syscall1(num: u64, a0: u64) -> u64 { syscall3(num, a0, 0, 0) }
+#[inline]
+fn syscall0(num: u64) -> u64 { syscall3(num, 0, 0, 0) }
+
+pub fn write(s: &str) { syscall2(1, s.as_ptr() as u64, s.len() as u64); }
+pub fn write_bytes(s: &[u8]) { syscall2(1, s.as_ptr() as u64, s.len() as u64); }
+pub fn yield_now() { syscall0(2); }
 pub fn exit() -> ! {
     syscall0(3);
     loop {}
@@ -53,31 +63,127 @@ pub fn fb_info() -> (u32, u32) {
     let v = syscall0(4);
     ((v >> 32) as u32, v as u32)
 }
-pub fn fb_map() -> u64 {
-    syscall0(5)
-}
-pub fn fb_present() {
-    syscall2(6, 0, 0);
-}
-/// Apresenta somente uma regiao (damage rect) — use para nao interferir
-/// com regioes desenhadas por outros processos.
-pub fn fb_present_rect(r: Rect) {
+pub fn fb_map() -> u64 { syscall0(5) }
+/// Apresenta um retangulo do back buffer (damage rect).
+pub fn fb_present(r: Rect) {
+    if r.is_empty() || r.x < 0 || r.y < 0 { return; }
     syscall2(6, ((r.x as u64) << 32) | r.y as u64, ((r.w as u64) << 32) | r.h as u64);
 }
-pub fn fs_count() -> usize {
-    syscall0(8) as usize
-}
-/// Preenche `buf` (>= 44 bytes) com a entrada `idx`. Retorna o tamanho do arquivo.
+pub fn fs_count() -> usize { syscall0(8) as usize }
+/// Preenche `buf` com a entrada `idx`: name[32] start u32 size u32 kind u32.
 pub fn fs_stat(idx: usize, buf: &mut [u8; 44]) -> i64 {
     syscall2(9, idx as u64, buf.as_mut_ptr() as u64) as i64
 }
 pub fn spawn(name: &str) -> i64 {
     syscall2(10, name.as_ptr() as u64, name.len() as u64) as i64
 }
+pub fn getpid() -> usize { syscall0(14) as usize }
+pub fn fs_read(idx: usize, buf: &mut [u8]) -> i64 {
+    syscall3(15, idx as u64, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+pub fn fs_write(idx: usize, data: &[u8]) -> i64 {
+    syscall3(16, idx as u64, data.as_ptr() as u64, data.len() as u64) as i64
+}
+/// Cria um arquivo de texto vazio. Retorna o indice ou <0 (-3 = ja existe).
+pub fn fs_create(name: &[u8]) -> i64 {
+    syscall2(17, name.as_ptr() as u64, name.len() as u64) as i64
+}
+pub fn set_focus(pid: usize) { syscall1(18, pid as u64); }
+pub fn register_service(service_id: u64) { syscall1(19, service_id); }
+pub fn lookup_service(service_id: u64) -> i64 { syscall1(20, service_id) as i64 }
+pub fn surface_map(slot: u64) -> u64 { syscall1(21, slot) }
+pub fn is_alive(pid: usize) -> bool { syscall1(24, pid as u64) != 0 }
+pub fn net_status() -> u32 { syscall0(26) as u32 }
+/// Dorme sem gastar CPU.
+pub fn sleep_ms(ms: u64) { syscall1(29, ms); }
+/// Milissegundos desde o boot (contador de hardware).
+pub fn uptime_ms() -> u64 { syscall0(30) }
+/// Segundos desde 1970 (relogio de tempo real).
+pub fn rtc_seconds() -> u64 { syscall0(31) }
+pub fn kill(pid: usize) -> bool { syscall1(34, pid as u64) == 0 }
+/// Uso (%) da CPU `cpu` no ultimo segundo; None se offline.
+pub fn cpu_load(cpu: usize) -> Option<u32> {
+    let v = syscall1(35, cpu as u64) as i64;
+    if v < 0 { None } else { Some(v as u32) }
+}
+pub fn poweroff() -> ! {
+    syscall0(36);
+    loop {}
+}
+/// Define a imagem (64x64 ARGB) e o hotspot do cursor de hardware.
+pub fn cursor_set(img: &[u32; 64 * 64], hot_x: u32, hot_y: u32, x: i32, y: i32) {
+    syscall3(37, img.as_ptr() as u64, ((hot_x as u64) << 16) | hot_y as u64,
+        ((x.max(0) as u64) << 32) | y.max(0) as u64);
+}
+pub fn cursor_move(x: i32, y: i32) { syscall2(38, x.max(0) as u64, y.max(0) as u64); }
+/// Pid do ultimo processo encerrado por fault (o WM avisa o usuario).
+pub fn last_crash() -> Option<usize> {
+    let v = syscall0(39) as i64;
+    if v < 0 { None } else { Some(v as usize) }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SysInfo {
+    pub arch_id: u32,
+    pub ncpus: u32,
+    pub mem_total_kb: u32,
+    pub mem_free_kb: u32,
+    pub fb_w: u32,
+    pub fb_h: u32,
+    pub uptime_ms: u64,
+    pub arch_name: [u8; 16],
+}
+
+impl SysInfo {
+    pub fn arch(&self) -> &[u8] {
+        let n = self.arch_name.iter().position(|&b| b == 0).unwrap_or(16);
+        &self.arch_name[..n]
+    }
+}
+
+pub fn sysinfo() -> SysInfo {
+    let mut s = SysInfo { arch_id: 0, ncpus: 0, mem_total_kb: 0, mem_free_kb: 0, fb_w: 0, fb_h: 0,
+        uptime_ms: 0, arch_name: [0; 16] };
+    syscall1(32, &mut s as *mut SysInfo as u64);
+    s
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProcInfo {
+    pub pid: u64,
+    /// 1 rodando, 2 pronto, 3 dormindo, 4 bloqueado (IPC)
+    pub state: u32,
+    pub cpu: u32,
+    pub cpu_ms: u64,
+    pub name: [u8; 24],
+}
+
+impl ProcInfo {
+    pub const fn zero() -> ProcInfo {
+        ProcInfo { pid: 0, state: 0, cpu: 0, cpu_ms: 0, name: [0; 24] }
+    }
+    pub fn name(&self) -> &[u8] {
+        let n = self.name.iter().position(|&b| b == 0).unwrap_or(24);
+        &self.name[..n]
+    }
+}
+
+/// Entrada `slot` da tabela de processos: Ok(Some) ocupada, Ok(None)
+/// vazia, Err(()) fim da tabela.
+pub fn proc_info(slot: usize) -> Result<Option<ProcInfo>, ()> {
+    let mut p = ProcInfo::zero();
+    match syscall2(33, slot as u64, &mut p as *mut ProcInfo as u64) as i64 {
+        0 => Ok(Some(p)),
+        -1 => Ok(None),
+        _ => Err(()),
+    }
+}
 
 // ---------------------------------------------------------------- IPC
 
-/// Mensagem de IPC: tag + 6 palavras. Layout casa com o kernel (56 bytes).
+/// Mensagem de IPC: tag + 6 palavras (56 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Msg {
@@ -88,92 +194,146 @@ impl Msg {
     pub const fn new(tag: u64) -> Self { Msg { tag, data: [0; 6] } }
 }
 
-pub fn getpid() -> usize {
-    syscall0(14) as usize
-}
-
-/// Transfere o foco de teclado para o processo `pid` (o kernel roteia o
-/// teclado apenas para o processo com foco; o mouse vai para todos).
-pub fn set_focus(pid: usize) {
-    syscall2(18, pid as u64, 0);
-}
-
-/// Registra o processo atual como servidor do `service_id`.
-pub fn register_service(service_id: u64) {
-    syscall2(19, service_id, 0);
-}
-
-/// Descobre o pid do servidor de `service_id` (ou <0 se ausente).
-pub fn lookup_service(service_id: u64) -> i64 {
-    syscall2(20, service_id, 0) as i64
-}
-
-/// ID do servico de filesystem.
-pub const SVC_FS: u64 = 1;
-
-// Opcodes do protocolo FS (tag da mensagem)
-pub const FS_OP_COUNT: u64 = 1;   // -> data[0] = numero de arquivos
-pub const FS_OP_STAT: u64  = 2;   // data[0]=idx -> data: size, kind, nome(4 palavras)
-pub const FS_OP_READ: u64  = 3;   // data[0]=idx, data[1]=offset -> ate 40 bytes por msg
-pub const FS_OP_WRITE: u64 = 4;   // (reservado)
-
-/// Envia `m` para o processo `dst` e bloqueia ate a resposta.
-/// A resposta sobrescreve `m`. Retorna 0 (ok) ou <0 (dst invalido).
+/// Envia e bloqueia ate a resposta (que sobrescreve `m`). 0 ok, <0 erro.
 pub fn send(dst: usize, m: &mut Msg) -> i64 {
     syscall2(11, dst as u64, m as *mut Msg as u64) as i64
 }
-
-/// Bloqueia ate receber. Preenche `m`. Retorna o pid do remetente.
-pub fn recv(m: &mut Msg) -> usize {
-    syscall2(12, m as *mut Msg as u64, 0) as usize
-}
-
-/// Responde ao remetente `to` com `m`, desbloqueando-o.
-pub fn reply(to: usize, m: &Msg) {
-    syscall2(13, to as u64, m as *const Msg as u64);
-}
-
-/// RECV nao-bloqueante: retorna Some(pid) se havia mensagem, senao None.
+/// Bloqueia ate receber. Retorna o pid do remetente.
+pub fn recv(m: &mut Msg) -> usize { syscall1(12, m as *mut Msg as u64) as usize }
+pub fn reply(to: usize, m: &Msg) { syscall2(13, to as u64, m as *const Msg as u64); }
+/// RECV nao-bloqueante.
 pub fn try_recv(m: &mut Msg) -> Option<usize> {
-    let r = syscall2(23, m as *mut Msg as u64, 0) as i64;
+    let r = syscall1(23, m as *mut Msg as u64) as i64;
     if r < 0 { None } else { Some(r as usize) }
 }
 
-/// O processo `pid` ainda esta vivo?
-pub fn is_alive(pid: usize) -> bool { syscall2(24, pid as u64, 0) != 0 }
-
-/// Milissegundos desde o boot (resolucao de 10ms).
-pub fn uptime_ms() -> u64 { syscall0(25) * 10 }
-
-// --------------------------------------------------------- Filesystem
-
-/// Le o arquivo `idx` para `buf` (ate buf.len() bytes). Retorna bytes lidos.
-pub fn fs_read(idx: usize, buf: &mut [u8]) -> i64 {
-    syscall3(15, idx as u64, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+/// RECV com prazo: Some(pid) se chegou mensagem, None apos `ms` sem nada.
+pub fn recv_timeout(m: &mut Msg, ms: u64) -> Option<usize> {
+    let r = syscall2(40, m as *mut Msg as u64, ms.max(1)) as i64;
+    if r < 0 { None } else { Some(r as usize) }
 }
 
-/// Escreve `data` no arquivo `idx`. Retorna 0 (ok) ou <0.
-pub fn fs_write(idx: usize, data: &[u8]) -> i64 {
-    syscall3(16, idx as u64, data.as_ptr() as u64, data.len() as u64) as i64
+/// Espera (sem gastar CPU) ate o servico existir.
+pub fn wait_service(id: u64) -> usize {
+    loop {
+        let p = lookup_service(id);
+        if p >= 0 { return p as usize; }
+        sleep_ms(5);
+    }
 }
 
-/// Cria um arquivo de texto vazio. Retorna o indice ou <0.
-pub fn fs_create(name: &str) -> i64 {
-    syscall2(17, name.as_ptr() as u64, name.len() as u64) as i64
+pub const SVC_FS: u64 = 1;
+pub const SVC_WM: u64 = 2;
+
+// Protocolo do fsd (tag da mensagem)
+pub const FS_OP_COUNT: u64 = 1; // -> data[0] = numero de arquivos
+pub const FS_OP_STAT: u64 = 2;  // data[0]=idx -> data: size, kind, nome(4 palavras)
+pub const FS_OP_READ: u64 = 3;  // data[0]=idx, data[1]=offset -> ate 40 bytes
+
+// ------------------------------------------------------------- arquivos
+
+/// Metadados de um arquivo.
+#[derive(Clone, Copy)]
+pub struct FileInfo {
+    pub idx: usize,
+    pub name: [u8; 28],
+    pub nlen: usize,
+    pub size: u32,
+    pub kind: u32,
+}
+
+impl FileInfo {
+    pub const fn zero() -> FileInfo {
+        FileInfo { idx: 0, name: [0; 28], nlen: 0, size: 0, kind: 0 }
+    }
+    pub fn name(&self) -> &[u8] { &self.name[..self.nlen] }
+    pub fn ext(&self) -> &[u8] {
+        let n = self.name();
+        match n.iter().rposition(|&b| b == b'.') { Some(p) => &n[p + 1..], None => b"" }
+    }
+}
+
+pub fn file_info(idx: usize) -> Option<FileInfo> {
+    let mut st = [0u8; 44];
+    if fs_stat(idx, &mut st) < 0 { return None; }
+    let mut name = [0u8; 28];
+    name.copy_from_slice(&st[..28]);
+    let nlen = name.iter().position(|&b| b == 0).unwrap_or(28);
+    Some(FileInfo {
+        idx, name, nlen,
+        size: u32::from_le_bytes([st[36], st[37], st[38], st[39]]),
+        kind: u32::from_le_bytes([st[40], st[41], st[42], st[43]]),
+    })
+}
+
+pub fn find_file(name: &[u8]) -> Option<usize> {
+    (0..fs_count()).find(|&i| file_info(i).map(|f| f.name() == name).unwrap_or(false))
 }
 
 // ------------------------------------------------------------------ input
 
 pub const EV_KEY: u16 = 1;
+pub const EV_REL: u16 = 2;
 pub const EV_ABS: u16 = 3;
 pub const ABS_X: u16 = 0;
 pub const ABS_Y: u16 = 1;
+pub const REL_WHEEL: u16 = 8;
 pub const BTN_LEFT: u16 = 0x110;
-pub const KEY_ENTER: u16 = 28;
-pub const KEY_BACKSPACE: u16 = 14;
-pub const KEY_SPACE: u16 = 57;
+pub const BTN_RIGHT: u16 = 0x111;
+pub const BTN_MIDDLE: u16 = 0x112;
 
-#[derive(Clone, Copy)]
+/// Codigos evdev usados pelo sistema.
+pub mod key {
+    pub const ESC: u16 = 1;
+    pub const BACKSPACE: u16 = 14;
+    pub const TAB: u16 = 15;
+    pub const Q: u16 = 16;
+    pub const W: u16 = 17;
+    pub const E: u16 = 18;
+    pub const T: u16 = 20;
+    pub const I: u16 = 23;
+    pub const ENTER: u16 = 28;
+    pub const LCTRL: u16 = 29;
+    pub const A: u16 = 30;
+    pub const S: u16 = 31;
+    pub const D: u16 = 32;
+    pub const LSHIFT: u16 = 42;
+    pub const Z: u16 = 44;
+    pub const C: u16 = 46;
+    pub const V: u16 = 47;
+    pub const N: u16 = 49;
+    pub const RSHIFT: u16 = 54;
+    pub const LALT: u16 = 56;
+    pub const SPACE: u16 = 57;
+    pub const CAPS: u16 = 58;
+    pub const F1: u16 = 59;
+    pub const F2: u16 = 60;
+    pub const F4: u16 = 62;
+    pub const F5: u16 = 63;
+    pub const F11: u16 = 87;
+    pub const F12: u16 = 88;
+    pub const KPENTER: u16 = 96;
+    pub const RCTRL: u16 = 97;
+    pub const RALT: u16 = 100;
+    pub const HOME: u16 = 102;
+    pub const UP: u16 = 103;
+    pub const PGUP: u16 = 104;
+    pub const LEFT: u16 = 105;
+    pub const RIGHT: u16 = 106;
+    pub const END: u16 = 107;
+    pub const DOWN: u16 = 108;
+    pub const PGDN: u16 = 109;
+    pub const DELETE: u16 = 111;
+    pub const LMETA: u16 = 125;
+    pub const RMETA: u16 = 126;
+}
+
+pub const MOD_SHIFT: u8 = 1;
+pub const MOD_CTRL: u8 = 2;
+pub const MOD_ALT: u8 = 4;
+pub const MOD_META: u8 = 8;
+
+#[derive(Clone, Copy, Default)]
 pub struct Event {
     pub ev_type: u16,
     pub code: u16,
@@ -182,833 +342,458 @@ pub struct Event {
 
 pub fn input_poll() -> Option<Event> {
     let v = syscall0(7);
-    if v >> 63 == 0 {
-        return None;
+    if v >> 63 == 0 { return None; }
+    Some(Event { ev_type: ((v >> 48) & 0x7FFF) as u16, code: (v >> 32) as u16, value: v as u32 })
+}
+
+/// Tecla traduzida: codigo evdev + caractere (Unicode/Latin-1; 0 se nenhum).
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct Key {
+    pub code: u16,
+    pub ch: u32,
+    pub mods: u8,
+}
+
+impl Key {
+    pub fn ctrl(&self) -> bool { self.mods & MOD_CTRL != 0 }
+    pub fn shift(&self) -> bool { self.mods & MOD_SHIFT != 0 }
+    pub fn alt(&self) -> bool { self.mods & MOD_ALT != 0 }
+    pub fn meta(&self) -> bool { self.mods & MOD_META != 0 }
+    pub fn pack(&self) -> u64 {
+        self.code as u64 | ((self.mods as u64) << 16) | ((self.ch as u64) << 32)
     }
-    Some(Event {
-        ev_type: ((v >> 48) & 0x7FFF) as u16,
-        code: (v >> 32) as u16,
-        value: v as u32,
-    })
-}
-
-/// Keycode evdev -> ASCII (maiusculas), ou 0.
-pub fn keycode_to_char(code: u16) -> u8 {
-    const ROW1: &[u8] = b"1234567890"; // codes 2..=11
-    const ROW2: &[u8] = b"QWERTYUIOP"; // 16..=25
-    const ROW3: &[u8] = b"ASDFGHJKL"; // 30..=38
-    const ROW4: &[u8] = b"ZXCVBNM"; // 44..=50
-    match code {
-        2..=11 => ROW1[(code - 2) as usize],
-        16..=25 => ROW2[(code - 16) as usize],
-        30..=38 => ROW3[(code - 30) as usize],
-        44..=50 => ROW4[(code - 44) as usize],
-        KEY_SPACE => b' ',
-        52 => b'.',
-        12 => b'-',
-        _ => 0,
-    }
-}
-
-// ------------------------------------------------------------ framebuffer
-
-#[derive(Clone, Copy)]
-pub struct Fb {
-    pub base: *mut u32,
-    pub w: u32,
-    pub h: u32,
-    // clip (scissor): escritas fora deste retangulo sao ignoradas.
-    // (cx0,cy0) inclusivo, (cx1,cy1) exclusivo. Default = tela toda.
-    pub cx0: u32, pub cy0: u32, pub cx1: u32, pub cy1: u32,
-}
-
-#[derive(Clone, Copy)]
-pub struct Rect {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-}
-
-impl Rect {
-    pub fn contains(&self, px: u32, py: u32) -> bool {
-        px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
+    pub fn unpack(v: u64) -> Option<Key> {
+        if v & 0xFFFF == 0 { return None; }
+        Some(Key { code: v as u16, mods: (v >> 16) as u8, ch: (v >> 32) as u32 })
     }
 }
 
-impl Fb {
-    /// Mapeia o framebuffer e retorna o handle de desenho.
-    pub fn open() -> Fb {
-        let base = fb_map() as *mut u32;
-        let (w, h) = fb_info();
-        Fb { base, w, h, cx0:0, cy0:0, cx1:w, cy1:h }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Layout { Us, Abnt2 }
+
+/// Estado do teclado: modificadores, caps lock e tecla morta pendente.
+pub struct Keyboard {
+    pub mods: u8,
+    caps: bool,
+    dead: u32,
+    pub layout: Layout,
+}
+
+const US_LO: &[u8; 58] = b"\x00\x001234567890-=\x00\x00qwertyuiop[]\x00\x00asdfghjkl;'`\x00\\zxcvbnm,./\x00*\x00 ";
+const US_HI: &[u8; 58] = b"\x00\x00!@#$%^&*()_+\x00\x00QWERTYUIOP{}\x00\x00ASDFGHJKL:\"~\x00|ZXCVBNM<>?\x00*\x00 ";
+
+impl Keyboard {
+    pub const fn new() -> Keyboard {
+        Keyboard { mods: 0, caps: false, dead: 0, layout: Layout::Abnt2 }
     }
 
-    /// Endereco do buffer de wallpaper (cacheado). Mesma geometria do fb.
-    pub const WALL_ADDR: u64 = 0x4600_0000 + 8*1024*1024;
-
-    /// Ponteiro para o wallpaper como *mut u32.
-    pub fn wall_ptr(&self) -> *mut u32 { Self::WALL_ADDR as *mut u32 }
-
-    /// Copia uma regiao do wallpaper cacheado para o back buffer (rapido:
-    /// memcpy por linha, sem blending). Usado para "apagar" area de janela.
-    pub fn restore_wall(&self, r: Rect) {
-        let x0=r.x.min(self.w); let x1=(r.x+r.w).min(self.w);
-        let y0=r.y.min(self.h); let y1=(r.y+r.h).min(self.h);
-        if x1<=x0 || y1<=y0 { return; }
-        let wall=self.wall_ptr();
-        let span=(x1-x0) as usize;
-        for y in y0..y1 {
-            let base=(y*self.w+x0) as usize;
-            unsafe {
-                core::ptr::copy_nonoverlapping(wall.add(base), self.base.add(base), span);
+    /// Alimenta um evento EV_KEY (value 1 = press, 0 = release, 2 = repeat).
+    /// Retorna a tecla traduzida nos pressionamentos.
+    pub fn feed(&mut self, code: u16, value: u32) -> Option<Key> {
+        let down = value != 0;
+        let bit = match code {
+            key::LSHIFT | key::RSHIFT => MOD_SHIFT,
+            key::LCTRL | key::RCTRL => MOD_CTRL,
+            key::LALT | key::RALT => MOD_ALT,
+            key::LMETA | key::RMETA => MOD_META,
+            _ => 0,
+        };
+        if bit != 0 {
+            if down { self.mods |= bit } else { self.mods &= !bit }
+            return if down { Some(Key { code, ch: 0, mods: self.mods }) } else { None };
+        }
+        if !down { return None; }
+        if code == key::CAPS {
+            self.caps = !self.caps;
+            return None;
+        }
+        // atalhos (Ctrl/Super): so o codigo
+        if self.mods & (MOD_CTRL | MOD_META) != 0 {
+            return Some(Key { code, ch: 0, mods: self.mods });
+        }
+        let shift = self.mods & MOD_SHIFT != 0;
+        // teclas mortas (ABNT2): ´ ` ~ ^ ¨
+        if let Some(d) = self.dead_for(code, shift) {
+            if self.dead != 0 {
+                let prev = self.dead;
+                self.dead = if prev == d { 0 } else { d };
+                return Some(Key { code, ch: prev, mods: self.mods });
             }
+            self.dead = d;
+            return None;
+        }
+        let mut ch = self.translate(code, shift);
+        if self.dead != 0 && ch != 0 {
+            let d = self.dead;
+            self.dead = 0;
+            if ch == ' ' as u32 { ch = d; } else if let Some(c) = compose(d, ch) { ch = c; }
+        }
+        Some(Key { code, ch, mods: self.mods })
+    }
+
+    fn dead_for(&self, code: u16, shift: bool) -> Option<u32> {
+        if self.layout != Layout::Abnt2 { return None; }
+        match (code, shift) {
+            (26, false) => Some(0xB4),     // ´
+            (26, true) => Some('`' as u32),
+            (40, false) => Some('~' as u32),
+            (40, true) => Some('^' as u32),
+            (7, true) => Some(0xA8),       // ¨
+            _ => None,
         }
     }
 
-    /// Desenha no buffer de WALLPAPER (nao no back). Para compor o fundo 1x.
-    pub fn wall_fb(&self) -> Fb { Fb { base: self.wall_ptr(), w:self.w, h:self.h, cx0:0,cy0:0,cx1:self.w,cy1:self.h } }
-
-    /// Ponteiro bruto do back buffer (para blit de superficies).
-    pub fn base_ptr(&self) -> *mut u32 { self.base }
-
-    /// Define o retangulo de recorte (scissor). Escritas fora sao ignoradas.
-    pub fn set_clip(&mut self, r: Rect) {
-        self.cx0 = r.x.min(self.w);
-        self.cy0 = r.y.min(self.h);
-        self.cx1 = (r.x+r.w).min(self.w);
-        self.cy1 = (r.y+r.h).min(self.h);
-    }
-    /// Remove o recorte (volta para a tela toda).
-    pub fn clear_clip(&mut self) {
-        self.cx0=0; self.cy0=0; self.cx1=self.w; self.cy1=self.h;
-    }
-    /// Um ponto esta dentro do clip atual?
-    #[inline]
-    pub fn in_clip(&self, x: u32, y: u32) -> bool {
-        x>=self.cx0 && x<self.cx1 && y>=self.cy0 && y<self.cy1
-    }
-
-
-    #[inline]
-    pub fn pixel(&self, x: u32, y: u32, color: u32) {
-        if x < self.w && y < self.h && self.in_clip(x,y) {
-            unsafe { *self.base.add((y * self.w + x) as usize) = color };
-        }
-    }
-
-    pub fn fill(&self, r: Rect, color: u32) {
-        let x0 = r.x.max(self.cx0); let x1 = (r.x + r.w).min(self.w).min(self.cx1);
-        let y0 = r.y.max(self.cy0); let y1 = (r.y + r.h).min(self.h).min(self.cy1);
-        for y in y0..y1 {
-            let row = unsafe { self.base.add((y * self.w) as usize) };
-            for x in x0..x1 {
-                unsafe { *row.add(x as usize) = color };
-            }
-        }
-    }
-
-    /// Linha horizontal com "buraco" (regiao que NAO deve ser pintada).
-    pub fn hline_with_hole(&self, y: u32, color: u32, hole: Option<Rect>) {
-        if y >= self.h {
-            return;
-        }
-        let row = unsafe { self.base.add((y * self.w) as usize) };
-        match hole {
-            Some(hr) if y >= hr.y && y < hr.y + hr.h => {
-                for x in 0..hr.x.min(self.w) {
-                    unsafe { *row.add(x as usize) = color };
-                }
-                for x in (hr.x + hr.w).min(self.w)..self.w {
-                    unsafe { *row.add(x as usize) = color };
-                }
-            }
-            _ => {
-                for x in 0..self.w {
-                    unsafe { *row.add(x as usize) = color };
-                }
-            }
-        }
-    }
-
-    pub fn frame(&self, r: Rect, thick: u32, color: u32) {
-        self.fill(Rect { x: r.x, y: r.y, w: r.w, h: thick }, color);
-        self.fill(Rect { x: r.x, y: r.y + r.h - thick, w: r.w, h: thick }, color);
-        self.fill(Rect { x: r.x, y: r.y, w: thick, h: r.h }, color);
-        self.fill(Rect { x: r.x + r.w - thick, y: r.y, w: thick, h: r.h }, color);
-    }
-
-    pub fn text(&self, x: u32, y: u32, s: &[u8], color: u32, scale: u32) {
-        let mut cx = x;
-        for &c in s {
-            let g = glyph(c.to_ascii_uppercase());
-            for (row, bits) in g.iter().enumerate() {
-                for col in 0..8u32 {
-                    if bits & (0x80 >> col) != 0 {
-                        self.fill(
-                            Rect {
-                                x: cx + col * scale,
-                                y: y + row as u32 * scale,
-                                w: scale,
-                                h: scale,
-                            },
-                            color,
-                        );
-                    }
-                }
-            }
-            cx += 9 * scale;
-        }
-    }
-
-    // ============================================================
-    // Primitivas "bonitas" — blending, gradientes, cantos redondos,
-    // sombras e brilho. Base para a estetica estilo macOS.
-    // ============================================================
-
-    /// Mistura `fg` sobre o pixel atual com alpha 0..255 (blending real
-    /// lendo o framebuffer). Permite transparencia e anti-aliasing.
-    #[inline]
-    pub fn blend(&self, x: u32, y: u32, fg: u32, a: u32) {
-        if x >= self.w || y >= self.h { return; }
-        if x<self.cx0||x>=self.cx1||y<self.cy0||y>=self.cy1 { return; }
-        let a = a.min(255);
-        if a == 0 { return; }
-        let p = unsafe { self.base.add((y*self.w+x) as usize) };
-        if a == 255 {
-            unsafe { *p = fg };
-            return;
-        }
-        let bg = unsafe { *p };
-        let inv = 255 - a;
-        let r = (((fg>>16)&0xFF)*a + ((bg>>16)&0xFF)*inv) / 255;
-        let g = (((fg>>8)&0xFF)*a + ((bg>>8)&0xFF)*inv) / 255;
-        let b = ((fg&0xFF)*a + (bg&0xFF)*inv) / 255;
-        unsafe { *p = (r<<16)|(g<<8)|b };
-    }
-
-    /// Interpola duas cores (t: 0..255).
-    #[inline]
-    pub fn lerp(c0: u32, c1: u32, t: u32) -> u32 {
-        let t = t.min(255); let it = 255 - t;
-        let r = (((c0>>16)&0xFF)*it + ((c1>>16)&0xFF)*t)/255;
-        let g = (((c0>>8)&0xFF)*it + ((c1>>8)&0xFF)*t)/255;
-        let b = ((c0&0xFF)*it + (c1&0xFF)*t)/255;
-        (r<<16)|(g<<8)|b
-    }
-
-    /// Preenche um retangulo com gradiente vertical (c_top -> c_bot).
-    pub fn vgrad(&self, r: Rect, c_top: u32, c_bot: u32) {
-        let x1 = (r.x+r.w).min(self.w);
-        let y1 = (r.y+r.h).min(self.h);
-        let h = r.h.max(1);
-        for y in r.y.min(self.h)..y1 {
-            let t = ((y - r.y) * 255) / h;
-            let c = Fb::lerp(c_top, c_bot, t);
-            let row = unsafe { self.base.add((y*self.w) as usize) };
-            for x in r.x.min(self.w)..x1 {
-                unsafe { *row.add(x as usize) = c };
-            }
-        }
-    }
-
-    /// Gradiente vertical com alpha constante (para faixas translucidas).
-    pub fn vgrad_alpha(&self, r: Rect, c_top: u32, c_bot: u32, a: u32) {
-        let y1 = (r.y+r.h).min(self.h);
-        let h = r.h.max(1);
-        for y in r.y.min(self.h)..y1 {
-            let t = ((y - r.y) * 255) / h;
-            let c = Fb::lerp(c_top, c_bot, t);
-            for x in r.x..(r.x+r.w).min(self.w) {
-                self.blend(x, y, c, a);
-            }
-        }
-    }
-
-    /// Distancia^2 de um ponto ao centro de uma quina, para cantos redondos.
-    #[inline]
-    fn corner_alpha(dx: i32, dy: i32, radius: i32) -> u32 {
-        // anti-aliasing: alpha cai a 0 na borda do raio
-        let d2 = (dx*dx + dy*dy) as i32;
-        let r2 = radius*radius;
-        if d2 <= (radius-1)*(radius-1) { 255 }
-        else if d2 >= (radius+1)*(radius+1) { 0 }
-        else {
-            // transicao suave de ~2px
-            let d = isqrt(d2 as u32) as i32;
-            let frac = radius + 1 - d; // 0..2
-            (frac.clamp(0,2) as u32 * 127).min(255)
-        }
-    }
-
-    /// Retangulo de cantos arredondados preenchido com cor solida.
-    pub fn round_rect(&self, r: Rect, radius: u32, color: u32) {
-        self.round_rect_grad(r, radius, color, color);
-    }
-
-    /// Retangulo de cantos arredondados com gradiente vertical + AA nas quinas.
-    pub fn round_rect_grad(&self, r: Rect, radius: u32, c_top: u32, c_bot: u32) {
-        let rad = radius.min(r.w/2).min(r.h/2) as i32;
-        let x0 = r.x as i32; let y0 = r.y as i32;
-        let x1 = (r.x+r.w) as i32; let y1 = (r.y+r.h) as i32;
-        let h = r.h.max(1);
-        for y in y0..y1 {
-            if y < 0 || y as u32 >= self.h { continue; }
-            let t = (((y - y0) as u32) * 255) / h;
-            let c = Fb::lerp(c_top, c_bot, t);
-            for x in x0..x1 {
-                if x < 0 || x as u32 >= self.w { continue; }
-                // dentro de qual quina?
-                let cx = if x < x0+rad { x0+rad } else if x >= x1-rad { x1-rad-1 } else { x };
-                let cy = if y < y0+rad { y0+rad } else if y >= y1-rad { y1-rad-1 } else { y };
-                if cx != x || cy != y {
-                    let a = Fb::corner_alpha(x-cx, y-cy, rad);
-                    if a > 0 { self.blend(x as u32, y as u32, c, a); }
-                } else {
-                    self.blend(x as u32, y as u32, c, 255);
-                }
-            }
-        }
-    }
-
-    /// Contorno arredondado (1px) — usado para bordas sutis de janela.
-    pub fn round_frame(&self, r: Rect, radius: u32, color: u32, a: u32) {
-        let rad = radius.min(r.w/2).min(r.h/2) as i32;
-        let x0 = r.x as i32; let y0 = r.y as i32;
-        let x1 = (r.x+r.w) as i32; let y1 = (r.y+r.h) as i32;
-        for y in y0..y1 {
-            if y < 0 || y as u32 >= self.h { continue; }
-            for x in x0..x1 {
-                if x < 0 || x as u32 >= self.w { continue; }
-                let cx = if x < x0+rad { x0+rad } else if x >= x1-rad { x1-rad-1 } else { x };
-                let cy = if y < y0+rad { y0+rad } else if y >= y1-rad { y1-rad-1 } else { y };
-                let on_edge = x==x0 || x==x1-1 || y==y0 || y==y1-1;
-                if cx != x || cy != y {
-                    // na quina: pinta so o anel externo
-                    let d = isqrt(((x-cx)*(x-cx)+(y-cy)*(y-cy)) as u32) as i32;
-                    if d >= rad-1 && d <= rad { self.blend(x as u32, y as u32, color, a); }
-                } else if on_edge {
-                    self.blend(x as u32, y as u32, color, a);
-                }
-            }
-        }
-    }
-
-    /// Sombra suave sob um retangulo (desfoque fake por camadas de alpha).
-    pub fn drop_shadow(&self, r: Rect, radius: u32, spread: u32) {
-        // varias molduras arredondadas concentricas, alpha decrescente
-        let layers = spread.max(1);
-        for i in 0..layers {
-            let off = (layers - i) as u32;
-            let a = 6 + i*4; // mais forte perto da borda
-            let sr = Rect {
-                x: r.x.saturating_sub(off),
-                y: r.y.saturating_sub(off).saturating_add(2), // desloca p/ baixo
-                w: r.w + off*2,
-                h: r.h + off*2,
+    fn translate(&self, code: u16, shift: bool) -> u32 {
+        let letter = matches!(code, 16..=25 | 30..=38 | 44..=50);
+        let up = if letter { shift ^ self.caps } else { shift };
+        if self.layout == Layout::Abnt2 {
+            let c = match (code, up) {
+                (39, false) => 0xE7, (39, true) => 0xC7,   // ç Ç
+                (41, false) => '\'' as u32, (41, true) => '"' as u32,
+                (27, false) => '[' as u32, (27, true) => '{' as u32,
+                (43, false) => ']' as u32, (43, true) => '}' as u32,
+                (53, false) => ';' as u32, (53, true) => ':' as u32,
+                (89, false) => '/' as u32, (89, true) => '?' as u32,
+                (86, false) => '\\' as u32, (86, true) => '|' as u32,
+                _ => 0,
             };
-            self.round_frame(sr, radius+off, 0x00000000, a);
+            if c != 0 { return c; }
         }
-    }
-
-    /// Circulo preenchido com AA (para pontos do dock, botoes de janela).
-    pub fn disc(&self, cx: u32, cy: u32, radius: u32, color: u32) {
-        let r = radius as i32;
-        let cxi = cx as i32; let cyi = cy as i32;
-        for dy in -r..=r {
-            for dx in -r..=r {
-                let d2 = dx*dx + dy*dy;
-                let a = if d2 <= (r-1)*(r-1) { 255 }
-                        else if d2 >= (r+1)*(r+1) { 0 }
-                        else { 140 };
-                if a > 0 {
-                    let x = cxi+dx; let y = cyi+dy;
-                    if x>=0 && y>=0 { self.blend(x as u32, y as u32, color, a); }
-                }
-            }
-        }
-    }
-
-    /// Texto com uma leve sombra (legibilidade sobre gradientes).
-    pub fn text_shadow(&self, x: u32, y: u32, s: &[u8], color: u32, scale: u32) {
-        self.text_blend(x+1, y+1, s, 0x00000000, 90, scale);
-        self.text_blend(x, y, s, color, 255, scale);
-    }
-
-    /// Texto com alpha (para labels suaves).
-    pub fn text_blend(&self, x: u32, y: u32, s: &[u8], color: u32, a: u32, scale: u32) {
-        let mut cx = x;
-        for &c in s {
-            let g = glyph(c.to_ascii_uppercase());
-            for (row, bits) in g.iter().enumerate() {
-                for col in 0..8u32 {
-                    if bits & (0x80 >> col) != 0 {
-                        for sy in 0..scale { for sx in 0..scale {
-                            self.blend(cx+col*scale+sx, y+row as u32*scale+sy, color, a);
-                        }}
-                    }
-                }
-            }
-            cx += 9*scale;
+        match code {
+            0..=57 => (if up { US_HI } else { US_LO })[code as usize] as u32,
+            71 => '7' as u32, 72 => '8' as u32, 73 => '9' as u32, 74 => '-' as u32,
+            75 => '4' as u32, 76 => '5' as u32, 77 => '6' as u32, 78 => '+' as u32,
+            79 => '1' as u32, 80 => '2' as u32, 81 => '3' as u32, 82 => '0' as u32,
+            83 => '.' as u32, 98 => '/' as u32,
+            _ => 0,
         }
     }
 }
 
-// helper: raiz quadrada inteira (para cantos redondos)
-pub fn isqrt(n: u32) -> u32 {
-    if n == 0 { return 0; }
-    let mut x = n;
-    let mut y = (x + 1) / 2;
-    while y < x { x = y; y = (x + n / x) / 2; }
-    x
+/// Combina tecla morta + letra (á à â ã ä, maiusculas, ñ).
+fn compose(dead: u32, c: u32) -> Option<u32> {
+    const BASE: &[u8] = b"aeiouAEIOUnN";
+    const ACUTE: [u32; 12] = [0xE1, 0xE9, 0xED, 0xF3, 0xFA, 0xC1, 0xC9, 0xCD, 0xD3, 0xDA, 0, 0];
+    const GRAVE: [u32; 12] = [0xE0, 0xE8, 0xEC, 0xF2, 0xF9, 0xC0, 0xC8, 0xCC, 0xD2, 0xD9, 0, 0];
+    const CIRC: [u32; 12] = [0xE2, 0xEA, 0xEE, 0xF4, 0xFB, 0xC2, 0xCA, 0xCE, 0xD4, 0xDB, 0, 0];
+    const TILDE: [u32; 12] = [0xE3, 0, 0, 0xF5, 0, 0xC3, 0, 0, 0xD5, 0, 0xF1, 0xD1];
+    const UML: [u32; 12] = [0xE4, 0xEB, 0xEF, 0xF6, 0xFC, 0xC4, 0xCB, 0xCF, 0xD6, 0xDC, 0, 0];
+    let i = BASE.iter().position(|&b| b as u32 == c)?;
+    let t = match dead { 0xB4 => &ACUTE, 0x60 => &GRAVE, 0x5E => &CIRC, 0x7E => &TILDE, 0xA8 => &UML, _ => return None };
+    Some(t[i]).filter(|&v| v != 0)
 }
 
-// ------------------------------------------------------------------ fonte
-
-pub fn glyph(c: u8) -> [u8; 8] {
-    match c {
-        b'A' => [0x38, 0x6C, 0xC6, 0xC6, 0xFE, 0xC6, 0xC6, 0x00],
-        b'B' => [0xFC, 0xC6, 0xC6, 0xFC, 0xC6, 0xC6, 0xFC, 0x00],
-        b'C' => [0x7C, 0xC6, 0xC0, 0xC0, 0xC0, 0xC6, 0x7C, 0x00],
-        b'D' => [0xF8, 0xCC, 0xC6, 0xC6, 0xC6, 0xCC, 0xF8, 0x00],
-        b'E' => [0xFE, 0xC0, 0xC0, 0xF8, 0xC0, 0xC0, 0xFE, 0x00],
-        b'F' => [0xFE, 0xC0, 0xC0, 0xF8, 0xC0, 0xC0, 0xC0, 0x00],
-        b'G' => [0x7C, 0xC6, 0xC0, 0xCE, 0xC6, 0xC6, 0x7C, 0x00],
-        b'H' => [0xC6, 0xC6, 0xC6, 0xFE, 0xC6, 0xC6, 0xC6, 0x00],
-        b'I' => [0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00],
-        b'J' => [0x1E, 0x06, 0x06, 0x06, 0xC6, 0xC6, 0x7C, 0x00],
-        b'K' => [0xC6, 0xCC, 0xD8, 0xF0, 0xD8, 0xCC, 0xC6, 0x00],
-        b'L' => [0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xFE, 0x00],
-        b'M' => [0xC6, 0xEE, 0xFE, 0xD6, 0xC6, 0xC6, 0xC6, 0x00],
-        b'N' => [0xC6, 0xE6, 0xF6, 0xDE, 0xCE, 0xC6, 0xC6, 0x00],
-        b'O' => [0x7C, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x7C, 0x00],
-        b'P' => [0xFC, 0xC6, 0xC6, 0xFC, 0xC0, 0xC0, 0xC0, 0x00],
-        b'Q' => [0x7C, 0xC6, 0xC6, 0xC6, 0xD6, 0xCC, 0x76, 0x00],
-        b'R' => [0xFC, 0xC6, 0xC6, 0xFC, 0xD8, 0xCC, 0xC6, 0x00],
-        b'S' => [0x7E, 0xC0, 0xC0, 0x7C, 0x06, 0x06, 0xFC, 0x00],
-        b'T' => [0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00],
-        b'U' => [0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x7C, 0x00],
-        b'V' => [0xC6, 0xC6, 0xC6, 0xC6, 0x6C, 0x38, 0x10, 0x00],
-        b'W' => [0xC6, 0xC6, 0xC6, 0xD6, 0xFE, 0xEE, 0xC6, 0x00],
-        b'X' => [0xC6, 0x6C, 0x38, 0x10, 0x38, 0x6C, 0xC6, 0x00],
-        b'Y' => [0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x18, 0x00],
-        b'Z' => [0xFE, 0x06, 0x0C, 0x18, 0x30, 0x60, 0xFE, 0x00],
-        b'0' => [0x7C, 0xC6, 0xCE, 0xD6, 0xE6, 0xC6, 0x7C, 0x00],
-        b'1' => [0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00],
-        b'2' => [0x7C, 0xC6, 0x06, 0x1C, 0x70, 0xC0, 0xFE, 0x00],
-        b'3' => [0x7C, 0xC6, 0x06, 0x3C, 0x06, 0xC6, 0x7C, 0x00],
-        b'4' => [0x0C, 0x1C, 0x3C, 0x6C, 0xFE, 0x0C, 0x0C, 0x00],
-        b'5' => [0xFE, 0xC0, 0xFC, 0x06, 0x06, 0xC6, 0x7C, 0x00],
-        b'6' => [0x7C, 0xC6, 0xC0, 0xFC, 0xC6, 0xC6, 0x7C, 0x00],
-        b'7' => [0xFE, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x00],
-        b'8' => [0x7C, 0xC6, 0xC6, 0x7C, 0xC6, 0xC6, 0x7C, 0x00],
-        b'9' => [0x7C, 0xC6, 0xC6, 0x7E, 0x06, 0xC6, 0x7C, 0x00],
-        b'.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00],
-        b':' => [0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00],
-        b'-' => [0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00],
-        b'>' => [0x60, 0x30, 0x18, 0x0C, 0x18, 0x30, 0x60, 0x00],
-        b'_' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0x00],
-        _ => [0; 8],
+/// Codifica um codepoint em UTF-8. Retorna o numero de bytes.
+pub fn utf8_encode(cp: u32, out: &mut [u8; 4]) -> usize {
+    if cp < 0x80 {
+        out[0] = cp as u8;
+        1
+    } else if cp < 0x800 {
+        out[0] = 0xC0 | (cp >> 6) as u8;
+        out[1] = 0x80 | (cp & 0x3F) as u8;
+        2
+    } else {
+        out[0] = 0xE0 | (cp >> 12) as u8;
+        out[1] = 0x80 | ((cp >> 6) & 0x3F) as u8;
+        out[2] = 0x80 | (cp & 0x3F) as u8;
+        3
     }
 }
 
-// ====================================================================
-// Toolkit de janelas (client-side) — usado pelo shell/WM e pelos apps.
-// ====================================================================
+// ------------------------------------------------------- regiao grafica
+// Mesmo VA nas duas arquiteturas (ver kernel/src/fb.rs).
 
-/// Uma janela desenhavel com barra de titulo. O WM (shell) desenha a
-/// decoracao; os apps desenham o conteudo dentro da area cliente.
-#[derive(Clone, Copy)]
-pub struct Window {
-    pub rect: Rect,       // moldura externa (inclui titulo)
-    pub title_h: u32,
+pub const FB_UVA: u64 = 0x4600_0000;
+pub const WALL_ADDR: u64 = FB_UVA + 8 * 1024 * 1024;
+pub const WALLBLUR_ADDR: u64 = FB_UVA + 16 * 1024 * 1024;
+pub const SURF_ADDR: u64 = FB_UVA + 24 * 1024 * 1024;
+pub const SURF_SLOT_BYTES: u64 = 4 * 1024 * 1024;
+pub const SURF_SLOTS: usize = 8;
+/// Stride e altura maxima das superficies dos apps.
+pub const SURF_W: i32 = 1280;
+pub const SURF_H: i32 = 816;
+
+/// Abre a tela (back buffer) — usado pelo compositor.
+pub fn screen_open() -> Fb {
+    let base = fb_map() as *mut u32;
+    let (w, h) = fb_info();
+    Fb::new(base, w as i32, h as i32, w as i32)
 }
 
-pub const TITLE_H: u32 = 26;
-
-impl Window {
-    pub fn new(x: u32, y: u32, w: u32, h: u32) -> Self {
-        Window { rect: Rect { x, y, w, h }, title_h: TITLE_H }
-    }
-
-    /// Area util (abaixo da barra de titulo).
-    pub fn client(&self) -> Rect {
-        Rect {
-            x: self.rect.x + 2,
-            y: self.rect.y + self.title_h,
-            w: self.rect.w - 4,
-            h: self.rect.h - self.title_h - 2,
-        }
-    }
-
-    /// Desenha a decoracao (fundo, barra, titulo, botao fechar).
-    /// `focused` muda a cor da barra. Retorna o retangulo do botao fechar.
-    pub fn decorate(&self, fb: &Fb, title: &[u8], focused: bool, bg: u32) -> Rect {
-        let bar = if focused { 0x001E2A44 } else { 0x00161C2C };
-        let accent = if focused { 0x004FA3FF } else { 0x00304050 };
-        fb.fill(self.rect, bg);
-        fb.fill(Rect { x: self.rect.x, y: self.rect.y, w: self.rect.w, h: self.title_h }, bar);
-        fb.frame(self.rect, 2, accent);
-        fb.text(self.rect.x + 10, self.rect.y + 8, title, 0x00E8EEF8, 1);
-        // botao fechar (quadrado vermelho a direita)
-        let close = Rect { x: self.rect.x + self.rect.w - 22, y: self.rect.y + 6, w: 14, h: 14 };
-        fb.fill(close, 0x00E05060);
-        fb.text(close.x + 3, close.y + 3, b"X", 0x00FFFFFF, 1);
-        close
-    }
+pub fn surface_ptr(slot: u64) -> *mut u32 {
+    (SURF_ADDR + slot * SURF_SLOT_BYTES) as *mut u32
 }
 
-/// Converte keycode evdev -> ASCII minusculo (para o editor de texto).
-pub fn keycode_to_lower(code: u16) -> u8 {
-    let c = keycode_to_char(code);
-    if c.is_ascii_uppercase() { c + 32 } else { c }
-}
+// ------------------------------------------------------------ protocolo WM
+//
+// HELLO  app->wm: data[0]=tipo, data[1]=w, data[2]=h, data[3..6]=titulo (24 B)
+//        resp:    data[0]=slot, data[1]=w, data[2]=h, data[3]=arquivo+1 (0 = nenhum)
+// COMMIT app->wm: data[0]=slot ("desenhei, componha"). Resposta = POLL.
+// POLL   resp:    data[0]=flags | w<<16 | h<<32
+//                 data[1]=mouse x local, data[2]=mouse y local (i32)
+//                 data[3]=botoes (bit0 down, bit1 click, bit2 clique direito,
+//                          bit3 duplo) | roda (i8) << 8
+//                 data[4]=tecla (Key::pack), data[5]=menu | cor de destaque << 32
+// TITLE  app->wm: data[0..3] = titulo (24 B)
 
-// ====================================================================
-// Logo do Pulsar OS + icones vetoriais para o dock.
-// A logo: um anel luminoso com uma onda de pulso (batimento) cruzando —
-// remete a "pulsar" (estrela de neutrons que pulsa) e a um heartbeat.
-// ====================================================================
-
-impl Fb {
-    /// Desenha a logo do Pulsar centrada em (cx,cy) com raio `r`.
-    /// Um anel luminoso + um traçado de batimento (ECG) contínuo cruzando.
-    pub fn pulsar_logo(&self, cx: u32, cy: u32, r: u32, tint: u32, glow: bool) {
-        let cxi = cx as i32; let cyi = cy as i32; let ri = r as i32;
-
-        // halo suave externo
-        if glow {
-            for dy in -(ri+10)..=(ri+10) {
-                for dx in -(ri+10)..=(ri+10) {
-                    let d = isqrt((dx*dx+dy*dy) as u32) as i32;
-                    if d > ri && d <= ri+10 {
-                        let a = ((ri+10-d) as u32 * 8).min(50);
-                        let x = cxi+dx; let y = cyi+dy;
-                        if x>=0 && y>=0 { self.blend(x as u32, y as u32, tint, a); }
-                    }
-                }
-            }
-        }
-
-        // disco de fundo translucido dentro do anel (dá corpo à logo)
-        for dy in -ri..=ri {
-            for dx in -ri..=ri {
-                let d2 = dx*dx+dy*dy;
-                if d2 <= (ri-3)*(ri-3) {
-                    let x = cxi+dx; let y = cyi+dy;
-                    if x>=0 && y>=0 { self.blend(x as u32, y as u32, tint, 28); }
-                }
-            }
-        }
-
-        // anel externo brilhante (espessura ~3px, com AA)
-        for dy in -ri..=ri {
-            for dx in -ri..=ri {
-                let d = isqrt((dx*dx+dy*dy) as u32) as i32;
-                if d >= ri-3 && d <= ri {
-                    let a = if d==ri || d==ri-3 { 160 } else { 255 };
-                    let x = cxi+dx; let y = cyi+dy;
-                    if x>=0 && y>=0 { self.blend(x as u32, y as u32, tint, a); }
-                }
-            }
-        }
-
-        // traçado de batimento (ECG) contínuo, dentro do anel.
-        // Definimos pontos-chave e ligamos com linhas para nao fragmentar.
-        let span = (ri*7)/10; // largura util do traçado
-        // pontos (dx relativo, dy relativo ao centro): base, subida, pico,
-        // vale profundo, recuperacao, base
-        let pts: [(i32,i32); 7] = [
-            (-span,        0),
-            (-span/2,      0),
-            (-span/4,   -ri/6),
-            (0,         -ri/2),   // pico
-            (span/6,     ri/3),   // vale
-            (span/2,     0),
-            (span,       0),
-        ];
-        for k in 0..pts.len()-1 {
-            let (x0,y0) = pts[k];
-            let (x1,y1) = pts[k+1];
-            self.thick_line(cxi+x0, cyi+y0, cxi+x1, cyi+y1, 0x00FFFFFF, 2);
-        }
-
-        // ponto de luz no pico
-        self.disc((cxi) as u32, (cyi - ri/2) as u32, 3, 0x00FFFFFF);
-    }
-
-    /// Linha com espessura (Bresenham + engrossamento vertical).
-    pub fn thick_line(&self, x0:i32, y0:i32, x1:i32, y1:i32, color:u32, thick:i32) {
-        let dx = (x1-x0).abs(); let sx = if x0<x1 {1} else {-1};
-        let dy = -(y1-y0).abs(); let sy = if y0<y1 {1} else {-1};
-        let mut err = dx+dy;
-        let (mut x, mut y) = (x0,y0);
-        loop {
-            for t in 0..thick {
-                if x>=0 && (y+t)>=0 { self.blend(x as u32,(y+t) as u32,color,255); }
-            }
-            if x==x1 && y==y1 { break; }
-            let e2 = 2*err;
-            if e2>=dy { err+=dy; x+=sx; }
-            if e2<=dx { err+=dx; y+=sy; }
-        }
-    }
-
-    // ============================================================
-    // Texto anti-aliased usando atlas de fonte (Poppins).
-    // Cada glifo e uma bitmap de alpha desenhada com blending.
-    // ============================================================
-
-    /// Desenha texto AA na fonte UI. (x,y) = canto superior esquerdo da
-    /// caixa de texto; a baseline e calculada internamente. Retorna a
-    /// largura desenhada (para centralizar/alinhar).
-    pub fn text_ui(&self, x: i32, y: i32, s: &[u8], color: u32) -> i32 {
-        self.draw_glyphs(x, y, s, color, &FONTUI_GLYPHS[..], &FONTUI_PIXELS[..], FONTUI_ASCENT, 255)
-    }
-
-    pub fn text_ui_a(&self, x: i32, y: i32, s: &[u8], color: u32, alpha: u32) -> i32 {
-        self.draw_glyphs(x, y, s, color, &FONTUI_GLYPHS[..], &FONTUI_PIXELS[..], FONTUI_ASCENT, alpha)
-    }
-
-    /// Fonte grande (titulos, logo).
-    pub fn text_big(&self, x: i32, y: i32, s: &[u8], color: u32) -> i32 {
-        self.draw_glyphs(x, y, s, color, &FONTBIG_GLYPHS[..], &FONTBIG_PIXELS[..], FONTBIG_ASCENT, 255)
-    }
-
-    /// Largura de uma string na fonte UI (sem desenhar).
-    pub fn text_ui_width(s: &[u8]) -> i32 {
-        let mut w = 0i32;
-        for &c in s {
-            if c < 32 || c > 126 { w += 6; continue; }
-            w += FONTUI_GLYPHS[(c - 32) as usize].adv as i32;
-        }
-        w
-    }
-
-    fn draw_glyphs(&self, x: i32, y: i32, s: &[u8], color: u32,
-                   glyphs: &[Glyph], pixels: &[u8], ascent: i32, alpha: u32) -> i32 {
-        let mut pen = x;
-        for &c in s {
-            if c < 32 || c > 126 {
-                pen += 6;
-                continue;
-            }
-            let g = glyphs[(c - 32) as usize];
-            // posicao: pen + left, baseline (y + ascent) + top
-            let gx = pen + g.left as i32;
-            let gy = y + ascent + g.top as i32;
-            let gw = g.w as i32;
-            let data = &pixels[g.off..g.off + g.len];
-            for row in 0..g.h as i32 {
-                for col in 0..gw {
-                    let a = data[(row * gw + col) as usize] as u32;
-                    if a > 0 {
-                        let px = gx + col;
-                        let py = gy + row;
-                        if px >= 0 && py >= 0 {
-                            self.blend(px as u32, py as u32, color, a * alpha / 255);
-                        }
-                    }
-                }
-            }
-            pen += g.adv as i32;
-        }
-        pen - x
-    }
-}
-
-// (pulse_shape removida: a logo agora usa thick_line entre pontos-chave)
-
-// ====================================================================
-// Cursor com backing store (nao deixa rastro) + eventos de mouse.
-// ====================================================================
-
-pub struct Cursor {
-    pub x: u32, pub y: u32,
-    saved: [u32; 24*24],   // fundo salvo sob o cursor
-    sx: u32, sy: u32, sw: u32, sh: u32,
-    has_save: bool,
-}
-
-impl Cursor {
-    pub const fn new(x:u32,y:u32) -> Self {
-        Cursor { x,y, saved:[0;24*24], sx:0,sy:0,sw:0,sh:0, has_save:false }
-    }
-    /// Restaura o fundo onde o cursor estava (chamar antes de recompor).
-    pub fn hide(&mut self, fb:&Fb) {
-        if !self.has_save { return; }
-        let mut i=0;
-        for yy in 0..self.sh {
-            for xx in 0..self.sw {
-                let px=self.sx+xx; let py=self.sy+yy;
-                if px<fb.w && py<fb.h {
-                    unsafe { *fb.base.add((py*fb.w+px) as usize) = self.saved[i as usize]; }
-                }
-                i+=1;
-            }
-        }
-        self.has_save=false;
-    }
-    /// Salva o fundo e desenha o cursor (chamar por ultimo, antes do present).
-    pub fn show(&mut self, fb:&Fb) {
-        let cw=16u32; let ch=22u32;
-        self.sx=self.x; self.sy=self.y; self.sw=cw.min(fb.w.saturating_sub(self.x)); self.sh=ch.min(fb.h.saturating_sub(self.y));
-        let mut i=0;
-        for yy in 0..self.sh {
-            for xx in 0..self.sw {
-                let px=self.sx+xx; let py=self.sy+yy;
-                self.saved[i as usize] = if px<fb.w&&py<fb.h { unsafe{*fb.base.add((py*fb.w+px) as usize)} } else {0};
-                i+=1;
-            }
-        }
-        self.has_save=true;
-        // seta: preenchida branca com contorno preto
-        draw_arrow(fb, self.x, self.y);
-    }
-    pub fn bounds(&self) -> Rect { Rect{x:self.x,y:self.y,w:16,h:22} }
-}
-
-fn draw_arrow(fb:&Fb, mx:u32, my:u32) {
-    // silhueta de seta 12x18 (0=nada,1=borda,2=preenchimento)
-    const A:[&[u8];18]=[
-        b"2",b"22",b"232",b"2332",b"23332",b"233332",b"2333332",b"23333332",
-        b"233333332",b"2333333332",b"23333333332",b"233333222",b"2332332",
-        b"232 2332",b"22  2332",b"2    2332",b"      2332",b"       22"];
-    for (row,line) in A.iter().enumerate() {
-        for (col,&c) in line.iter().enumerate() {
-            let color = match c { b'2'=>0x00202020u32, b'3'=>0x00FFFFFF, _=>continue };
-            fb.blend(mx+col as u32, my+row as u32, color, 255);
-        }
-    }
-}
-
-/// Estado de mouse com deteccao de click e double-click.
-pub struct Mouse {
-    pub x:u32, pub y:u32,
-    pub down:bool,
-    prev_down:bool,
-    pub clicked:bool,
-    pub double:bool,
-    pending_press:u32,
-    last_click_tick:u32,
-    last_x:u32, last_y:u32,
-    pub dragging:bool,
-}
-impl Mouse {
-    pub const fn new(x:u32,y:u32)->Self{
-        Mouse{x,y,down:false,prev_down:false,clicked:false,double:false,pending_press:0,last_click_tick:0,last_x:0,last_y:0,dragging:false}
-    }
-    /// Processa um evento bruto. tick = contador global (para double-click).
-    pub fn feed(&mut self, ev:&Event, w:u32, h:u32) {
-        match ev.ev_type {
-            EV_ABS => {
-                if ev.code==ABS_X { self.x=(ev.value.min(32767)*(w-1))/32767; }
-                else if ev.code==ABS_Y { self.y=(ev.value.min(32767)*(h-1))/32767; }
-            }
-            EV_KEY if ev.code==BTN_LEFT => {
-                let was=self.down;
-                self.down = ev.value==1;
-                if self.down && !was { self.pending_press += 1; } // conta cada press
-            }
-            _=>{}
-        }
-    }
-    /// Atualiza flags de click/double. `now_ms` = tempo real em ms.
-    pub fn update(&mut self, now_ms:u64) {
-        self.clicked=false; self.double=false;
-        let presses=self.pending_press; self.pending_press=0;
-        if presses>=2 {
-            // dois ou mais press no mesmo frame = double-click imediato
-            self.clicked=true; self.double=true;
-            self.last_click_tick=now_ms as u32; self.last_x=self.x; self.last_y=self.y;
-        } else if presses==1 {
-            self.clicked=true;
-            let delta=now_ms.wrapping_sub(self.last_click_tick as u64);
-            if delta<800 && self.x.abs_diff(self.last_x)<10 && self.y.abs_diff(self.last_y)<10 {
-                self.double=true;
-            }
-            self.last_click_tick=now_ms as u32; self.last_x=self.x; self.last_y=self.y;
-        }
-        if !self.down && self.prev_down { self.dragging=false; }
-        self.prev_down=self.down;
-    }
-    pub fn pressed(&self)->bool { self.down && !self.prev_down }
-    pub fn released(&self)->bool { !self.down && self.prev_down }
-}
-
-// ====================================================================
-// Superficies por cliente. Cada app desenha na SUA superficie (buffer
-// privado); o WM le e compoe. Isso isola o desenho dos apps entre si.
-// ====================================================================
-
-pub const SURF_W: u32 = 512;
-pub const SURF_H: u32 = 512;
-
-/// Mapeia a superficie do slot `slot` e retorna um Fb que desenha nela.
-/// A superficie tem SURF_W x SURF_H; o app usa a sub-regiao que quiser.
-pub fn surface_open(slot: u64) -> Fb {
-    let addr = syscall2(21, slot, 0); // SYS_SURF_MAP
-    Fb { base: addr as *mut u32, w: SURF_W, h: SURF_H, cx0:0,cy0:0,cx1:SURF_W,cy1:SURF_H }
-}
-
-/// Protocolo WM<->app via IPC (service SVC_WM). O app pergunta ao WM:
-/// - qual meu slot de superficie?
-/// - qual a geometria da minha area cliente (w,h)?
-/// - devo fechar? (o WM sinaliza fechamento pelo semaforo)
-pub const SVC_WM: u64 = 2;
-pub const WM_OP_HELLO: u64 = 1;   // app->wm: registro. data[0]=app_kind, data[1]=w_desejada, data[2]=h_desejada. resp: data[0]=slot, data[1]=w, data[2]=h
-pub const WM_OP_COMMIT: u64 = 2;  // app->wm: "desenhei, componha". data[0]=slot
+pub const WM_OP_HELLO: u64 = 1;
+pub const WM_OP_COMMIT: u64 = 2;
 pub const WM_OP_POLL: u64 = 3;
-// Acoes de menu enviadas pelo WM ao app em foco (WmEvent.menu):
-pub const APP_MENU_SAVE:u16=1;
-pub const APP_MENU_NEW:u16=2;
-pub const APP_MENU_COPY:u16=3;
-pub const APP_MENU_PASTE:u16=4;
-pub const APP_MENU_UNDO:u16=5;
-pub const APP_MENU_CLEAR:u16=6;
-pub const APP_MENU_PAUSE:u16=7;
-pub const APP_MENU_RESET:u16=8;    // app->wm: eventos. resp: data[0]=flags, data[1]=mouse_x_local, data[2]=mouse_y_local, data[3]=mouse_flags(bit0=down,bit1=clicked), data[4]=key(evdev code se tecla)
+pub const WM_OP_TITLE: u64 = 4;
 
 pub const WM_FLAG_CLOSE: u64 = 1;
 pub const WM_FLAG_FOCUS: u64 = 2;
+pub const WM_FLAG_DARK: u64 = 4;
+pub const WM_FLAG_MORE: u64 = 8;
+pub const WM_FLAG_VISIBLE: u64 = 16;
+
 pub const WM_MOUSE_DOWN: u64 = 1;
 pub const WM_MOUSE_CLICK: u64 = 2;
+pub const WM_MOUSE_RCLICK: u64 = 4;
+pub const WM_MOUSE_DOUBLE: u64 = 8;
 
-/// Evento que o app recebe do WM via POLL.
-pub struct WmEvent {
-    pub close: bool,
-    pub focused: bool,
-    pub mx: i32, pub my: i32,     // mouse local (na area cliente), -1 se fora
-    pub click: bool,             // clicou neste frame dentro da area
-    pub key: u16,                // tecla evdev (0 = nenhuma)
-    pub menu: u16,               // acao de menu da barra (0 = nenhuma)
-}
+// Acoes de menu enviadas pelo WM ao app em foco
+pub const APP_MENU_SAVE: u16 = 1;
+pub const APP_MENU_NEW: u16 = 2;
+pub const APP_MENU_COPY: u16 = 3;
+pub const APP_MENU_PASTE: u16 = 4;
+pub const APP_MENU_UNDO: u16 = 5;
+pub const APP_MENU_CLEAR: u16 = 6;
+pub const APP_MENU_PAUSE: u16 = 7;
+pub const APP_MENU_RESET: u16 = 8;
+pub const APP_MENU_ZOOM_IN: u16 = 9;
+pub const APP_MENU_ZOOM_OUT: u16 = 10;
+pub const APP_MENU_SELECT_ALL: u16 = 11;
+pub const APP_MENU_RELOAD: u16 = 12;
+pub const APP_MENU_ADD: u16 = 13;
 
-/// Faz POLL ao WM e decodifica os eventos.
-pub fn wm_poll(wm: usize) -> WmEvent {
-    let mut m = Msg::new(WM_OP_POLL);
-    send(wm, &mut m);
-    let mf = m.data[3];
-    WmEvent {
-        close: m.data[0] & WM_FLAG_CLOSE != 0,
-        focused: m.data[0] & WM_FLAG_FOCUS != 0,
-        mx: m.data[1] as i32, my: m.data[2] as i32,
-        click: mf & WM_MOUSE_CLICK != 0,
-        key: m.data[4] as u16,
-        menu: m.data[5] as u16,
+pub fn pack_title(t: &[u8], out: &mut [u64]) {
+    for (i, w) in out.iter_mut().enumerate() {
+        let mut v = 0u64;
+        for b in 0..8 {
+            let k = i * 8 + b;
+            if k < t.len() { v |= (t[k] as u64) << (b * 8); }
+        }
+        *w = v;
     }
 }
 
-/// HELLO com tamanho desejado + titulo (ate 24 bytes em data[3..6]).
-pub fn wm_hello(wm: usize, app_kind: u64, want_w: u32, want_h: u32) -> (u64, u32, u32) {
-    let mut m = Msg::new(WM_OP_HELLO);
-    m.data[0] = app_kind; m.data[1] = want_w as u64; m.data[2] = want_h as u64;
-    send(wm, &mut m);
-    (m.data[0], m.data[1] as u32, m.data[2] as u32)
+pub fn unpack_title(words: &[u64], out: &mut [u8; 24]) -> usize {
+    for (i, w) in words.iter().enumerate().take(3) {
+        for b in 0..8 { out[i * 8 + b] = (w >> (b * 8)) as u8; }
+    }
+    out.iter().position(|&b| b == 0).unwrap_or(24)
 }
 
-/// COMMIT: avisa o WM que desenhou.
-pub fn wm_commit(wm: usize, slot: u64) {
-    let mut m = Msg::new(WM_OP_COMMIT); m.data[0] = slot;
-    send(wm, &mut m);
+/// Evento recebido do WM.
+#[derive(Clone, Copy, Default)]
+pub struct WmEvent {
+    pub close: bool,
+    pub focused: bool,
+    pub dark: bool,
+    pub visible: bool,
+    /// ha mais eventos na fila: chame poll de novo antes de desenhar
+    pub more: bool,
+    /// tamanho ou tema mudaram: redesenhe tudo
+    pub changed: bool,
+    pub w: i32,
+    pub h: i32,
+    pub mx: i32,
+    pub my: i32,
+    pub down: bool,
+    pub click: bool,
+    pub rclick: bool,
+    pub double: bool,
+    pub wheel: i32,
+    pub key: Option<Key>,
+    pub menu: u16,
+    pub accent: u32,
 }
+
+impl WmEvent {
+    fn decode(m: &Msg) -> WmEvent {
+        let f = m.data[0];
+        let b = m.data[3];
+        WmEvent {
+            close: f & WM_FLAG_CLOSE != 0,
+            focused: f & WM_FLAG_FOCUS != 0,
+            dark: f & WM_FLAG_DARK != 0,
+            visible: f & WM_FLAG_VISIBLE != 0,
+            more: f & WM_FLAG_MORE != 0,
+            changed: false,
+            w: ((f >> 16) & 0xFFFF) as i32,
+            h: ((f >> 32) & 0xFFFF) as i32,
+            mx: m.data[1] as i64 as i32,
+            my: m.data[2] as i64 as i32,
+            down: b & WM_MOUSE_DOWN != 0,
+            click: b & WM_MOUSE_CLICK != 0,
+            rclick: b & WM_MOUSE_RCLICK != 0,
+            double: b & WM_MOUSE_DOUBLE != 0,
+            wheel: ((b >> 8) & 0xFF) as u8 as i8 as i32,
+            key: Key::unpack(m.data[4]),
+            menu: m.data[5] as u16,
+            accent: (m.data[5] >> 32) as u32 & 0xFFFFFF,
+        }
+    }
+
+    /// O evento traz algo que pede redesenho?
+    pub fn interesting(&self) -> bool {
+        self.changed || self.click || self.rclick || self.wheel != 0 || self.key.is_some() || self.menu != 0
+    }
+}
+
+/// Cliente do WM: superficie propria + eventos + tema.
+pub struct App {
+    pub wm: usize,
+    pub slot: u64,
+    pub fb: Fb,
+    pub w: i32,
+    pub h: i32,
+    pub theme: Theme,
+    pub focused: bool,
+    /// indice do arquivo a abrir (duplo clique no Finder), se houver
+    pub open_file: Option<usize>,
+}
+
+impl App {
+    /// Registra-se no WM com tamanho preferido (area cliente) e titulo.
+    pub fn new(kind: u64, title: &[u8], w: i32, h: i32) -> App {
+        let wm = wait_service(SVC_WM);
+        let mut m = Msg::new(WM_OP_HELLO);
+        m.data[0] = kind;
+        m.data[1] = w as u64;
+        m.data[2] = h as u64;
+        pack_title(title, &mut m.data[3..6]);
+        send(wm, &mut m);
+        let slot = m.data[0];
+        let (w, h) = ((m.data[1] as i32).min(SURF_W), (m.data[2] as i32).min(SURF_H));
+        let open_file = if m.data[3] > 0 { Some(m.data[3] as usize - 1) } else { None };
+        let base = surface_map(slot) as *mut u32;
+        let fb = Fb::new(base, w, h, SURF_W);
+        let mut app = App { wm, slot, fb, w, h, theme: Theme::new(false, 0x0A84FF), focused: true, open_file };
+        app.poll();
+        app
+    }
+
+    /// Aplica tamanho/tema do evento; marca `changed` se algo mudou.
+    fn apply(&mut self, ev: &mut WmEvent) {
+        if ev.w > 0 && ev.h > 0 && (ev.w != self.w || ev.h != self.h) {
+            self.w = ev.w.min(SURF_W);
+            self.h = ev.h.min(SURF_H);
+            self.fb = Fb::new(self.fb.base, self.w, self.h, SURF_W);
+            ev.changed = true;
+        }
+        if ev.accent != 0 && (ev.dark != self.theme.dark || ev.accent != self.theme.accent) {
+            self.theme = Theme::new(ev.dark, ev.accent);
+            ev.changed = true;
+        }
+        if ev.focused != self.focused {
+            self.focused = ev.focused;
+            ev.changed = true;
+        }
+    }
+
+    /// Busca o proximo evento (bloqueia ate o WM atender, ~1 quadro).
+    pub fn poll(&mut self) -> WmEvent {
+        let mut m = Msg::new(WM_OP_POLL);
+        send(self.wm, &mut m);
+        let mut ev = WmEvent::decode(&m);
+        self.apply(&mut ev);
+        ev
+    }
+
+    /// "Desenhei": o WM compoe a superficie. Retorna eventos como o poll.
+    pub fn commit(&mut self) -> WmEvent {
+        let mut m = Msg::new(WM_OP_COMMIT);
+        m.data[0] = self.slot;
+        m.data[1] = ((self.w as u64) << 16) | self.h as u64;
+        send(self.wm, &mut m);
+        let mut ev = WmEvent::decode(&m);
+        self.apply(&mut ev);
+        ev
+    }
+
+    pub fn set_title(&self, t: &[u8]) {
+        let mut m = Msg::new(WM_OP_TITLE);
+        pack_title(t, &mut m.data[0..3]);
+        send(self.wm, &mut m);
+    }
+}
+
+// ------------------------------------------------------------- formatacao
+
+/// Buffer de texto de tamanho fixo (sem alocacao) para montar strings.
+#[derive(Clone, Copy)]
+pub struct Buf<const N: usize> {
+    pub b: [u8; N],
+    pub n: usize,
+}
+
+impl<const N: usize> Buf<N> {
+    pub const fn new() -> Self { Buf { b: [0; N], n: 0 } }
+    pub fn clear(&mut self) -> &mut Self { self.n = 0; self }
+    pub fn s(&mut self, s: &str) -> &mut Self { self.bytes(s.as_bytes()) }
+    pub fn bytes(&mut self, s: &[u8]) -> &mut Self {
+        for &c in s {
+            if self.n < N { self.b[self.n] = c; self.n += 1; }
+        }
+        self
+    }
+    pub fn u(&mut self, v: u64) -> &mut Self {
+        let mut t = [0u8; 20];
+        let mut i = 20;
+        let mut v = v;
+        if v == 0 { i -= 1; t[i] = b'0'; }
+        while v > 0 { i -= 1; t[i] = b'0' + (v % 10) as u8; v /= 10; }
+        self.bytes(&t[i..])
+    }
+    /// Inteiro com zeros a esquerda ate `w` digitos.
+    pub fn u0(&mut self, v: u64, w: usize) -> &mut Self {
+        let mut d = 1;
+        let mut x = v;
+        while x >= 10 { x /= 10; d += 1; }
+        for _ in d..w { self.bytes(b"0"); }
+        self.u(v)
+    }
+    pub fn i(&mut self, v: i64) -> &mut Self {
+        if v < 0 { self.bytes(b"-"); }
+        self.u(v.unsigned_abs())
+    }
+    pub fn ch(&mut self, cp: u32) -> &mut Self {
+        let mut t = [0u8; 4];
+        let n = utf8_encode(cp, &mut t);
+        self.bytes(&t[..n])
+    }
+    /// Tamanho em KB/MB legivel.
+    pub fn size(&mut self, bytes: u64) -> &mut Self {
+        if bytes < 1024 { self.u(bytes).s(" B") }
+        else if bytes < 1024 * 1024 { self.u(bytes.div_ceil(1024)).s(" KB") }
+        else {
+            let tenths = bytes * 10 / (1024 * 1024);
+            self.u(tenths / 10).s(",").u(tenths % 10).s(" MB")
+        }
+    }
+    pub fn get(&self) -> &[u8] { &self.b[..self.n] }
+}
+
+/// Converte segundos Unix em (ano, mes, dia, hora, min, seg, dia da semana).
+pub fn civil_time(secs: u64) -> (u32, u32, u32, u32, u32, u32, u32) {
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let wday = ((days + 4) % 7) as u32; // 01/01/1970 foi quinta-feira
+    // algoritmo de Howard Hinnant (days_from_civil inverso)
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as u32, m as u32, d as u32, (rem / 3600) as u32, ((rem / 60) % 60) as u32, (rem % 60) as u32, wday)
+}
+
+pub const WEEKDAYS: [&str; 7] = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
+pub const MONTHS: [&str; 12] = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];

@@ -11,16 +11,18 @@
 //! Operacao por polling (a syscall SYS_INPUT_POLL drena as filas).
 
 use crate::virtio::{self, QueueMem, VirtQueue};
+use crate::sync::SpinLock;
 use crate::uart::Uart;
+
+/// Trava das filas de entrada e do foco de teclado.
+static INPUT: SpinLock = SpinLock::new();
 use core::fmt::Write;
 
 const VIRTIO_ID_INPUT: u32 = 18;
-const NBUF: u16 = 16; // buffers de evento postados por dispositivo
+const NBUF: u16 = 64; // buffers de evento postados por dispositivo
 
 // Tipos de evento (evdev)
 pub const EV_SYN: u16 = 0;
-pub const EV_KEY: u16 = 1;
-pub const EV_REL: u16 = 2;
 pub const EV_ABS: u16 = 3;
 
 // Config space do virtio-input
@@ -99,15 +101,20 @@ pub fn init() -> usize {
 // Slot 0 = teclado, slot 1 = tablet(mouse). Filas separadas de eventos.
 // O teclado e roteado para o processo com FOCO; o mouse vai para quem
 // pedir (o shell/WM sempre le o mouse para mover o cursor).
-static mut FOCUS_PID: usize = 0; // processo que recebe o teclado
+static mut FOCUS_PID: usize = usize::MAX; // processo que recebe o teclado
 
 /// Define qual processo recebe eventos de teclado.
 pub fn set_focus(pid: usize) {
+    let _g = INPUT.guard();
     unsafe { FOCUS_PID = pid; }
 }
 
-pub fn focus() -> usize {
-    unsafe { FOCUS_PID }
+/// Esquece um processo que terminou (o foco volta a ficar livre).
+pub fn forget(pid: usize) {
+    let _g = INPUT.guard();
+    unsafe {
+        if FOCUS_PID == pid { FOCUS_PID = usize::MAX; }
+    }
 }
 
 /// Drena um evento do dispositivo `slot`, sem bloquear. Filtra EV_SYN.
@@ -132,19 +139,16 @@ fn drain(slot: usize) -> Option<InputEvent> {
 /// Poll para o processo `pid`: mouse sempre; teclado so se tiver foco.
 /// Quando um processo sem foco chama, so recebe eventos de mouse.
 pub fn poll_for(pid: usize) -> Option<InputEvent> {
+    let _g = INPUT.guard();
     // mouse (tablet) primeiro — qualquer um pode ler
     if let Some(ev) = drain(1) {
         return Some(ev);
     }
-    // teclado — so o processo com foco drena a fila
-    if pid == unsafe { FOCUS_PID } {
+    // teclado — so o processo com foco drena a fila (sem foco definido,
+    // qualquer um pode ler)
+    let f = unsafe { FOCUS_PID };
+    if pid == f || f == usize::MAX {
         return drain(0);
     }
     None
-}
-
-/// Compatibilidade: poll sem roteamento (usado internamente).
-pub fn poll_event() -> Option<InputEvent> {
-    if let Some(ev) = drain(1) { return Some(ev); }
-    drain(0)
 }

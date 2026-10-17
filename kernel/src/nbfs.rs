@@ -41,8 +41,6 @@ pub struct Inode {
     pub _reserved: [u32; 3],    // 64 (padding p/ fechar 64 bytes)
 }
 
-// Mesmo nome de tipo publico que o pfs usa, para compatibilidade de chamadas.
-pub type FileEntry = Inode;
 
 #[repr(C)]
 struct SuperBlock {

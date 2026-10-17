@@ -10,5 +10,5 @@ plib = { path = "../plib" }
 
 [profile.release]
 panic = "abort"
-opt-level = "s"
+opt-level = 3
 lto = true

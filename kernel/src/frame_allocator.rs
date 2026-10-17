@@ -1,93 +1,114 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+//! Alocador de frames fisicos de 4 KiB por bitmap, sobre a janela
+//! [HEAP_START, HEAP_START + HEAP_SIZE) definida pela arquitetura.
+//! Protegido pela trava FRAME (folha: nunca pega outra trava).
+use crate::arch::platform::{FB_PA, FB_REGION_BYTES, HEAP_SIZE, HEAP_START};
+use crate::sync::SpinLock;
 
-/// Inicio da RAM gerenciada pelo alocador (depois do kernel + regiao de usuario).
-const HEAP_START: u64 = 0x4020_0000;
-/// Tamanho da janela gerenciada: 64 MB.
-const HEAP_SIZE: u64 = 64 * 1024 * 1024;
-/// Tamanho de uma pagina (frame).
+static FRAME: SpinLock = SpinLock::new();
+
 const PAGE_SIZE: u64 = 4096;
-/// Numero total de frames gerenciados.
-const NUM_FRAMES: usize = (HEAP_SIZE / PAGE_SIZE) as usize; // 16384
-/// Tamanho do bitmap em bytes (1 bit por frame).
-const BITMAP_BYTES: usize = NUM_FRAMES / 8; // 2048
+const NUM_FRAMES: usize = (HEAP_SIZE / PAGE_SIZE) as usize;
+const WORDS: usize = NUM_FRAMES.div_ceil(64);
 
-/// Bitmap: bit i = frame i. 0 = livre, 1 = usado. Vive na BSS (zerado no boot).
-static mut BITMAP: [u8; BITMAP_BYTES] = [0; BITMAP_BYTES];
+/// bit i = frame i (1 = usado). Vive na BSS (tudo livre no boot).
+static mut BITMAP: [u64; WORDS] = [0; WORDS];
+/// Dica de onde comecar a busca (next-fit).
+static mut HINT: usize = 0;
+static mut FREE: usize = NUM_FRAMES;
 
-/// Trava simples para evitar uso antes de init (e marcar "ja inicializado").
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
+#[inline]
+fn bm() -> &'static mut [u64; WORDS] {
+    unsafe { &mut *(&raw mut BITMAP) }
+}
 
-/// Inicializa o alocador. Por enquanto so marca como pronto — o bitmap ja
-/// nasce zerado (tudo livre) gracas ao zero da BSS no boot.
 pub fn init() {
-    INITIALIZED.store(true, Ordering::SeqCst);
-}
-
-/// Marca um frame como usado no bitmap.
-fn set_used(idx: usize) {
-    unsafe {
-        let byte = &raw mut BITMAP[idx / 8];
-        *byte |= 1 << (idx % 8);
+    // bits alem de NUM_FRAMES na ultima palavra ficam "usados"
+    let extra = WORDS * 64 - NUM_FRAMES;
+    if extra > 0 {
+        bm()[WORDS - 1] |= !0u64 << (64 - extra);
+    }
+    // a regiao grafica fica dentro da RAM gerenciada: reserva os frames
+    let mut a = FB_PA;
+    while a < FB_PA + FB_REGION_BYTES {
+        set_used(((a - HEAP_START) / PAGE_SIZE) as usize);
+        a += PAGE_SIZE;
     }
 }
 
-/// Marca um frame como livre no bitmap.
-fn set_free(idx: usize) {
-    unsafe {
-        let byte = &raw mut BITMAP[idx / 8];
-        *byte &= !(1 << (idx % 8));
-    }
+/// Frames que nunca sao devolvidos (regiao grafica mapeada para os apps).
+#[inline]
+fn reserved(addr: u64) -> bool {
+    addr >= FB_PA && addr < FB_PA + FB_REGION_BYTES
 }
 
-/// Verifica se um frame esta livre.
+#[inline]
 fn is_free(idx: usize) -> bool {
-    unsafe {
-        let byte = (&raw const BITMAP[idx / 8]).read();
-        (byte & (1 << (idx % 8))) == 0
-    }
+    bm()[idx / 64] & (1 << (idx % 64)) == 0
 }
 
-/// Aloca um frame de 4KB. Retorna o endereco fisico, ou None se nao houver.
+#[inline]
+fn set_used(idx: usize) {
+    bm()[idx / 64] |= 1 << (idx % 64);
+    unsafe { FREE -= 1; }
+}
+
+#[inline]
+fn addr_of(idx: usize) -> u64 {
+    HEAP_START + idx as u64 * PAGE_SIZE
+}
+
+/// Aloca um frame de 4KB. Retorna o endereco fisico.
 pub fn alloc_frame() -> Option<u64> {
-    for idx in 0..NUM_FRAMES {
-        if is_free(idx) {
+    let _g = FRAME.guard();
+    let start = unsafe { HINT } / 64;
+    for k in 0..WORDS {
+        let w = (start + k) % WORDS;
+        let word = bm()[w];
+        if word != u64::MAX {
+            let bit = (!word).trailing_zeros() as usize;
+            let idx = w * 64 + bit;
             set_used(idx);
-            let addr = HEAP_START + (idx as u64) * PAGE_SIZE;
-            return Some(addr);
+            unsafe { HINT = idx; }
+            return Some(addr_of(idx));
         }
     }
     None
 }
 
-/// Libera um frame previamente alocado.
+/// Libera um frame. Enderecos fora da janela (MMIO, regiao grafica) sao
+/// ignorados, o que permite liberar tabelas de usuario sem distinguir.
 pub fn free_frame(addr: u64) {
-    if addr < HEAP_START || addr >= HEAP_START + HEAP_SIZE {
-        return; // fora da janela gerenciada — ignora
+    if addr < HEAP_START || addr >= HEAP_START + HEAP_SIZE || reserved(addr) {
+        return;
     }
     let idx = ((addr - HEAP_START) / PAGE_SIZE) as usize;
-    set_free(idx);
+    let _g = FRAME.guard();
+    if !is_free(idx) {
+        bm()[idx / 64] &= !(1 << (idx % 64));
+        unsafe { FREE += 1; }
+    }
 }
 
-/// Conta quantos frames estao livres (util para diagnostico).
 pub fn free_count() -> usize {
-    (0..NUM_FRAMES).filter(|&i| is_free(i)).count()
+    unsafe { FREE }
 }
-/// Aloca `n` frames FISICAMENTE CONTIGUOS. Retorna o endereco do primeiro.
-/// Usado para buffers de arquivo (leitura de disco) e stacks de processo.
+
+pub fn total_count() -> usize {
+    NUM_FRAMES
+}
+
+/// Aloca `n` frames fisicamente contiguos.
 pub fn alloc_contig(n: usize) -> Option<u64> {
+    let _g = FRAME.guard();
     let mut run = 0usize;
     let mut start = 0usize;
     for idx in 0..NUM_FRAMES {
         if is_free(idx) {
-            if run == 0 {
-                start = idx;
-            }
+            if run == 0 { start = idx; }
             run += 1;
             if run == n {
-                for i in start..start + n {
-                    set_used(i);
-                }
-                return Some(HEAP_START + (start as u64) * PAGE_SIZE);
+                for i in start..start + n { set_used(i); }
+                return Some(addr_of(start));
             }
         } else {
             run = 0;
@@ -96,7 +117,6 @@ pub fn alloc_contig(n: usize) -> Option<u64> {
     None
 }
 
-/// Libera `n` frames contiguos a partir de `addr`.
 pub fn free_contig(addr: u64, n: usize) {
     for i in 0..n {
         free_frame(addr + (i as u64) * PAGE_SIZE);

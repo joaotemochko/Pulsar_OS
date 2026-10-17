@@ -1,30 +1,27 @@
+//! Generic Timer (timer fisico EL1, PPI 30). Cada CPU tem o seu.
 use core::arch::asm;
 
-pub const TIMER_IRQ: u32 = 30; // PPI do timer fisico EL1
+pub const TIMER_IRQ: u32 = 30;
 
-/// Arma o timer para disparar daqui a `ticks_fraction` da frequencia.
-/// Ex.: fraction=10 -> dispara a cada 1/10 de segundo.
-pub static mut UPTIME_TICKS: u64 = 0;
-
-/// Incrementa o contador de uptime (chamado pelo IRQ do timer a 100Hz).
-pub fn tick() { unsafe { UPTIME_TICKS += 1; } }
-
-/// Ticks desde o boot (100Hz -> cada tick = 10ms).
-pub fn uptime() -> u64 { unsafe { UPTIME_TICKS } }
-
-pub fn arm(fraction: u64) {
-    unsafe {
-        let freq: u64;
-        asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack, preserves_flags));
-        let interval = freq / fraction;
-        // carrega o valor de contagem regressiva
-        asm!("msr cntp_tval_el0, {}", in(reg) interval, options(nomem, nostack, preserves_flags));
-        // habilita o timer (bit 0 = enable, bit 1 = mask; queremos enable e nao-mascarado)
-        asm!("msr cntp_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack, preserves_flags));
-    }
+#[inline]
+pub fn now() -> u64 {
+    let v: u64;
+    unsafe { asm!("isb", "mrs {}, cntpct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
 }
 
-/// Rearma o timer para o proximo tick (chamado no handler de IRQ).
-pub fn rearm(fraction: u64) {
-    arm(fraction);
+#[inline]
+pub fn freq() -> u64 {
+    let v: u64;
+    unsafe { asm!("mrs {}, cntfrq_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+/// Dispara o IRQ do timer desta CPU no instante absoluto `t`.
+pub fn set_deadline(t: u64) {
+    unsafe {
+        asm!("msr cntp_cval_el0, {}", in(reg) t, options(nomem, nostack, preserves_flags));
+        asm!("msr cntp_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack, preserves_flags));
+        asm!("isb", options(nomem, nostack, preserves_flags));
+    }
 }

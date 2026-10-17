@@ -1,53 +1,55 @@
+//! GICv2: distribuidor compartilhado + interface por CPU.
+//!
+//! Registradores de SGI/PPI (ISENABLER0, IPRIORITYR0..7) e a interface de
+//! CPU (GICC) sao "banked": cada nucleo enxerga a sua copia no mesmo
+//! endereco, por isso `init_cpu` roda em todas as CPUs.
 use core::ptr::{read_volatile, write_volatile};
+use super::platform::{GICC_BASE, GICD_BASE};
 
-const GICD_BASE: usize = 0x0800_0000;
-const GICC_BASE: usize = 0x0801_0000;
+const GICD_CTLR: u64 = 0x000;
+const GICD_ISENABLER: u64 = 0x100;
+const GICD_IPRIORITYR: u64 = 0x400;
+const GICD_SGIR: u64 = 0xF00;
 
-// Registradores do distribuidor (GICD)
-const GICD_CTLR:      *mut u32 = (GICD_BASE + 0x000) as *mut u32;
-const GICD_ISENABLER: *mut u32 = (GICD_BASE + 0x100) as *mut u32; // enable set
-const GICD_IPRIORITYR:*mut u32 = (GICD_BASE + 0x400) as *mut u32;
-const GICD_ITARGETSR: *mut u32 = (GICD_BASE + 0x800) as *mut u32;
+const GICC_CTLR: u64 = 0x000;
+const GICC_PMR: u64 = 0x004;
+const GICC_IAR: u64 = 0x00C;
+const GICC_EOIR: u64 = 0x010;
 
-// Registradores da interface de CPU (GICC)
-const GICC_CTLR: *mut u32 = (GICC_BASE + 0x000) as *mut u32;
-const GICC_PMR:  *mut u32 = (GICC_BASE + 0x004) as *mut u32; // priority mask
-const GICC_IAR:  *mut u32 = (GICC_BASE + 0x00C) as *mut u32; // ack
-const GICC_EOIR: *mut u32 = (GICC_BASE + 0x010) as *mut u32; // end of interrupt
+/// SGI usada como IPI de reescalonamento.
+pub const IPI_SGI: u32 = 1;
 
-pub fn init() {
-    unsafe {
-        // Habilita o distribuidor
-        write_volatile(GICD_CTLR, 1);
-        // Habilita a interface de CPU
-        write_volatile(GICC_CTLR, 1);
-        // Mascara de prioridade: aceita todas (0xFF = menor prioridade permitida)
-        write_volatile(GICC_PMR, 0xFF);
+#[inline]
+fn w32(addr: u64, v: u32) { unsafe { write_volatile(addr as *mut u32, v) } }
+#[inline]
+fn r32(addr: u64) -> u32 { unsafe { read_volatile(addr as *const u32) } }
+
+pub fn init_distributor() {
+    w32(GICD_BASE + GICD_CTLR, 1);
+}
+
+/// Interface de CPU + habilita timer (PPI 30) e a SGI de IPI neste nucleo.
+pub fn init_cpu() {
+    w32(GICC_BASE + GICC_CTLR, 1);
+    w32(GICC_BASE + GICC_PMR, 0xFF);
+    for irq in [super::timer::TIMER_IRQ, IPI_SGI] {
+        w32(GICD_BASE + GICD_ISENABLER + (irq as u64 / 32) * 4, 1 << (irq % 32));
+        unsafe { write_volatile((GICD_BASE + GICD_IPRIORITYR + irq as u64) as *mut u8, 0x00) };
     }
 }
 
-/// Habilita um IRQ especifico no distribuidor.
-pub fn enable_irq(irq: u32) {
-    unsafe {
-        let reg = GICD_ISENABLER.add((irq / 32) as usize);
-        write_volatile(reg, 1 << (irq % 32));
-
-        // prioridade do IRQ (byte por IRQ); 0 = maior prioridade
-        let prio = GICD_IPRIORITYR.cast::<u8>().add(irq as usize);
-        write_volatile(prio, 0x00);
-
-        // alvo: core 0 (byte por IRQ)
-        let target = GICD_ITARGETSR.cast::<u8>().add(irq as usize);
-        write_volatile(target, 0x01);
-    }
-}
-
-/// Le o numero do IRQ pendente (acknowledge).
+/// Le o IAR (acknowledge). Retorna o valor bruto (inclui a CPU de origem
+/// das SGIs, necessaria no EOI).
 pub fn ack() -> u32 {
-    unsafe { read_volatile(GICC_IAR) & 0x3FF }
+    r32(GICC_BASE + GICC_IAR)
 }
 
-/// Sinaliza fim de tratamento do IRQ.
-pub fn eoi(irq: u32) {
-    unsafe { write_volatile(GICC_EOIR, irq); }
+pub fn eoi(iar: u32) {
+    w32(GICC_BASE + GICC_EOIR, iar);
+}
+
+/// Envia a SGI `id` para a CPU `cpu` (alvo por lista de CPUs).
+pub fn send_sgi(cpu: usize, id: u32) {
+    unsafe { core::arch::asm!("dsb ishst", options(nostack, preserves_flags)) };
+    w32(GICD_BASE + GICD_SGIR, ((1u32 << cpu) << 16) | id);
 }

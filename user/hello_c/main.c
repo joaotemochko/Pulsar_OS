@@ -1,37 +1,26 @@
-/* hello_c — primeiro app em C do Pulsar OS. Desenha um gradiente e
- * alguns retângulos para provar que a toolchain C + libc funcionam. */
+/* hello_c — o menor app grafico em C para o Pulsar OS. Use-o como modelo:
+ * registra uma janela no WM, desenha na propria superficie e reage aos
+ * eventos (clique, tecla, tema). Abra pelo Terminal com:  open hello_c */
 #include "pulsar.h"
 
 int main(void){
-    puts_("[hello_c] app em C iniciando\n");
-    Fb fb = fb_open();
-
-    /* fundo: gradiente vertical azul */
-    for(u32 y=0; y<fb.h; y++){
-        u32 t = (y*255)/fb.h;
-        u32 color = (0x20<<16) | ((0x33+t/4)<<8) | (0x58+t/3);
-        fb_fill(&fb, 0, y, fb.w, 1, color);
-    }
-
-    /* barras coloridas centrais */
-    u32 colors[5] = {0xFF5F57, 0xFEBC2E, 0x28C840, 0x579BFF, 0xAF6BFF};
-    u32 bw = fb.w/6;
-    for(int i=0; i<5; i++){
-        u32 bx = bw/2 + (u32)i*bw + bw/4;
-        for(u32 yy=0; yy<200; yy++)
-            for(u32 xx=0; xx<bw-20; xx++)
-                fb_blend(&fb, bx+xx, fb.h/2-100+yy, colors[i], 230);
-    }
-
-    /* quadro branco translúcido no topo */
-    for(u32 yy=0; yy<80; yy++)
-        for(u32 xx=0; xx<fb.w; xx++)
-            fb_blend(&fb, xx, yy, 0xFFFFFF, 40);
-
-    puts_("[hello_c] desenho pronto, apresentando\n");
+    App app;
+    app_init(&app, 99, "Olá, Pulsar", 360, 200);
+    int clicks = 0;
+    WmEvent e; e.changed = 1; e.close = 0; e.click = 0; e.more = 0;
     for(;;){
-        sys_fb_present();
-        sys_yield();
+        if(e.close) sys_exit();
+        if(e.click) clicks++;
+        if(e.changed || e.click){
+            Fb* fb = &app.fb;
+            fb_fill(fb, rect(0, 0, app.w, app.h), app.th.win_bg);
+            text_center(fb, &FONT_TITLE, rect(0, 40, app.w, 40), "Olá, Pulsar!", app.th.text);
+            char b[48]; char* p = fmt_s(b, "cliques: "); fmt_u(p, (u64)clicks);
+            text_center(fb, &FONT_UI, rect(0, 90, app.w, 24), b, app.th.text2);
+            fb_round_rect(fb, rect(app.w / 2 - 60, 130, 120, 32), 8, app.th.accent);
+            text_center(fb, &FONT_UI_BOLD, rect(app.w / 2 - 60, 130, 120, 32), "Clique aqui", 0xFFFFFF);
+            e = app_commit(&app);
+        } else e = app_poll(&app);
     }
     return 0;
 }

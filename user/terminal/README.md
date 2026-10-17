@@ -1,19 +1,13 @@
-# Terminal do Pulsar OS (em C)
+# Terminal (C)
 
-Primeiro app funcional escrito em C sobre a libc mínima do Pulsar. Roda
-como cliente do Window Manager: pede uma superfície, desenha nela, e recebe
-teclado/mouse via o protocolo IPC do WM (SVC_WM).
+Shell gráfico no estilo Unix, com fonte monoespaçada e tema claro/escuro.
 
-## Recursos
-- Renderização na própria superfície (isolada), composta pelo WM.
-- Fonte Poppins anti-aliased (mesma da GUI Rust, portada para C).
-- Entrada de teclado roteada pelo WM (foco).
-- Comandos: help, echo <txt>, clear, ver, files (conta arquivos via IPC
-  do filesystem daemon).
-- Cursor de texto piscando, histórico de linhas.
+Comandos: `help`, `ls`, `cat <arq>`, `ps`, `kill <pid>`, `open <app>`,
+`date`, `uptime`, `free`, `cpus`, `uname`, `neofetch`, `echo`, `history`,
+`clear`, `exit`, `poweroff`.
 
-## Compilar
-```
-cd user/terminal && ./build.sh
-python3 tools/mkpulse.py terminal.elf terminal.pulse 0x11400000
-```
+- Setas ↑/↓: histórico; Tab completa comandos; Ctrl+L limpa; PgUp/PgDn rolam.
+- `open calc` (ou qualquer `.pulse` do disco) cria um processo novo; o WM
+  abre a janela dele automaticamente.
+
+Compilado pelo `Makefile` da raiz.

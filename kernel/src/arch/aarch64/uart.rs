@@ -1,32 +1,15 @@
-use core::fmt;
+//! PL011 UART (somente transmissao, por polling).
 use core::ptr::{read_volatile, write_volatile};
+use super::platform::UART_BASE;
 
-const UART0_BASE: usize = 0x0900_0000;
-const UART0_DR: *mut u32 = UART0_BASE as *mut u32;              // Data Register
-const UART0_FR: *const u32 = (UART0_BASE + 0x18) as *const u32; // Flag Register
-const FR_TXFF: u32 = 1 << 5;                                    // Transmit FIFO Full
+const DR: u64 = 0x00;
+const FR: u64 = 0x18;
+const FR_TXFF: u32 = 1 << 5;
 
-pub struct Uart;
-
-impl Uart {
-    pub fn write_byte(&self, byte: u8) {
-        unsafe {
-            while read_volatile(UART0_FR) & FR_TXFF != 0 {} // espera a FIFO esvaziar
-            write_volatile(UART0_DR, byte as u32);
-        }
-    }
-
-    pub fn write_string(&self, s: &str) {
-        for b in s.bytes() {
-            if b == b'\n' { self.write_byte(b'\r'); }
-            self.write_byte(b);
-        }
-    }
-}
-
-impl fmt::Write for Uart {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.write_string(s);
-        Ok(())
+#[inline]
+pub fn putc(byte: u8) {
+    unsafe {
+        while read_volatile((UART_BASE + FR) as *const u32) & FR_TXFF != 0 {}
+        write_volatile((UART_BASE + DR) as *mut u32, byte as u32);
     }
 }

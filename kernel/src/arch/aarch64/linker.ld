@@ -23,13 +23,7 @@ SECTIONS
         __bss_end = .;
     }
 
-    . = ALIGN(16);
-    . = . + 0x80000;   /* 512 KiB stack do kernel (SP_EL1) */
-    . = ALIGN(16);
-    __stack_top = .;
-
-    . = ALIGN(16);
-    . = . + 0x10000;   /* 64 KiB stack de usuario (SP_EL0) */
-    . = ALIGN(16);
-    __user_stack_top = .;
+    /* As pilhas de kernel por CPU (KSTACKS) vivem na .bss. */
+    . = ALIGN(4096);
+    __kernel_end = .;
 }

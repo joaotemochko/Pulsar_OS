@@ -7,5 +7,5 @@ plib = { path = "../plib" }
 [workspace]
 [profile.release]
 panic = "abort"
-opt-level = "s"
+opt-level = 3
 lto = true

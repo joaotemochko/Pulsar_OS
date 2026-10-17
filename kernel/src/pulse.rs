@@ -9,12 +9,12 @@ pub struct PulseHeader {
     pub seg_count: u16,    // numero de segmentos
     pub entry: u64,        // VA do ponto de entrada
     pub seg_table_off: u32, // offset (no arquivo) da tabela de segmentos
-    pub _reserved: u32,
+    pub arch: u32,         // 0 = legado (AArch64), 1 = AArch64, 2 = RISC-V RV64
     pub stack_top: u64,    // v2: topo da stack EL0 (loader mapeia abaixo)
 }
 
-/// Paginas de stack que o loader mapeia abaixo de `stack_top` (32 KB).
-pub const STACK_PAGES: u64 = 8;
+/// Paginas de stack que o loader mapeia abaixo de `stack_top` (256 KB).
+pub const STACK_PAGES: u64 = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -26,6 +26,10 @@ pub struct PulseSegment {
     pub flags: u32,      // bit0=R, bit1=W, bit2=X
 }
 
-pub const SEG_R: u32 = 1 << 0;
-pub const SEG_W: u32 = 1 << 1;
 pub const SEG_X: u32 = 1 << 2;
+
+/// O executavel foi gerado para a arquitetura em que estamos rodando?
+pub fn arch_matches(arch: u32) -> bool {
+    let id = crate::arch::ARCH_ID;
+    arch == id || (arch == 0 && id == 1)
+}

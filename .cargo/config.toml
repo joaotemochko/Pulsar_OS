@@ -1,8 +1,14 @@
+# Alvo padrao do kernel. Para RISC-V: --target riscv64imac-unknown-none-elf.
+# O jeito recomendado de compilar/rodar e o Makefile (make run / make run ARCH=riscv64),
+# que tambem gera os apps e o disco em build/<arch>/.
 [build]
 target = "aarch64-unknown-none-softfloat"
 
 [target.aarch64-unknown-none-softfloat]
-runner = "qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a53 -serial mon:stdio -global virtio-mmio.force-legacy=false -device virtio-gpu-device -device virtio-keyboard-device -device virtio-tablet-device -drive file=disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -netdev user,id=n0 -device virtio-net-device,netdev=n0 -kernel"
+runner = "qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a53 -smp 4 -m 4G -serial mon:stdio -global virtio-mmio.force-legacy=false -device virtio-gpu-device -device virtio-keyboard-device -device virtio-tablet-device -drive file=build/aarch64/disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -netdev user,id=n0 -device virtio-net-device,netdev=n0 -kernel"
+
+[target.riscv64imac-unknown-none-elf]
+runner = "qemu-system-riscv64 -machine virt -smp 4 -m 4G -serial mon:stdio -global virtio-mmio.force-legacy=false -device virtio-gpu-device -device virtio-keyboard-device -device virtio-tablet-device -drive file=build/riscv64/disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -netdev user,id=n0 -device virtio-net-device,netdev=n0 -kernel"
 
 [unstable]
 build-std = ["core", "compiler_builtins"]

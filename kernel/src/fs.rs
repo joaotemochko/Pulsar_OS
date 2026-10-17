@@ -10,6 +10,10 @@
 //! PFS quando necessario.
 
 use crate::blk;
+use crate::sync::SpinLock;
+
+/// Trava do sistema de arquivos e do disco (virtio-blk) por baixo dele.
+static FS: SpinLock = SpinLock::new();
 use crate::uart::Uart;
 use core::fmt::Write;
 
@@ -63,6 +67,11 @@ pub fn mount() -> Option<usize> {
 }
 
 pub fn count() -> usize {
+    let _g = FS.guard();
+    count_nl()
+}
+
+fn count_nl() -> usize {
     unsafe {
         match BACKEND {
             Backend::Nbfs => crate::nbfs::count(),
@@ -73,6 +82,11 @@ pub fn count() -> usize {
 }
 
 pub fn entry(idx: usize) -> FileEntry {
+    let _g = FS.guard();
+    entry_nl(idx)
+}
+
+fn entry_nl(idx: usize) -> FileEntry {
     unsafe {
         match BACKEND {
             Backend::Nbfs => {
@@ -101,14 +115,16 @@ pub fn name_str(name: &[u8; NAME_LEN]) -> &str {
 }
 
 pub fn find(name: &str) -> Option<usize> {
-    for i in 0..count() {
-        let e = entry(i);
+    let _g = FS.guard();
+    for i in 0..count_nl() {
+        let e = entry_nl(i);
         if name_str(&e.name) == name { return Some(i); }
     }
     None
 }
 
 pub fn read_file(idx: usize, dst_pa: u64) -> Option<u32> {
+    let _g = FS.guard();
     unsafe {
         match BACKEND {
             Backend::Nbfs => crate::nbfs::read_file(idx, dst_pa),
@@ -119,6 +135,7 @@ pub fn read_file(idx: usize, dst_pa: u64) -> Option<u32> {
 }
 
 pub fn write_file(idx: usize, src_pa: u64, size: u32) -> bool {
+    let _g = FS.guard();
     unsafe {
         match BACKEND {
             Backend::Nbfs => crate::nbfs::write_file(idx, src_pa, size),
@@ -129,6 +146,7 @@ pub fn write_file(idx: usize, src_pa: u64, size: u32) -> bool {
 }
 
 pub fn create(name: &str, kind: u32, capacity_sec: u32) -> Option<usize> {
+    let _g = FS.guard();
     unsafe {
         match BACKEND {
             Backend::Nbfs => crate::nbfs::create(name, kind, capacity_sec),

@@ -1,735 +1,2484 @@
-//! Pulsar WM — compositor com multiplas janelas de app, barra de menu
-//! interativa (dropdowns), dock, e sistema de arquivos que abre apps.
+//! Pulsar Desktop — compositor e gerenciador de janelas do Pulsar OS.
+//!
+//! * aparencia macOS: barra de menus e dock de vidro fosco, semaforos,
+//!   sombras suaves, ampliacao do dock, modo claro/escuro;
+//! * facilidades do Windows: Alt+Tab, encaixe de janelas (Aero Snap),
+//!   menus de contexto, gerenciador de tarefas (Ctrl+Shift+Esc),
+//!   "forcar encerramento" de apps travados, busca universal;
+//! * customizacao do Linux: tudo em `pulsar.cfg` (texto puro), editavel
+//!   no Editor e aplicado ao vivo; papeis de parede, cores, layout.
+//!
+//! Desempenho: so a area danificada e recomposta (com descarte de janelas
+//! totalmente cobertas); o cursor e de hardware (mover o mouse nao redesenha
+//! nada); o present roda fora da trava do kernel; os apps rodam em paralelo
+//! nos outros nucleos e so pedem quadros quando algo muda.
 #![no_std]
 #![no_main]
+
+mod catalog;
+mod config;
+mod cursor;
+mod panels;
+mod ui;
+mod wallpaper;
+
+use catalog::*;
+use config::Config;
+use panels::{Ctx, Panels, THUMB_H, THUMB_W, TOOLBAR_H};
+use plib::icons::{self, Icon, Sym};
 use plib::*;
+use ui::Hits;
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! { write("[wm] PANIC\n"); exit() }
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    write("[wm] PANIC\n");
+    exit()
+}
+
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! { main(); exit() }
-
-const WALL_TOP:u32=0x00203358; const WALL_BOT:u32=0x00355789; const AURORA:u32=0x005A8AD0;
-const GLASS:u32=0x00FAFBFE; const GLASS_BOT:u32=0x00EDF0F6;
-const INK:u32=0x001E2530; const INK_DIM:u32=0x007C8697; const WHITE:u32=0x00FFFFFF;
-const MENU_H:u32=32; const DOCK_H:u32=76; const TITLE_H:u32=40;
-const MAXWIN:usize=6;
-
-fn fsd()->i64{ lookup_service(SVC_FS) }
-fn fs_count_ipc(dd:usize)->u32{ let mut m=Msg::new(FS_OP_COUNT); send(dd,&mut m); m.data[0] as u32 }
-fn fs_stat_ipc(dd:usize,i:usize,name:&mut[u8;32])->(i64,u32){
-    let mut m=Msg::new(FS_OP_STAT); m.data[0]=i as u64; send(dd,&mut m);
-    for w in 0..4{let word=m.data[2+w];for b in 0..8{name[w*8+b]=(word>>(b*8))as u8;}}
-    (m.data[0] as i64, m.data[1] as u32)
-}
-fn u32_dec(mut v:u32,out:&mut[u8;10])->usize{ if v==0{out[9]=b'0';return 9;} let mut i=10; while v>0{i-=1;out[i]=b'0'+(v%10)as u8;v/=10;} i }
-
-#[derive(Clone,Copy,PartialEq)]
-enum WKind{ Files, App }
-#[derive(Clone,Copy)]
-struct Win{
-    used:bool, kind:WKind, r:Rect, saved:Rect, open:bool, max:bool, z:u8,
-    pid:i64, slot:u8, app_kind:u8, committed:bool, want_close:bool,
-    // eventos pendentes para o app
-    ev_mx:i32, ev_my:i32, ev_click:bool, ev_key:u16, ev_menu:u16,
-}
-impl Win{
-    const fn empty()->Self{ Win{used:false,kind:WKind::App,r:Rect{x:0,y:0,w:0,h:0},saved:Rect{x:0,y:0,w:0,h:0},open:false,max:false,z:0,pid:-1,slot:255,app_kind:0,committed:false,want_close:false,ev_mx:-1,ev_my:-1,ev_click:false,ev_key:0,ev_menu:0} }
-    fn titlebar(&self)->Rect{ Rect{x:self.r.x,y:self.r.y,w:self.r.w,h:TITLE_H} }
-    fn client(&self)->Rect{ Rect{x:self.r.x,y:self.r.y+TITLE_H,w:self.r.w,h:self.r.h-TITLE_H} }
-    fn b_close(&self)->Rect{ Rect{x:self.r.x+16,y:self.r.y+12,w:18,h:18} }
-    fn b_max(&self)->Rect{ Rect{x:self.r.x+64,y:self.r.y+12,w:18,h:18} }
+pub extern "C" fn _start() -> ! {
+    let wm = unsafe { &mut *(&raw mut WM) };
+    wm.run()
 }
 
-// apps do dock/launcher. bin vazio = janela interna (arquivos)
-struct AppDef{color:u32,glyph:u8,name:&'static[u8],bin:&'static str,kind:u8,w:u32,h:u32}
+const MENU_H: i32 = 28;
+const TITLE_H: i32 = 38;
+const WIN_RAD: i32 = 10;
+const MAXWIN: usize = 12;
+const KQ: usize = 32;
+const FRAME_MS: u64 = 16;
+const MAX_FILES: usize = 64;
+const RESIZE_M: i32 = 6;
+/// Prazo maximo de um POLL estacionado (apps acordam ~4x/s quando ociosos).
+const POLL_MAX_MS: u64 = 250;
+/// Imprime na serial o custo medio de composicao/apresentacao.
+const PERF_LOG: bool = false;
+static mut PERF: (u64, u64, u64, u64) = (0, 0, 0, 0); // quadros, ms compondo, ms apresentando, px
 
-fn title_for(kind:u8)->&'static[u8]{
-    match kind{ 1=>b"Editor", 2=>b"Ball", 3=>b"Calculadora", 4=>b"Sobre", 5=>b"Terminal", 6=>b"Rede", 7=>b"Vela", _=>b"App" }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WState { Normal, Max, SnapL, SnapR }
+
+#[derive(Clone, Copy)]
+struct Win {
+    used: bool,
+    app: u8,
+    internal: bool,
+    r: Rect,
+    restore: Rect,
+    state: WState,
+    minimized: bool,
+    z: u32,
+    pid: i64,
+    slot: i8,
+    title: [u8; 32],
+    tlen: usize,
+    hello: bool,
+    committed: bool,
+    commit_w: i32,
+    commit_h: i32,
+    want_close: bool,
+    close_at: u64,
+    keys: [u64; KQ],
+    kh: usize,
+    kn: usize,
+    click: bool,
+    rclick: bool,
+    dbl: bool,
+    wheel: i32,
+    menu: u16,
+    open_file: i32,
+    /// ultimo estado entregue ao app (para saber se ha novidade): flags
+    /// (foco/tema/tamanho/visivel) e posicao do mouse local
+    rep_f: u64,
+    rep_mx: i32,
+    rep_my: i32,
 }
 
-fn main(){
-    write("[wm] Pulsar WM (multi-janela) iniciando\n");
-    let mut fb=Fb::open();
-    let (w,h)=(fb.w,fb.h);
-    register_service(SVC_WM);
-    let dd=loop{let p=fsd(); if p>=0{break p as usize;} yield_now();};
-    write("[wm] fsd conectado, SVC_WM registrado\n");
-    set_focus(getpid()); // WM recebe o teclado e encaminha aos apps
-
-    compose_wallpaper(&fb,w,h);
-    fb.restore_wall(Rect{x:0,y:0,w,h});
-
-    // catalogo de apps
-    let apps=[
-        AppDef{color:0x00579BFF,glyph:b'F',name:b"Arquivos",   bin:"",             kind:0, w:0,h:0},
-        AppDef{color:0x0032D256,glyph:b'E',name:b"Editor",     bin:"editor.pulse", kind:1, w:500,h:440},
-        AppDef{color:0x00FF9F0A,glyph:b'B',name:b"Ball",       bin:"ball.pulse",   kind:2, w:360,h:360},
-        AppDef{color:0x00AF6BFF,glyph:b'C',name:b"Calculadora",bin:"calc.pulse",   kind:3, w:280,h:400},
-        AppDef{color:0x00FF6482,glyph:b'S',name:b"Sobre",      bin:"about.pulse",  kind:4, w:420,h:300},
-        AppDef{color:0x0030C8D0,glyph:b'T',name:b"Terminal",   bin:"terminal.pulse",kind:5, w:560,h:380},
-        AppDef{color:0x005AC8FF,glyph:b'N',name:b"Rede",       bin:"netmon.pulse", kind:6, w:420,h:340},
-        AppDef{color:0x00FF7A59,glyph:b'V',name:b"Vela",       bin:"vela.pulse",   kind:7, w:720,h:520},
-    ];
-    let n_apps=apps.len() as u32;
-    let icon=52u32; let gap=18u32;
-    let dock_w=n_apps*icon+(n_apps+1)*gap;
-    let dock_x=w/2-dock_w/2; let dock_y=h-DOCK_H-12;
-
-    let mut wins=[Win::empty();MAXWIN];
-    // janela 0 = arquivos (sempre presente)
-    wins[0]=Win{used:true,kind:WKind::Files,r:Rect{x:80,y:MENU_H+40,w:440,h:400},saved:Rect{x:80,y:MENU_H+40,w:440,h:400},open:false,max:false,z:1,pid:-1,slot:255,app_kind:0,committed:true,want_close:false,ev_mx:-1,ev_my:-1,ev_click:false,ev_key:0,ev_menu:0};
-    let mut zmax=1u8;
-    let mut next_slot=0u8;
-
-    let mut cursor=Cursor::new(w/2,h/2);
-    let mut mouse=Mouse::new(w/2,h/2);
-    let mut fcache:[FileMeta;9]=[FileMeta{name:[0;32],nlen:0,size:0,kind:0};9];
-    let mut nfiles=fs_count_ipc(dd);
-    refresh_files(dd,nfiles,&mut fcache);
-    let mut tick=0u32;
-    let mut bounce=[0u32;8];
-    let mut drag:i32=-1; let mut ddx=0i32; let mut ddy=0i32;
-    let mut drag_prev_r=Rect{x:0,y:0,w:0,h:0}; // posicao da janela no frame anterior (p/ damage)
-    let mut sel:i32=-1;
-    let mut msg=Msg::new(0);
-    let mut dirty=true; let mut last_mx=w/2; let mut last_my=h/2;
-    // damage acumulado no frame (abrir/fechar/foco). None = sem dano especifico.
-    // Quando Some(r), recompoe so r em vez da tela toda.
-    let mut damage:Option<Rect>=None;
-    let acc=|d:&mut Option<Rect>, r:Rect|{ *d=Some(match *d{ Some(o)=>rect_union(o,r), None=>r }); };
-    let mut any_commit=false;
-    let mut frame_start=uptime_ms();
-    // menu dropdown aberto: -1 nenhum, senao indice do menu (0=app,1=arquivo,2=editar,3=janela)
-    let mut menu_open:i32=-1;
-
-    loop {
-        // ---- atender apps (nao-bloqueante) ----
-        for _ in 0..16 {
-            let Some(from)=try_recv(&mut msg) else {break};
-            let mut r=Msg::new(msg.tag);
-            // acha a janela desse pid
-            let wi=wins.iter().position(|x|x.used && x.pid==from as i64);
-            match msg.tag {
-                x if x==WM_OP_HELLO => {
-                    // registra: acha a janela recem-criada sem pid ainda com este app
-                    if let Some(idx)=wins.iter().position(|x|x.used && x.pid<0 && x.kind==WKind::App){
-                        wins[idx].pid=from as i64;
-                        let c=wins[idx].client();
-                        r.data[0]=wins[idx].slot as u64;
-                        r.data[1]=c.w as u64; r.data[2]=c.h as u64;
-                    }
-                }
-                x if x==WM_OP_COMMIT => { if let Some(i)=wi{ wins[i].committed=true; any_commit=true; } }
-                x if x==WM_OP_POLL => {
-                    if let Some(i)=wi{
-                        let mut flags=0u64;
-                        if wins[i].want_close{flags|=WM_FLAG_CLOSE;}
-                        if wins[i].z==zmax{flags|=WM_FLAG_FOCUS;}
-                        r.data[0]=flags;
-                        r.data[1]=wins[i].ev_mx as u64; r.data[2]=wins[i].ev_my as u64;
-                        let mut mf=0u64; if wins[i].ev_click{mf|=WM_MOUSE_CLICK;}
-                        r.data[3]=mf; r.data[4]=wins[i].ev_key as u64;
-                        r.data[5]=wins[i].ev_menu as u64;  // acao de menu (0=nenhuma)
-                        // consome os eventos
-                        wins[i].ev_click=false; wins[i].ev_key=0; wins[i].ev_mx=-1; wins[i].ev_my=-1;
-                        wins[i].ev_menu=0;
-                    }
-                }
-                _=>{}
-            }
-            reply(from,&r);
+impl Win {
+    const fn empty() -> Win {
+        Win {
+            used: false, app: 0, internal: false, r: Rect::empty(), restore: Rect::empty(),
+            state: WState::Normal, minimized: false, z: 0, pid: -1, slot: -1,
+            title: [0; 32], tlen: 0, hello: false, committed: false, commit_w: 0, commit_h: 0,
+            want_close: false, close_at: 0, keys: [0; KQ], kh: 0, kn: 0,
+            click: false, rclick: false, dbl: false, wheel: 0, menu: 0, open_file: -1,
+            rep_f: u64::MAX, rep_mx: i32::MIN, rep_my: i32::MIN,
         }
-
-        // ---- entrada ----
-        for _ in 0..256 {
-            let Some(ev)=input_poll() else {break};
-            mouse.feed(&ev,w,h);
-            // teclado vai para o app focado (se houver)
-            if ev.ev_type==EV_KEY && ev.value==1 && ev.code!=BTN_LEFT {
-                if let Some(i)=focused_app(&wins,zmax){ wins[i].ev_key=ev.code; dirty=true; }
-            }
+    }
+    fn title(&self) -> &[u8] { &self.title[..self.tlen] }
+    fn set_title(&mut self, t: &[u8]) {
+        let n = t.len().min(32);
+        self.title[..n].copy_from_slice(&t[..n]);
+        self.tlen = n;
+    }
+    fn client(&self) -> Rect {
+        if self.internal { self.r } else { Rect::new(self.r.x, self.r.y + TITLE_H, self.r.w, self.r.h - TITLE_H) }
+    }
+    /// Area que a janela pode afetar (inclui a sombra).
+    fn outer(&self) -> Rect {
+        Rect::new(self.r.x - 32, self.r.y - 24, self.r.w + 64, self.r.h + 64)
+    }
+    /// Retangulo garantidamente opaco (sem os cantos arredondados).
+    fn opaque(&self) -> Rect {
+        Rect::new(self.r.x, self.r.y + WIN_RAD, self.r.w, self.r.h - 2 * WIN_RAD)
+    }
+    fn lights(&self) -> Rect { Rect::new(self.r.x + 10, self.r.y + 8, 62, 22) }
+    fn push_key(&mut self, k: u64) {
+        if self.kn < KQ {
+            self.keys[(self.kh + self.kn) % KQ] = k;
+            self.kn += 1;
         }
-        cursor.x=mouse.x; cursor.y=mouse.y;
-        mouse.update(uptime_ms());
-
-        // arrasto
-        if drag>=0 {
-            if mouse.down {
-                if !wins[drag as usize].max {
-                    wins[drag as usize].r.x=(mouse.x as i32-ddx).max(0).min((w-60)as i32)as u32;
-                    wins[drag as usize].r.y=(mouse.y as i32-ddy).max(MENU_H as i32).min((h-60)as i32)as u32;
-                    dirty=true;
-                }
-            } else { drag=-1; }
-        }
-
-        if mouse.clicked {
-            dirty=true;
-            let my=mouse.y; let mx=mouse.x;
-            // 1) barra de menu (dropdowns)?
-            if my<MENU_H {
-                menu_open = menu_hit(mx, &wins, zmax);
-            } else if menu_open>=0 {
-                // clique num item do dropdown aberto?
-                let act=dropdown_hit(menu_open,mx,my,&wins,zmax);
-                handle_menu_action(act,&mut wins,zmax);
-                menu_open=-1;
-            } else {
-                menu_open=-1;
-                // 2) janelas (frente->tras)
-                let ord=z_desc(&wins);
-                let mut done=false;
-                for &wi in ord.iter(){
-                    if wi>=MAXWIN {continue;}
-                    let win=wins[wi];
-                    if !win.used||!win.open {continue;}
-                    if win.b_close().contains(mx,my){
-                        if win.kind==WKind::App{wins[wi].want_close=true;}
-                        else {
-                            let r=wins[wi].r;
-                            acc(&mut damage,Rect{x:r.x.saturating_sub(22),y:r.y.saturating_sub(22),w:r.w+44,h:r.h+44});
-                            wins[wi].open=false;
-                        }
-                        done=true;break;
-                    }
-                    if win.b_max().contains(mx,my){ toggle_max(&mut wins[wi],w,h); done=true;break; }
-                    if win.titlebar().contains(mx,my){
-                        zmax+=1; wins[wi].z=zmax;
-                        drag=wi as i32; ddx=mx as i32-win.r.x as i32; ddy=my as i32-win.r.y as i32;
-                        done=true;break;
-                    }
-                    if win.r.contains(mx,my){
-                        zmax+=1; wins[wi].z=zmax;
-                        if win.kind==WKind::Files{
-                            let idx=file_at(&win,mx,my,nfiles);
-                            if idx>=0{ sel=idx;
-                                if mouse.double{ open_file_by_ext(&mut wins,&apps,&fcache,idx,&mut zmax,&mut next_slot,&mut bounce); }
-                            }
-                        } else {
-                            // entrega o clique ao app (coordenadas locais)
-                            let c=win.client();
-                            wins[wi].ev_mx=(mx-c.x) as i32; wins[wi].ev_my=(my-c.y) as i32; wins[wi].ev_click=true;
-                        }
-                        done=true;break;
-                    }
-                }
-                if !done{
-                    // 3) dock
-                    for i in 0..n_apps{
-                        let ix=dock_x+gap+i*(icon+gap);
-                        if (Rect{x:ix,y:dock_y+12,w:icon,h:icon}).contains(mx,my){
-                            let a=&apps[i as usize];
-                            if a.bin.is_empty(){ wins[0].open=true; zmax+=1; wins[0].z=zmax; }
-                            else { launch(&mut wins,a,&mut zmax,&mut next_slot,&mut bounce,i as usize); }
-                        }
-                    }
-                }
-            }
-        }
-
-        // liberar janelas de apps mortos
-        for i in 0..MAXWIN{
-            if wins[i].used && wins[i].kind==WKind::App && wins[i].pid>=0 && !is_alive(wins[i].pid as usize){
-                // dano = area da janela morta (+ margem p/ sombra)
-                let r=wins[i].r;
-                let dr=Rect{x:r.x.saturating_sub(22),y:r.y.saturating_sub(22),w:r.w+44,h:r.h+44};
-                acc(&mut damage,dr);
-                wins[i]=Win::empty(); dirty=true; set_focus(getpid());
-            }
-        }
-
-        // ---- damage: so recompoe quando algo VISUAL muda (nao no mouse-move puro) ----
-        // Compositores reais nao redesenham a cena quando o cursor so anda:
-        // movem o cursor via backing-store. Marcamos dirty apenas quando o
-        // movimento cruza uma regiao interativa que muda de aparencia (hover
-        // na lista de arquivos, hover no dock) ou quando ha arraste/animacao.
-        let moved = mouse.x!=last_mx||mouse.y!=last_my;
-        if moved {
-            // hover sobre a janela Files (highlight de linha muda)?
-            let over_files = wins[0].used && wins[0].open && wins[0].r.contains(mouse.x,mouse.y);
-            let was_over_files = wins[0].used && wins[0].open && wins[0].r.contains(last_mx,last_my);
-            // hover sobre o dock (icone acende)?
-            let dock_r = Rect{x:dock_x,y:dock_y,w:dock_w,h:DOCK_H};
-            let over_dock = dock_r.contains(mouse.x,mouse.y);
-            let was_over_dock = dock_r.contains(last_mx,last_my);
-            if over_files||was_over_files||over_dock||was_over_dock { dirty=true; }
-        }
-        if drag>=0 { dirty=true; } // arrastar janela recompoe
-        if bounce.iter().any(|&b|b>0){dirty=true;}
-        let mut app_only=false;
-        if any_commit{ app_only=true; any_commit=false; }
-        // apps animados (ball) pedem recomposicao da propria superficie
-        if wins.iter().any(|x|x.used&&x.app_kind==2&&x.open){ app_only=true; }
-
-        // ---- COMPOSICAO com DAMAGE RECTANGLES ----
-        if dirty{
-            let secs=(uptime_ms()/1000) as u32;
-            // Determina o retangulo de dano.
-            // - Arrastando: dano = posicao antiga U nova da janela (so o rastro
-            //   + o destino precisam ser recompostos, nao a tela toda).
-            // - Caso geral (abrir/fechar/foco/menu): dano = tela inteira (seguro).
-            let full=Rect{x:0,y:0,w,h};
-            let mut dmg = if drag>=0 && drag_prev_r.w>0 {
-                rect_union(drag_prev_r, wins[drag as usize].r)
-            } else if let Some(d)=damage {
-                // dano especifico de abrir/fechar; clampa a tela
-                let x1=(d.x+d.w).min(w); let y1=(d.y+d.h).min(h);
-                Rect{x:d.x.min(w),y:d.y.min(h),w:x1.saturating_sub(d.x.min(w)),h:y1.saturating_sub(d.y.min(h))}
-            } else { full };
-            // inclui a regiao do cursor (atual e anterior) no dano, senao o
-            // present parcial pode nao cobrir onde o cursor esta/estava.
-            if dmg.w<w || dmg.h<h {
-                let cur=Rect{x:mouse.x.min(last_mx),y:mouse.y.min(last_my),
-                             w:mouse.x.abs_diff(last_mx)+20,h:mouse.y.abs_diff(last_my)+26};
-                dmg=rect_union(dmg,cur);
-                // reclampa aos limites da tela
-                let x1=(dmg.x+dmg.w).min(w); let y1=(dmg.y+dmg.h).min(h);
-                dmg=Rect{x:dmg.x.min(w),y:dmg.y.min(h),w:x1-dmg.x.min(w),h:y1-dmg.y.min(h)};
-            }
-            cursor.hide(&fb);
-            compose_scene(&mut fb, dmg, w, secs, &wins, zmax, menu_open,
-                          &fcache, nfiles, sel, &mouse,
-                          dock_x,dock_y,dock_w,icon,gap,n_apps,&apps,&mut bounce);
-            cursor.show(&fb);
-            if dmg.w>=w && dmg.h>=h { fb_present(); }
-            else { fb_present_rect(dmg); }
-            // registra a posicao da janela arrastada p/ o proximo frame
-            if drag>=0 { drag_prev_r=wins[drag as usize].r; } else { drag_prev_r.w=0; }
-            damage=None;
-            dirty=false;
-        } else if app_only {
-            // SO reblita as janelas de app committadas e apresenta suas regioes.
-            // Nao recompoe wallpaper/menu/dock (caro). O cursor e restaurado
-            // por cima se sobrepor a alguma area de app.
-            cursor.hide(&fb);
-            let ord=z_asc(&wins);
-            let mut minx=w; let mut miny=h; let mut maxx=0u32; let mut maxy=0u32;
-            for &wi in ord.iter(){
-                if wi>=MAXWIN{continue;}
-                let win=wins[wi];
-                if !win.used||!win.open||win.kind!=WKind::App||!win.committed{continue;}
-                blit_surface(&fb,win.slot as u64,win.client());
-                let c=win.client();
-                if c.x<minx{minx=c.x;} if c.y<miny{miny=c.y;}
-                if c.x+c.w>maxx{maxx=c.x+c.w;} if c.y+c.h>maxy{maxy=c.y+c.h;}
-            }
-            cursor.show(&fb);
-            if maxx>minx && maxy>miny {
-                fb_present_rect(Rect{x:minx,y:miny,w:(maxx-minx).min(w-minx),h:(maxy-miny).min(h-miny)});
-            }
-        } else {
-            // so o cursor mexeu
-            let ax=last_mx.min(mouse.x); let ay=last_my.min(mouse.y);
-            let bx=last_mx.max(mouse.x)+20; let by=last_my.max(mouse.y)+26;
-            cursor.hide(&fb); cursor.show(&fb);
-            fb_present_rect(Rect{x:ax,y:ay,w:(bx-ax).min(w-ax),h:(by-ay).min(h-ay)});
-        }
-        last_mx=mouse.x; last_my=mouse.y;
-
-        let target=frame_start+16;
-        while uptime_ms()<target{ yield_now(); }
-        frame_start=uptime_ms();
-        tick=tick.wrapping_add(1);
-        if tick%120==0{ let nn=fs_count_ipc(dd); if nn!=nfiles{nfiles=nn; refresh_files(dd,nfiles,&mut fcache); dirty=true;} }
-        yield_now();
+    }
+    fn pop_key(&mut self) -> u64 {
+        if self.kn == 0 { return 0; }
+        let k = self.keys[self.kh];
+        self.kh = (self.kh + 1) % KQ;
+        self.kn -= 1;
+        k
     }
 }
 
-#[derive(Clone,Copy)]
-struct FileMeta{ name:[u8;32], nlen:u8, size:i64, kind:u32 }
-fn refresh_files(dd:usize,n:u32,cache:&mut[FileMeta;9]){
-    for i in 0..n.min(9){ let mut name=[0u8;32]; let (size,kind)=fs_stat_ipc(dd,i as usize,&mut name);
-        let ne=name.iter().position(|&x|x==0).unwrap_or(32);
-        cache[i as usize]=FileMeta{name,nlen:ne as u8,size,kind}; }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Drag {
+    None,
+    Move { win: usize, dx: i32, dy: i32, moved: bool },
+    Resize { win: usize, edges: u8, start: Rect, mx: i32, my: i32 },
 }
 
-fn focused_app(wins:&[Win;MAXWIN],zmax:u8)->Option<usize>{
-    for i in 0..MAXWIN{ if wins[i].used&&wins[i].open&&wins[i].kind==WKind::App&&wins[i].z==zmax{return Some(i);} }
-    None
-}
-fn z_desc(wins:&[Win;MAXWIN])->[usize;MAXWIN]{
-    let mut idx=[0usize;MAXWIN]; for i in 0..MAXWIN{idx[i]=i;}
-    // ordena por z decrescente (bubble simples)
-    for a in 0..MAXWIN{ for b in a+1..MAXWIN{ if wins[idx[b]].z>wins[idx[a]].z{idx.swap(a,b);} } }
-    idx
-}
-fn z_asc(wins:&[Win;MAXWIN])->[usize;MAXWIN]{
-    let mut idx=z_desc(wins); idx.reverse(); idx
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuKind { Bar(usize), Context }
+
+#[derive(Clone, Copy)]
+struct Menu {
+    kind: MenuKind,
+    rect: Rect,
+    items: &'static [MI],
+    target_win: Option<usize>,
+    target_app: u8,
 }
 
-fn toggle_max(win:&mut Win,w:u32,h:u32){
-    if win.max{win.r=win.saved;win.max=false;}
-    else{win.saved=win.r;win.r=Rect{x:8,y:MENU_H+8,w:w-16,h:h-MENU_H-DOCK_H-28};win.max=true;}
+#[derive(Clone, Copy)]
+struct Toast {
+    active: bool,
+    icon: Icon,
+    title: [u8; 48],
+    tl: usize,
+    body: [u8; 72],
+    bl: usize,
+    until: u64,
 }
-fn launch(wins:&mut[Win;MAXWIN],a:&AppDef,zmax:&mut u8,next_slot:&mut u8,bounce:&mut[u32;8],dock_i:usize){
-    // ja aberto? traz pra frente
-    for i in 0..MAXWIN{ if wins[i].used&&wins[i].app_kind==a.kind&&wins[i].open{ *zmax+=1; wins[i].z=*zmax; return; } }
-    // acha slot de janela livre
-    let Some(idx)=(1..MAXWIN).find(|&i|!wins[i].used) else {return};
-    let pid=spawn(a.bin);
-    if pid<0{return;}
-    let slot=*next_slot % 6; *next_slot=next_slot.wrapping_add(1);
-    *zmax+=1;
-    // posicao em cascata
-    let ox=(idx as u32)*30; let oy=(idx as u32)*28;
-    wins[idx]=Win{used:true,kind:WKind::App,
-        r:Rect{x:120+ox,y:MENU_H+50+oy,w:a.w,h:a.h+TITLE_H},
-        saved:Rect{x:120+ox,y:MENU_H+50+oy,w:a.w,h:a.h+TITLE_H},
-        open:true,max:false,z:*zmax,pid:-1,slot:slot as u8,app_kind:a.kind,
-        committed:false,want_close:false,ev_mx:-1,ev_my:-1,ev_click:false,ev_key:0,ev_menu:0};
-    if dock_i<6{bounce[dock_i]=18;}
-    // foco de teclado fica no WM, que encaminha via ev_key
+
+impl Toast {
+    const fn empty() -> Toast {
+        Toast { active: false, icon: Icon::Pulsar, title: [0; 48], tl: 0, body: [0; 72], bl: 0, until: 0 }
+    }
 }
-fn open_file_by_ext(wins:&mut[Win;MAXWIN],apps:&[AppDef;8],cache:&[FileMeta;9],idx:i32,zmax:&mut u8,next_slot:&mut u8,bounce:&mut[u32;8]){
-    let fm=&cache[idx as usize];
-    let name=&fm.name[..fm.nlen as usize];
-    // Se o arquivo e um executavel .pulse cujo nome bate com um app do
-    // catalogo, EXECUTA aquele app. Senao (texto/dado), abre no editor.
-    if fm.kind==1 {
-        for (di,a) in apps.iter().enumerate(){
-            if !a.bin.is_empty() && a.bin.as_bytes()==name {
-                launch(wins,a,zmax,next_slot,bounce,di);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dialog { None, Poweroff }
+
+/// Resultado da busca (Spotlight).
+#[derive(Clone, Copy)]
+enum Hit { App(u8), File(u16), Cmd(Action, &'static str, Icon), Calc(i64) }
+
+const SEARCH_CMDS: [(&str, Action, Icon); 6] = [
+    ("Desligar", Action::Poweroff, Icon::Pulsar),
+    ("Alternar modo escuro", Action::ToggleDark, Icon::Settings),
+    ("Papel de parede", Action::Settings(1), Icon::Settings),
+    ("Atalhos do teclado", Action::Help, Icon::Help),
+    ("Mostrar área de trabalho", Action::ShowDesktop, Icon::Files),
+    ("Novo documento de texto", Action::NewTextDoc, Icon::Document),
+];
+
+struct Wm {
+    scr: Fb,
+    wall: Fb,
+    blur: Fb,
+    w: i32,
+    h: i32,
+    cfg: Config,
+    cfg_raw: [u8; 2048],
+    cfg_len: usize,
+    th: Theme,
+    wins: [Win; MAXWIN],
+    zc: u32,
+    // mouse
+    mx: i32,
+    my: i32,
+    down: bool,
+    capture: Option<usize>,
+    last_click: u64,
+    last_cx: i32,
+    last_cy: i32,
+    wheel: i32,
+    kb: Keyboard,
+    meta_tap: bool,
+    drag: Drag,
+    snap: Option<(Rect, WState)>,
+    cursor: cursor::Shape,
+    cursor_img: [u32; 64 * 64],
+    // overlays
+    menu: Option<Menu>,
+    menu_hits: Hits,
+    cc_open: bool,
+    cc_hits: Hits,
+    dialog: Dialog,
+    dialog_hits: Hits,
+    spot: bool,
+    query: Buf<64>,
+    spot_sel: usize,
+    spot_hits: [Hit; 8],
+    spot_n: usize,
+    switcher: bool,
+    sw_list: [usize; MAXWIN],
+    sw_n: usize,
+    sw_sel: usize,
+    toasts: [Toast; 3],
+    // estado das janelas internas
+    panels: Panels,
+    phits: [Hits; 12],
+    hover_hit: Rect,
+    hover_light: Option<usize>,
+    // dock
+    dock_hover: i32,
+    dock_rects: [(Rect, u8); 16],
+    dock_n: usize,
+    dock_area: Rect,
+    bounce: [u64; 12],
+    // dados do sistema
+    files: [FileInfo; MAX_FILES],
+    nfiles: usize,
+    sys: SysInfo,
+    loads: [u32; 8],
+    clock: Buf<40>,
+    net_up: bool,
+    /// retangulos danificados neste quadro (fundidos quando se sobrepoem)
+    dmg: [Rect; 8],
+    ndmg: usize,
+    /// COMMITs respondidos so depois da composicao (o app nao pode
+    /// redesenhar a superficie enquanto o compositor a copia)
+    pending: [(usize, usize); MAXWIN],
+    npending: usize,
+    /// POLLs estacionados ("long poll"): respondidos quando o app tiver
+    /// novidade ou apos POLL_MAX_MS, para apps ociosos nao girarem em falso
+    parked: [(usize, usize, u64); MAXWIN],
+    nparked: usize,
+    caret_on: bool,
+}
+
+static mut WM: Wm = Wm::new();
+
+/// Miniaturas dos papeis de parede (na .bss, fora do estado do WM).
+static mut THUMBS: [u32; 6 * (THUMB_W * THUMB_H) as usize] = [0; 6 * (THUMB_W * THUMB_H) as usize];
+
+fn thumbs() -> &'static mut [u32] {
+    unsafe { &mut *(&raw mut THUMBS) }
+}
+
+const fn hits_array() -> [Hits; 12] {
+    [Hits::new(), Hits::new(), Hits::new(), Hits::new(), Hits::new(), Hits::new(),
+     Hits::new(), Hits::new(), Hits::new(), Hits::new(), Hits::new(), Hits::new()]
+}
+
+impl Wm {
+    const fn new() -> Wm {
+        let nullfb = Fb { base: core::ptr::null_mut(), w: 0, h: 0, stride: 0, clip: Rect::empty() };
+        Wm {
+            scr: nullfb, wall: nullfb, blur: nullfb, w: 0, h: 0,
+            cfg: Config::default(), cfg_raw: [0; 2048], cfg_len: 0,
+            th: Theme {
+                dark: false, accent: 0, win_bg: 0, side_bg: 0, title_top: 0, title_bot: 0, text: 0, text2: 0,
+                text3: 0, sep: 0, ctrl_bg: 0, ctrl_border: 0, field_bg: 0, menu_bg: 0, menu_alpha: 0,
+                glass: 0, glass_alpha: 0, hover: 0, border: 0,
+            },
+            wins: [Win::empty(); MAXWIN], zc: 1,
+            mx: 640, my: 400, down: false, capture: None, last_click: 0, last_cx: 0, last_cy: 0, wheel: 0,
+            kb: Keyboard::new(), meta_tap: false,
+            drag: Drag::None, snap: None, cursor: cursor::Shape::Hand, cursor_img: [0; 64 * 64],
+            menu: None, menu_hits: Hits::new(), cc_open: false, cc_hits: Hits::new(),
+            dialog: Dialog::None, dialog_hits: Hits::new(),
+            spot: false, query: Buf::new(), spot_sel: 0, spot_hits: [Hit::App(0); 8], spot_n: 0,
+            switcher: false, sw_list: [0; MAXWIN], sw_n: 0, sw_sel: 0,
+            toasts: [Toast::empty(); 3],
+            panels: Panels::new(), phits: hits_array(), hover_hit: Rect::empty(), hover_light: None,
+            dock_hover: -1, dock_rects: [(Rect::empty(), 0); 16], dock_n: 0, dock_area: Rect::empty(),
+            bounce: [0; 12],
+            files: [FileInfo::zero(); MAX_FILES], nfiles: 0,
+            sys: SysInfo { arch_id: 0, ncpus: 0, mem_total_kb: 0, mem_free_kb: 0, fb_w: 0, fb_h: 0, uptime_ms: 0, arch_name: [0; 16] },
+            loads: [0; 8], clock: Buf::new(), net_up: false,
+            dmg: [Rect::empty(); 8], ndmg: 0, pending: [(0, 0); MAXWIN], npending: 0, parked: [(0, 0, 0); MAXWIN], nparked: 0, caret_on: true,
+        }
+    }
+
+    // ================================================================ boot
+
+    fn run(&mut self) -> ! {
+        write("[wm] Pulsar Desktop iniciando\n");
+        self.scr = screen_open();
+        self.w = self.scr.w;
+        self.h = self.scr.h;
+        self.wall = Fb::new(WALL_ADDR as *mut u32, self.w, self.h, self.w);
+        self.blur = Fb::new(WALLBLUR_ADDR as *mut u32, self.w, self.h, self.w);
+        register_service(SVC_WM);
+        set_focus(getpid());
+        wait_service(SVC_FS);
+
+        let (cfg, n) = config::load(&mut self.cfg_raw);
+        self.cfg = cfg;
+        self.cfg_len = n;
+        if n == 0 { self.save_config(); }
+        self.apply_config(true);
+        for k in 0..6 {
+            let t = &mut thumbs()[k * (THUMB_W * THUMB_H) as usize..(k + 1) * (THUMB_W * THUMB_H) as usize];
+            wallpaper::render_thumb(k as u8, t, THUMB_W, THUMB_H, self.w, self.h);
+        }
+        self.refresh_files();
+        self.sys = sysinfo();
+        self.update_clock();
+        self.net_up = net_status() != 0;
+        self.mx = self.w / 2;
+        self.my = self.h / 2;
+        self.set_cursor(cursor::Shape::Arrow);
+        self.toast(Icon::Pulsar, "Bem-vindo ao Pulsar OS",
+            "Ctrl+Espaço busca apps e arquivos. F1 mostra os atalhos.");
+        let mut b = Buf::<64>::new();
+        b.s("[wm] pronto: ").u(self.sys.ncpus as u64).s(" CPU(s), ").bytes(self.sys.arch()).s("\n");
+        write_bytes(b.get());
+        self.damage_all();
+
+        let mut last_slow = 0u64;
+        loop {
+            let t0 = uptime_ms();
+            self.serve_ipc();
+            self.handle_input();
+            if t0 >= last_slow + 500 {
+                last_slow = t0;
+                self.slow_tick(t0);
+            }
+            self.fast_tick(t0);
+            self.release_parked();
+            self.render();
+            // espera o proximo quadro OU uma mensagem: um COMMIT de app e
+            // composto logo (apps animados nao perdem quadros por esperar
+            // o "tique" do compositor)
+            let deadline = t0 + FRAME_MS;
+            let mut m = Msg::new(0);
+            loop {
+                let now = uptime_ms();
+                if now >= deadline { break; }
+                let Some(from) = recv_timeout(&mut m, deadline - now) else { break };
+                let commit = m.tag == WM_OP_COMMIT;
+                self.handle_msg(from, &m);
+                if commit {
+                    // no maximo ~125 quadros/s
+                    let since = uptime_ms().saturating_sub(t0);
+                    if since < 8 { sleep_ms(8 - since); }
+                    break;
+                }
+            }
+        }
+    }
+
+    // ============================================================ config
+
+    fn apply_config(&mut self, wallpaper_changed: bool) {
+        self.th = Theme::new(self.cfg.dark, self.cfg.accent_rgb());
+        self.kb.layout = if self.cfg.abnt2 { Layout::Abnt2 } else { Layout::Us };
+        if wallpaper_changed {
+            let t0 = uptime_ms();
+            wallpaper::render(self.cfg.wallpaper, &self.wall);
+            wallpaper::make_blur(&self.wall, &self.blur);
+            let mut b = Buf::<64>::new();
+            b.s("[wm] papel de parede '").s(config::WALLPAPERS[self.cfg.wallpaper as usize % 6])
+                .s("' gerado em ").u(uptime_ms() - t0).s(" ms\n");
+            write_bytes(b.get());
+        }
+        self.damage_all();
+    }
+
+    fn save_config(&mut self) {
+        let mut out = Buf::<1024>::new();
+        config::save(&self.cfg, &mut out);
+        let n = out.n.min(2048);
+        self.cfg_raw[..n].copy_from_slice(&out.b[..n]);
+        self.cfg_len = n;
+    }
+
+    fn set_cfg(&mut self, f: impl FnOnce(&mut Config)) {
+        let old = self.cfg;
+        f(&mut self.cfg);
+        if self.cfg != old {
+            self.save_config();
+            self.apply_config(old.wallpaper != self.cfg.wallpaper);
+        }
+    }
+
+    /// Relê pulsar.cfg (editado a mao no Editor, por exemplo).
+    fn watch_config(&mut self) {
+        let mut raw = [0u8; 2048];
+        let (cfg, n) = config::load(&mut raw);
+        if n == 0 || (n == self.cfg_len && raw[..n] == self.cfg_raw[..n]) { return; }
+        self.cfg_raw = raw;
+        self.cfg_len = n;
+        if cfg != self.cfg {
+            let wall = cfg.wallpaper != self.cfg.wallpaper;
+            self.cfg = cfg;
+            self.apply_config(wall);
+            self.toast(Icon::Config, "Configuração recarregada", "pulsar.cfg foi alterado e aplicado.");
+        }
+    }
+
+    // ============================================================ helpers
+
+    fn damage(&mut self, r: Rect) {
+        let mut r = r.intersect(&Rect::new(0, 0, self.w, self.h));
+        if r.is_empty() { return; }
+        // funde com tudo que sobrepoe (retangulos so encostados ficam
+        // separados: assim a area opaca de um app nao se mistura com as
+        // bordas arredondadas e a oclusao continua valendo)
+        let mut k = 0;
+        while k < self.ndmg {
+            if self.dmg[k].overlaps(&r) || self.dmg[k].contains_rect(&r) {
+                r = r.union(&self.dmg[k]);
+                self.ndmg -= 1;
+                self.dmg[k] = self.dmg[self.ndmg];
+                k = 0;
+                continue;
+            }
+            k += 1;
+        }
+        if self.ndmg == self.dmg.len() {
+            self.dmg[0] = self.dmg[0].union(&r);
+        } else {
+            self.dmg[self.ndmg] = r;
+            self.ndmg += 1;
+        }
+    }
+
+    fn damage_all(&mut self) {
+        self.dmg[0] = Rect::new(0, 0, self.w, self.h);
+        self.ndmg = 1;
+    }
+
+    /// Dano de um commit de app: parte opaca + faixa dos cantos inferiores.
+    fn damage_client(&mut self, i: usize) {
+        let c = self.wins[i].client();
+        // totalmente coberta por uma janela acima? nada visivel mudou
+        let z = self.wins[i].z;
+        if self.wins.iter().any(|w| w.used && !w.minimized && w.z > z && w.opaque().contains_rect(&c)) {
+            return;
+        }
+        if c.h > WIN_RAD * 2 {
+            self.damage(Rect::new(c.x, c.y, c.w, c.h - WIN_RAD));
+            self.damage(Rect::new(c.x, c.bottom() - WIN_RAD, c.w, WIN_RAD));
+        } else {
+            self.damage(c);
+        }
+    }
+
+    fn set_cursor(&mut self, s: cursor::Shape) {
+        if s == self.cursor { return; }
+        self.cursor = s;
+        let (hx, hy) = cursor::make(s, &mut self.cursor_img);
+        cursor_set(&self.cursor_img, hx, hy, self.mx, self.my);
+    }
+
+    fn work_area(&self) -> Rect {
+        let s = self.cfg.icon_size();
+        let reserve = s + s * 36 / 100 + 12;
+        if self.cfg.dock_left {
+            Rect::new(reserve, MENU_H, self.w - reserve, self.h - MENU_H)
+        } else {
+            Rect::new(0, MENU_H, self.w, self.h - MENU_H - reserve)
+        }
+    }
+
+    /// Janela com foco: a mais alta visivel.
+    fn focused(&self) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for i in 0..MAXWIN {
+            let w = &self.wins[i];
+            if w.used && !w.minimized && best.map(|b| w.z > self.wins[b].z).unwrap_or(true) {
+                best = Some(i);
+            }
+        }
+        best
+    }
+
+    fn z_order(&self, out: &mut [usize; MAXWIN]) -> usize {
+        let mut n = 0;
+        for i in 0..MAXWIN {
+            if self.wins[i].used && !self.wins[i].minimized { out[n] = i; n += 1; }
+        }
+        // insercao por z crescente
+        for a in 1..n {
+            let mut b = a;
+            while b > 0 && self.wins[out[b - 1]].z > self.wins[out[b]].z {
+                out.swap(b - 1, b);
+                b -= 1;
+            }
+        }
+        n
+    }
+
+    /// Janela visivel sob o ponto (de cima para baixo).
+    fn win_at(&self, x: i32, y: i32) -> Option<usize> {
+        let mut order = [0usize; MAXWIN];
+        let n = self.z_order(&mut order);
+        for k in (0..n).rev() {
+            let w = &self.wins[order[k]];
+            if w.r.inset(-RESIZE_M).contains(x, y) { return Some(order[k]); }
+        }
+        None
+    }
+
+    fn raise(&mut self, i: usize) {
+        // ja e a janela do topo (e visivel)? nada a fazer
+        if self.wins[i].z == self.zc && !self.wins[i].minimized { return; }
+        let prev = self.focused();
+        self.zc += 1;
+        self.wins[i].z = self.zc;
+        self.wins[i].minimized = false;
+        self.damage(self.wins[i].outer());
+        if let Some(p) = prev { if p != i { self.damage(self.wins[p].outer()); } }
+        self.damage(Rect::new(0, 0, self.w, MENU_H));
+        self.damage(self.dock_area);
+    }
+
+    fn find_app_win(&self, app: u8) -> Option<usize> {
+        (0..MAXWIN).find(|&i| self.wins[i].used && self.wins[i].app == app)
+    }
+
+    fn toast(&mut self, icon: Icon, title: &str, body: &str) {
+        self.toast_b(icon, title.as_bytes(), body.as_bytes());
+    }
+
+    fn toast_b(&mut self, icon: Icon, title: &[u8], body: &[u8]) {
+        let k = self.toasts.iter().position(|t| !t.active).unwrap_or_else(|| {
+            self.toasts.rotate_left(1);
+            2
+        });
+        let t = &mut self.toasts[k];
+        t.active = true;
+        t.icon = icon;
+        t.tl = title.len().min(48);
+        t.title[..t.tl].copy_from_slice(&title[..t.tl]);
+        t.bl = body.len().min(72);
+        t.body[..t.bl].copy_from_slice(&body[..t.bl]);
+        t.until = uptime_ms() + 6000;
+        self.damage(self.toast_area());
+    }
+
+    fn toast_area(&self) -> Rect {
+        Rect::new(self.w - 360, MENU_H, 360, 3 * 78 + 30)
+    }
+
+    fn refresh_files(&mut self) {
+        let n = fs_count().min(MAX_FILES);
+        for i in 0..n {
+            if let Some(f) = file_info(i) { self.files[i] = f; }
+        }
+        self.nfiles = n;
+    }
+
+    fn update_clock(&mut self) -> bool {
+        let (_, mo, d, hh, mm, ss, wd) = civil_time(rtc_seconds());
+        let mut b = Buf::<40>::new();
+        b.s(WEEKDAYS[wd as usize % 7]).s(" ").u(d as u64).s(" ").s(MONTHS[(mo as usize + 11) % 12]).s("  ");
+        let (h12, suf) = if self.cfg.clock24 { (hh, "") } else {
+            (if hh % 12 == 0 { 12 } else { hh % 12 }, if hh < 12 { " AM" } else { " PM" })
+        };
+        b.u0(h12 as u64, if self.cfg.clock24 { 2 } else { 1 }).s(":").u0(mm as u64, 2);
+        if self.cfg.seconds { b.s(":").u0(ss as u64, 2); }
+        b.s(suf);
+        let changed = b.get() != self.clock.get();
+        self.clock = b;
+        changed
+    }
+
+    // ============================================================== IPC
+
+    fn serve_ipc(&mut self) {
+        let mut m = Msg::new(0);
+        for _ in 0..64 {
+            let Some(from) = try_recv(&mut m) else { break };
+            self.handle_msg(from, &m);
+        }
+    }
+
+    /// Atende uma mensagem de app. COMMIT so e respondido apos a composicao.
+    fn handle_msg(&mut self, from: usize, m: &Msg) {
+        {
+            let mut r = Msg::new(m.tag);
+            let wi = (0..MAXWIN).find(|&i| self.wins[i].used && self.wins[i].pid == from as i64);
+            match m.tag {
+                WM_OP_HELLO => {
+                    let wi = match wi {
+                        Some(i) => Some(i),
+                        // processo lancado fora do WM (ex.: pelo Terminal)
+                        None => {
+                            let mut t = [0u8; 24];
+                            let n = unpack_title(&m.data[3..6], &mut t);
+                            let kind = m.data[0] as usize;
+                            let app = APPS.iter().find(|a| a.kind == Kind::Process && a.name.as_bytes() == &t[..n])
+                                .map(|a| a.id)
+                                .unwrap_or(if kind < APPS.len() && APPS[kind].kind == Kind::Process && kind != APP_GENERIC as usize
+                                    { kind as u8 } else { APP_GENERIC });
+                            self.new_window(app, from as i64, -1)
+                        }
+                    };
+                    if let Some(i) = wi {
+                        let want_w = (m.data[1] as i32).clamp(200, SURF_W);
+                        let want_h = (m.data[2] as i32).clamp(120, SURF_H);
+                        let mut t = [0u8; 24];
+                        let n = unpack_title(&m.data[3..6], &mut t);
+                        let w = &mut self.wins[i];
+                        w.hello = true;
+                        if n > 0 { w.set_title(&t[..n]); }
+                        if !w.committed && w.state == WState::Normal {
+                            let old = w.outer();
+                            w.r.w = want_w;
+                            w.r.h = want_h + TITLE_H;
+                            let wa = self.work_area();
+                            let w = &mut self.wins[i];
+                            w.r.x = w.r.x.min(wa.right() - w.r.w).max(wa.x);
+                            w.r.y = w.r.y.min(wa.bottom() - w.r.h).max(wa.y);
+                            w.restore = w.r;
+                            self.damage(old);
+                        }
+                        let w = &self.wins[i];
+                        let c = w.client();
+                        r.data[0] = w.slot as u64;
+                        r.data[1] = c.w.min(SURF_W) as u64;
+                        r.data[2] = c.h.min(SURF_H) as u64;
+                        r.data[3] = if w.open_file >= 0 { w.open_file as u64 + 1 } else { 0 };
+                        self.damage(self.wins[i].outer());
+                    }
+                }
+                WM_OP_COMMIT => {
+                    if let Some(i) = wi {
+                        let w = &mut self.wins[i];
+                        w.committed = true;
+                        let c = w.client();
+                        let (cw, ch) = ((m.data[1] >> 16) as i32 & 0xFFFF, m.data[1] as i32 & 0xFFFF);
+                        // (c so serve de padrao quando o app nao informa o tamanho)
+                        w.commit_w = if cw > 0 { cw } else { c.w };
+                        w.commit_h = if ch > 0 { ch } else { c.h };
+                        if !w.minimized {
+                            self.damage_client(i);
+                            if self.npending < MAXWIN {
+                                self.pending[self.npending] = (from, i);
+                                self.npending += 1;
+                                return; // resposta depois de compor
+                            }
+                        }
+                        self.fill_poll(i, &mut r);
+                    }
+                }
+                WM_OP_POLL => {
+                    if let Some(i) = wi {
+                        // data[0] bit 0 = "peek": responde ja, sem estacionar
+                        // (apps com trabalho de fundo, como o Vela carregando)
+                        if m.data[0] & 1 == 0 && !self.has_news(i) && self.nparked < MAXWIN {
+                            self.parked[self.nparked] = (from, i, uptime_ms());
+                            self.nparked += 1;
+                            return; // resposta quando houver novidade
+                        }
+                        self.fill_poll(i, &mut r);
+                    }
+                }
+                WM_OP_TITLE => {
+                    if let Some(i) = wi {
+                        let mut t = [0u8; 24];
+                        let n = unpack_title(&m.data[0..3], &mut t);
+                        self.wins[i].set_title(&t[..n]);
+                        let tb = Rect::new(self.wins[i].r.x, self.wins[i].r.y, self.wins[i].r.w, TITLE_H);
+                        self.damage(tb);
+                        if self.focused() == Some(i) { self.damage(Rect::new(0, 0, self.w, MENU_H)); }
+                    }
+                }
+                _ => {}
+            }
+            reply(from, &r);
+        }
+    }
+
+    /// Flags de estado do app `i` (sem os eventos de mouse/tecla).
+    fn state_flags(&self, i: usize) -> u64 {
+        let w = &self.wins[i];
+        let c = w.client();
+        let mut f = (c.w.min(SURF_W) as u64) << 16 | (c.h.min(SURF_H) as u64) << 32;
+        if w.want_close { f |= WM_FLAG_CLOSE; }
+        if self.focused() == Some(i) { f |= WM_FLAG_FOCUS; }
+        if self.th.dark { f |= WM_FLAG_DARK; }
+        if !w.minimized { f |= WM_FLAG_VISIBLE; }
+        // (bits so de comparacao: botao preso e cor de destaque)
+        if self.down && self.capture == Some(i) { f |= 1 << 62; }
+        f | ((self.th.accent as u64 & 0x3FFF) << 48)
+    }
+
+    /// O app `i` tem algo novo para receber?
+    fn has_news(&self, i: usize) -> bool {
+        let w = &self.wins[i];
+        if w.kn > 0 || w.click || w.rclick || w.dbl || w.wheel != 0 || w.menu != 0 || w.want_close {
+            return true;
+        }
+        if self.state_flags(i) != w.rep_f { return true; }
+        // mouse andou sobre a janela (ou acabou de sair dela): realces
+        let c = w.client();
+        let (lx, ly) = (self.mx - c.x, self.my - c.y);
+        let inside = c.contains(self.mx, self.my) && self.win_at(self.mx, self.my) == Some(i);
+        let was_inside = w.rep_mx >= 0 && w.rep_my >= 0 && w.rep_mx < c.w && w.rep_my < c.h;
+        let captured = self.capture == Some(i);
+        (inside || was_inside || captured) && (lx != w.rep_mx || ly != w.rep_my)
+    }
+
+    /// Responde os POLLs estacionados que ja tem novidade ou expiraram.
+    fn release_parked(&mut self) {
+        let now = uptime_ms();
+        let mut k = 0;
+        while k < self.nparked {
+            let (pid, i, since) = self.parked[k];
+            let alive = self.wins[i].used && self.wins[i].pid == pid as i64;
+            if !alive || self.has_news(i) || now - since >= POLL_MAX_MS {
+                let mut r = Msg::new(WM_OP_POLL);
+                if alive { self.fill_poll(i, &mut r); }
+                reply(pid, &r);
+                self.nparked -= 1;
+                self.parked[k] = self.parked[self.nparked];
+                continue;
+            }
+            k += 1;
+        }
+    }
+
+    fn fill_poll(&mut self, i: usize, r: &mut Msg) {
+        let state = self.state_flags(i);
+        let focused = self.focused() == Some(i);
+        let (mx, my, down, cap) = (self.mx, self.my, self.down, self.capture);
+        let dark = self.th.dark;
+        let accent = self.th.accent;
+        let w = &mut self.wins[i];
+        let c = w.client();
+        let key = w.pop_key();
+        let mut f = (c.w.min(SURF_W) as u64) << 16 | (c.h.min(SURF_H) as u64) << 32;
+        if w.want_close { f |= WM_FLAG_CLOSE; }
+        if focused { f |= WM_FLAG_FOCUS; }
+        if dark { f |= WM_FLAG_DARK; }
+        if w.kn > 0 { f |= WM_FLAG_MORE; }
+        if !w.minimized { f |= WM_FLAG_VISIBLE; }
+        r.data[0] = f;
+        r.data[1] = (mx - c.x) as i64 as u64;
+        r.data[2] = (my - c.y) as i64 as u64;
+        let mut b = 0u64;
+        if down && cap == Some(i) { b |= WM_MOUSE_DOWN; }
+        if w.click { b |= WM_MOUSE_CLICK; }
+        if w.rclick { b |= WM_MOUSE_RCLICK; }
+        if w.dbl { b |= WM_MOUSE_DOUBLE; }
+        b |= ((w.wheel.clamp(-127, 127) as i8 as u8) as u64) << 8;
+        r.data[3] = b;
+        r.data[4] = key;
+        r.data[5] = w.menu as u64 | ((accent as u64) << 32);
+        w.rep_f = state;
+        w.rep_mx = mx - c.x;
+        w.rep_my = my - c.y;
+        w.click = false;
+        w.rclick = false;
+        w.dbl = false;
+        w.wheel = 0;
+        w.menu = 0;
+    }
+
+    // ============================================================ janelas
+
+    fn free_slot(&self) -> Option<i8> {
+        (0..SURF_SLOTS as i8).find(|&s| !self.wins.iter().any(|w| w.used && w.slot == s))
+    }
+
+    fn new_window(&mut self, app: u8, pid: i64, open_file: i32) -> Option<usize> {
+        let idx = (0..MAXWIN).find(|&i| !self.wins[i].used)?;
+        let def = catalog::app(app);
+        let internal = def.kind == Kind::Internal;
+        let slot = if internal { -1 } else { self.free_slot()? };
+        let count = self.wins.iter().filter(|w| w.used).count() as i32;
+        let wa = self.work_area();
+        let (ww, wh) = if internal { (def.w, def.h) } else { (def.w, def.h + TITLE_H) };
+        let x = (wa.x + (wa.w - ww) / 2 + (count % 6) * 26 - 60).clamp(wa.x, (wa.right() - ww).max(wa.x));
+        let y = (wa.y + (wa.h - wh) / 2 + (count % 6) * 24 - 50).clamp(wa.y, (wa.bottom() - wh).max(wa.y));
+        let mut w = Win::empty();
+        w.used = true;
+        w.app = app;
+        w.internal = internal;
+        w.r = Rect::new(x, y, ww.min(wa.w), wh.min(wa.h));
+        w.restore = w.r;
+        w.pid = pid;
+        w.slot = slot;
+        w.open_file = open_file;
+        w.set_title(def.name.as_bytes());
+        self.wins[idx] = w;
+        self.raise(idx);
+        self.damage(self.wins[idx].outer());
+        Some(idx)
+    }
+
+    /// Abre (ou traz para frente) um aplicativo do catalogo.
+    fn launch(&mut self, app: u8, open_file: i32) {
+        let def = catalog::app(app);
+        if !def.multi || open_file < 0 {
+            if let Some(i) = self.find_app_win(app) {
+                self.raise(i);
                 return;
             }
         }
-        // .pulse desconhecido: nao faz nada (nao abre no editor um binario)
-        return;
+        if def.kind == Kind::Internal {
+            self.new_window(app, -1, -1);
+        } else {
+            if self.free_slot().is_none() || !self.wins.iter().any(|w| !w.used) {
+                self.toast(def.icon, "Janelas demais", "Feche uma janela para abrir outra.");
+                return;
+            }
+            let pid = spawn(def.bin);
+            if pid < 0 {
+                let mut b = Buf::<72>::new();
+                b.s(def.bin).s(" não foi encontrado no disco.");
+                self.toast_b(def.icon, "Não foi possível abrir".as_bytes(), b.get());
+                return;
+            }
+            self.new_window(app, pid, open_file);
+        }
+        self.bounce[app as usize] = uptime_ms() + 700;
     }
-    // texto/dado -> editor (kind 1)
-    for a in apps.iter(){ if a.kind==1{ launch(wins,a,zmax,next_slot,bounce,1); return; } }
-}
-fn file_at(win:&Win,mx:u32,my:u32,n:u32)->i32{
-    let cy=win.r.y+52;
-    for i in 0..n.min(9){ let y=cy+i*30; if mx>=win.r.x+10&&mx<win.r.x+win.r.w-10&&(my+4)>=y&&my<y+24{return i as i32;} }
-    -1
-}
 
-// ---- barra de menu interativa ----
-// menus: [nome_app] Arquivo Editar Janela. Retorna indice do menu clicado.
-// Menus por-programa. Indice = app_kind (0=Finder/Files, 1=Editor, 2=Ball,
-// 3=Calc, 4=Sobre, 5=Terminal). Cada app expoe ate 3 menus alem do seu nome.
-// Um label vazio (b"") significa "menu ausente".
-fn menu_labels_for(app_kind:u8)->[&'static[u8];3]{
-    match app_kind{
-        1=>[b"Arquivo",b"Editar",b""],          // Editor
-        2=>[b"Animacao",b"",b""],               // Ball
-        3=>[b"Calcular",b"",b""],                // Calculadora
-        5=>[b"Terminal",b"Editar",b""],         // Terminal
-        6=>[b"Rede",b"",b""],                   // Monitor de Rede
-        7=>[b"Vela",b"Historico",b""],          // Navegador
-        _=>[b"Arquivo",b"Editar",b"Janela"],    // Finder (padrao)
+    fn close_window(&mut self, i: usize) {
+        let w = &mut self.wins[i];
+        if !w.used { return; }
+        if w.internal {
+            let o = w.outer();
+            w.used = false;
+            self.damage(o);
+            self.damage(Rect::new(0, 0, self.w, MENU_H));
+            self.damage(self.dock_area);
+        } else if !w.want_close {
+            w.want_close = true;
+            w.close_at = uptime_ms() + 3000;
+        }
     }
-}
-// Nome exibido do "menu do app" (primeiro item, em negrito).
-fn app_menu_name(wins:&[Win;MAXWIN],zmax:u8)->&'static[u8]{
-    match focused_app(wins,zmax){
-        Some(i)=>title_for(wins[i].app_kind),
-        None=>b"Finder",
-    }
-}
-fn menu_x_positions(wins:&[Win;MAXWIN],zmax:u8)->[i32;4]{
-    let app=app_menu_name(wins,zmax);
-    let ak=focused_app(wins,zmax).map(|i|wins[i].app_kind).unwrap_or(0);
-    let lab=menu_labels_for(ak);
-    let x0=40i32;
-    let x1=x0+Fb::text_ui_width(app)+24;
-    // menus ausentes (label vazio) nao ocupam espaco
-    let x2=if lab[0].is_empty(){x1}else{x1+Fb::text_ui_width(lab[0])+22};
-    let x3=if lab[1].is_empty(){x2}else{x2+Fb::text_ui_width(lab[1])+22};
-    [x0,x1,x2,x3]
-}
-fn menu_hit(mx:u32,wins:&[Win;MAXWIN],zmax:u8)->i32{
-    let xs=menu_x_positions(wins,zmax);
-    let ak=focused_app(wins,zmax).map(|i|wins[i].app_kind).unwrap_or(0);
-    let lab=menu_labels_for(ak);
-    // menu 0 = nome do app, 1..3 = menus do app (pulando ausentes)
-    for i in (0..4).rev(){
-        if i>=1 && lab[i-1].is_empty(){ continue; }
-        if (mx as i32)>=xs[i]{ return i as i32; }
-    }
-    -1
-}
-fn dropdown_items(menu:i32,wins:&[Win;MAXWIN],zmax:u8)->[&'static[u8];4]{
-    let ak=focused_app(wins,zmax).map(|i|wins[i].app_kind).unwrap_or(0);
-    // menu 0 = menu do app (nome). menus 1..3 dependem do app.
-    match (ak,menu){
-        // ---- Editor ----
-        (1,0)=>[b"Sobre o Editor",b"",b"",b""],
-        (1,1)=>[b"Novo",b"Salvar",b"Fechar",b""],       // Arquivo
-        (1,2)=>[b"Desfazer",b"Copiar",b"Colar",b""],    // Editar
-        // ---- Ball ----
-        (2,0)=>[b"Sobre o Ball",b"",b"",b""],
-        (2,1)=>[b"Pausar",b"Reiniciar",b"",b""],        // Animacao
-        // ---- Calculadora ----
-        (3,0)=>[b"Sobre a Calc",b"",b"",b""],
-        (3,1)=>[b"Limpar",b"",b"",b""],
-        // ---- Vela (navegador) ----
-        (7,0)=>[b"Sobre o Vela",b"",b"",b""],
-        (7,1)=>[b"Recarregar",b"Limpar",b"Fechar",b""],
-        (7,2)=>[b"(vazio)",b"",b"",b""],
-        // ---- Rede ----
-        (6,0)=>[b"Sobre a Rede",b"",b"",b""],
-        (6,1)=>[b"Atualizar",b"Fechar",b"",b""],
-        // ---- Terminal ----
-        (5,0)=>[b"Sobre o Terminal",b"",b"",b""],
-        (5,1)=>[b"Limpar",b"Fechar",b"",b""],           // Terminal
-        (5,2)=>[b"Copiar",b"Colar",b"",b""],            // Editar
-        // ---- Finder (padrao) ----
-        (_,0)=>[b"Sobre o Pulsar",b"Preferencias",b"",b""],
-        (_,1)=>[b"Novo",b"Abrir",b"Salvar",b"Fechar"],  // Arquivo
-        (_,2)=>[b"Desfazer",b"Copiar",b"Colar",b""],    // Editar
-        (_,3)=>[b"Minimizar",b"Maximizar",b"Fechar tudo",b""], // Janela
-        _=>[b"",b"",b"",b""],
-    }
-}
-fn dropdown_hit(menu:i32,mx:u32,my:u32,wins:&[Win;MAXWIN],zmax:u8)->i32{
-    let xs=menu_x_positions(wins,zmax);
-    let dx=xs[menu as usize] as u32;
-    let items=dropdown_items(menu,wins,zmax);
-    for (i,it) in items.iter().enumerate(){
-        if it.is_empty(){continue;}
-        let y=MENU_H+2+(i as u32)*26;
-        if mx>=dx && mx<dx+180 && my>=y && my<y+26 { return (menu*10+i as i32) as i32; }
-    }
-    -1
-}
-// Codigos de acao-de-app enviados ao app em foco via ev_menu.
-// O app interpreta como quiser (protocolo simples e estavel).
-pub const APP_MENU_SAVE:u16=1;
-pub const APP_MENU_NEW:u16=2;
-pub const APP_MENU_COPY:u16=3;
-pub const APP_MENU_PASTE:u16=4;
-pub const APP_MENU_UNDO:u16=5;
-pub const APP_MENU_CLEAR:u16=6;
-pub const APP_MENU_PAUSE:u16=7;
-pub const APP_MENU_RESET:u16=8;
 
-fn send_app_menu(wins:&mut[Win;MAXWIN],zmax:u8,code:u16){
-    if let Some(i)=focused_app(wins,zmax){ wins[i].ev_menu=code; }
-}
-
-fn handle_menu_action(act:i32,wins:&mut[Win;MAXWIN],zmax:u8){
-    let ak=focused_app(wins,zmax).map(|i|wins[i].app_kind).unwrap_or(0);
-    // act = menu*10 + item. menu 0 = menu do app.
-    match (ak,act){
-        // ---- Editor (ak=1) ----
-        (1, 0)=>{}                                    // Sobre o Editor (no-op p/ agora)
-        (1,10)=>send_app_menu(wins,zmax,APP_MENU_NEW),   // Arquivo>Novo
-        (1,11)=>send_app_menu(wins,zmax,APP_MENU_SAVE),  // Arquivo>Salvar
-        (1,12)=>{ if let Some(i)=focused_app(wins,zmax){wins[i].want_close=true;} } // Arquivo>Fechar
-        (1,20)=>send_app_menu(wins,zmax,APP_MENU_UNDO),  // Editar>Desfazer
-        (1,21)=>send_app_menu(wins,zmax,APP_MENU_COPY),
-        (1,22)=>send_app_menu(wins,zmax,APP_MENU_PASTE),
-        // ---- Ball (ak=2) ----
-        (2,10)=>send_app_menu(wins,zmax,APP_MENU_PAUSE), // Animacao>Pausar
-        (2,11)=>send_app_menu(wins,zmax,APP_MENU_RESET), // Animacao>Reiniciar
-        // ---- Calculadora (ak=3) ----
-        (3,10)=>send_app_menu(wins,zmax,APP_MENU_CLEAR), // Calcular>Limpar
-        // ---- Vela (ak=7) ----
-        (7,11)=>send_app_menu(wins,zmax,APP_MENU_CLEAR), // Vela>Limpar
-        (7,12)=>{ if let Some(i)=focused_app(wins,zmax){wins[i].want_close=true;} } // Vela>Fechar
-        // ---- Rede (ak=6) ----
-        (6,11)=>{ if let Some(i)=focused_app(wins,zmax){wins[i].want_close=true;} } // Rede>Fechar
-        // ---- Terminal (ak=5) ----
-        (5,10)=>send_app_menu(wins,zmax,APP_MENU_CLEAR), // Terminal>Limpar
-        (5,11)=>{ if let Some(i)=focused_app(wins,zmax){wins[i].want_close=true;} } // Terminal>Fechar
-        (5,20)=>send_app_menu(wins,zmax,APP_MENU_COPY),
-        (5,21)=>send_app_menu(wins,zmax,APP_MENU_PASTE),
-        // ---- Finder (padrao) ----
-        (_,30)=>{ if let Some(i)=focused_app(wins,zmax){ wins[i].open=false; } } // Janela>Minimizar
-        (_,32)=>{ for i in 1..MAXWIN{ if wins[i].used&&wins[i].kind==WKind::App{ wins[i].want_close=true; } } } // Fechar tudo
-        (_,13)=>{ if let Some(i)=focused_app(wins,zmax){ wins[i].want_close=true; } } // Arquivo>Fechar
-        _=>{}
+    fn force_quit(&mut self, i: usize) {
+        let w = self.wins[i];
+        if w.internal { return self.close_window(i); }
+        if w.pid >= 0 { kill(w.pid as usize); }
     }
-}
 
-fn surf_ptr(slot:u64)->*const u32{ (0x4600_0000 + 12*1024*1024 + slot*2*1024*1024) as *const u32 }
-/// Uniao de dois retangulos (menor retangulo que contem ambos).
-fn rect_union(a:Rect,b:Rect)->Rect{
-    let x0=a.x.min(b.x); let y0=a.y.min(b.y);
-    let x1=(a.x+a.w).max(b.x+b.w); let y1=(a.y+a.h).max(b.y+b.h);
-    Rect{x:x0,y:y0,w:x1-x0,h:y1-y0}
-}
+    fn set_state(&mut self, i: usize, st: WState) {
+        let wa = self.work_area();
+        let old = self.wins[i].outer();
+        let w = &mut self.wins[i];
+        if w.state == WState::Normal && st != WState::Normal { w.restore = w.r; }
+        w.state = st;
+        w.r = match st {
+            WState::Normal => w.restore,
+            WState::Max => wa,
+            WState::SnapL => Rect::new(wa.x, wa.y, wa.w / 2, wa.h),
+            WState::SnapR => Rect::new(wa.x + wa.w / 2, wa.y, wa.w - wa.w / 2, wa.h),
+        };
+        let new = self.wins[i].outer();
+        self.damage(old);
+        self.damage(new);
+    }
 
-/// Compoe a cena inteira restrita ao retangulo de dano `dmg` (scissor).
-/// As primitivas so escrevem dentro do clip, entao recompor "tudo" custa
-/// proporcional a area do dano, nao a tela inteira. Isto e o coracao do
-/// damage-tracking: desenhar so o que mudou.
-#[allow(clippy::too_many_arguments)]
-fn compose_scene(fb:&mut Fb, dmg:Rect, w:u32, secs:u32,
-                 wins:&[Win;MAXWIN], zmax:u8, menu_open:i32,
-                 fcache:&[FileMeta;9], nfiles:u32, sel:i32, mouse:&Mouse,
-                 dock_x:u32,dock_y:u32,dock_w:u32,icon:u32,gap:u32,n_apps:u32,
-                 apps:&[AppDef;8], bounce:&mut[u32;8]){
-    fb.set_clip(dmg);
-    // 1) fundo (restaura wallpaper so na area do dano)
-    fb.restore_wall(dmg);
-    // 2) barra de menu (se o dano toca o topo)
-    if dmg.y < MENU_H { draw_menubar(fb,w,secs,wins,zmax,menu_open); }
-    // 3) janelas em ordem de z (tras->frente); so as que intersectam o dano
-    let ord=z_asc(wins);
-    for &wi in ord.iter(){
-        if wi>=MAXWIN{continue;}
-        let win=wins[wi];
-        if !win.used||!win.open{continue;}
-        if !rects_overlap(win.r,dmg){continue;}
-        let focused=win.z==zmax;
-        match win.kind{
-            WKind::Files=>draw_files(fb,&win,fcache,nfiles,focused,sel,mouse),
-            WKind::App=>{
-                draw_chrome(fb,win.r,title_for(win.app_kind),focused);
-                if win.committed{ blit_surface(fb,win.slot as u64,win.client()); }
-                else{ let c=win.client(); fb.round_rect(Rect{x:c.x,y:c.y,w:c.w,h:c.h},0,0x00FCFDFE); }
+    fn toggle_zoom(&mut self, i: usize) {
+        let st = if self.wins[i].state == WState::Normal { WState::Max } else { WState::Normal };
+        self.set_state(i, st);
+    }
+
+    fn minimize(&mut self, i: usize) {
+        self.wins[i].minimized = true;
+        self.damage(self.wins[i].outer());
+        self.damage(Rect::new(0, 0, self.w, MENU_H));
+        self.damage(self.dock_area);
+    }
+
+    fn tile_all(&mut self) {
+        let wa = self.work_area();
+        let ids: [usize; MAXWIN] = core::array::from_fn(|i| i);
+        let vis: usize = ids.iter().filter(|&&i| self.wins[i].used && !self.wins[i].minimized).count();
+        if vis == 0 { return; }
+        let cols = if vis <= 2 { vis } else if vis <= 4 { 2 } else { 3 } as i32;
+        let rows = ((vis as i32) + cols - 1) / cols;
+        let mut k = 0;
+        for i in 0..MAXWIN {
+            if !self.wins[i].used || self.wins[i].minimized { continue; }
+            let (c, r) = (k % cols, k / cols);
+            let cell = Rect::new(wa.x + c * wa.w / cols, wa.y + r * wa.h / rows, wa.w / cols, wa.h / rows);
+            let w = &mut self.wins[i];
+            w.state = WState::Normal;
+            w.r = cell.inset(4);
+            w.restore = w.r;
+            k += 1;
+        }
+        self.damage_all();
+    }
+
+    fn cascade(&mut self) {
+        let wa = self.work_area();
+        let mut order = [0usize; MAXWIN];
+        let n = self.z_order(&mut order);
+        for k in 0..n {
+            let w = &mut self.wins[order[k]];
+            w.state = WState::Normal;
+            w.r = Rect::new(wa.x + 40 + k as i32 * 30, wa.y + 20 + k as i32 * 28, w.restore.w.min(wa.w - 80), w.restore.h.min(wa.h - 40));
+            w.restore = w.r;
+        }
+        self.damage_all();
+    }
+
+    fn show_desktop(&mut self) {
+        let any = self.wins.iter().any(|w| w.used && !w.minimized);
+        for w in self.wins.iter_mut() {
+            if w.used { w.minimized = any; }
+        }
+        self.damage_all();
+    }
+
+    // ============================================================ acoes
+
+    fn target(&self) -> Option<usize> {
+        self.menu.and_then(|m| m.target_win).or_else(|| self.focused())
+    }
+
+    fn do_action(&mut self, a: Action) {
+        let tgt = self.target();
+        match a {
+            Action::None => {}
+            Action::About => self.launch(APP_ABOUT, -1),
+            Action::Help => self.launch(APP_HELP, -1),
+            Action::Settings(p) => {
+                self.panels.settings_page = p.min(4);
+                self.launch(APP_SETTINGS, -1);
+                if let Some(i) = self.find_app_win(APP_SETTINGS) { self.damage(self.wins[i].outer()); }
+            }
+            Action::SettingsPage(p) => {
+                self.panels.settings_page = p;
+                if let Some(i) = self.find_app_win(APP_SETTINGS) { self.damage(self.wins[i].outer()); }
+            }
+            Action::Launch(id) => self.launch(id, -1),
+            Action::Poweroff => {
+                self.dialog = Dialog::Poweroff;
+                self.damage_all();
+            }
+            Action::DialogCancel => {
+                self.dialog = Dialog::None;
+                self.damage_all();
+            }
+            Action::DialogConfirm => {
+                write("[wm] desligando...\n");
+                self.scr.fill(Rect::new(0, 0, self.w, self.h), 0x000000);
+                fb_present(Rect::new(0, 0, self.w, self.h));
+                poweroff();
+            }
+            Action::NewTextDoc => self.new_text_doc(),
+            Action::OpenFileIdx(i) => {
+                let i = if i == u16::MAX { self.panels.files_sel } else { i as i32 };
+                if i >= 0 { self.open_file(i as usize, false); }
+            }
+            Action::OpenWithEditor(i) => {
+                let i = if i == u16::MAX { self.panels.files_sel } else { i as i32 };
+                if i >= 0 { self.open_file(i as usize, true); }
+            }
+            Action::FileInfo(i) => {
+                let i = if i == u16::MAX { self.panels.files_sel } else { i as i32 };
+                if i >= 0 && (i as usize) < self.nfiles {
+                    let f = self.files[i as usize];
+                    let mut b = Buf::<72>::new();
+                    b.s(panels::file_kind_label(&f)).s(" · ").size(f.size as u64);
+                    self.toast_b(panels::file_icon(&f), f.name(), b.get());
+                }
+            }
+            Action::FileSel(i) => {
+                self.panels.files_sel = i as i32;
+                if let Some(w) = self.find_app_win(APP_FILES) { self.damage(self.wins[w].r); }
+            }
+            Action::FilesView(v) => {
+                self.panels.files_view = v;
+                self.panels.files_scroll = 0;
+                if let Some(w) = self.find_app_win(APP_FILES) { self.damage(self.wins[w].r); }
+            }
+            Action::FilesFilter(f) => {
+                self.panels.files_filter = f;
+                self.panels.files_scroll = 0;
+                if let Some(w) = self.find_app_win(APP_FILES) { self.damage(self.wins[w].r); }
+            }
+            Action::AppMenu(code) => {
+                if let Some(i) = tgt { self.wins[i].menu = code; }
+            }
+            Action::CloseWin | Action::QuitApp => { if let Some(i) = tgt { self.close_window(i); } }
+            Action::ForceQuit => { if let Some(i) = tgt { self.force_quit(i); } }
+            Action::MinimizeWin => { if let Some(i) = tgt { self.minimize(i); } }
+            Action::ZoomWin => { if let Some(i) = tgt { self.toggle_zoom(i); } }
+            Action::SnapLeft => { if let Some(i) = tgt { self.set_state(i, WState::SnapL); } }
+            Action::SnapRight => { if let Some(i) = tgt { self.set_state(i, WState::SnapR); } }
+            Action::TileAll => self.tile_all(),
+            Action::Cascade => self.cascade(),
+            Action::ShowDesktop => self.show_desktop(),
+            Action::CloseAll => {
+                for i in 0..MAXWIN { if self.wins[i].used { self.close_window(i); } }
+            }
+            Action::Spotlight => self.open_spotlight(),
+            Action::ControlCenter => {
+                self.cc_open = !self.cc_open;
+                self.damage(self.cc_rect());
+            }
+            Action::ToggleDark => self.set_cfg(|c| c.dark = !c.dark),
+            Action::ToggleMagnify => self.set_cfg(|c| c.dock_magnify = !c.dock_magnify),
+            Action::SetAccent(k) => self.set_cfg(|c| c.accent = k),
+            Action::SetWallpaper(k) => self.set_cfg(|c| c.wallpaper = k),
+            Action::DockSize(k) => self.set_cfg(|c| c.dock_size = k),
+            Action::DockLeft(v) => self.set_cfg(|c| c.dock_left = v),
+            Action::SetClock24(v) => { self.set_cfg(|c| c.clock24 = v); self.update_clock(); }
+            Action::SetSeconds(v) => { self.set_cfg(|c| c.seconds = v); self.update_clock(); }
+            Action::SetCpuMeter(v) => self.set_cfg(|c| c.cpu_meter = v),
+            Action::SetGlass(v) => self.set_cfg(|c| c.glass = v),
+            Action::SetLayout(v) => self.set_cfg(|c| c.abnt2 = v),
+            Action::SetDockMinimize(v) => self.set_cfg(|c| c.dock_minimize = v),
+            Action::EditConfig => {
+                if let Some(i) = find_file(config::CFG_NAME) { self.launch(APP_EDITOR, i as i32); }
+            }
+            Action::DockOpen => {
+                if let Some(m) = self.menu { self.launch(m.target_app, -1); }
             }
         }
     }
-    // 4) dropdown (se aberto)
-    if menu_open>=0{ draw_dropdown(fb,menu_open,wins,zmax); }
-    // 5) dock (se o dano toca a area do dock)
-    let dock_r=Rect{x:dock_x,y:dock_y,w:dock_w,h:DOCK_H};
-    if rects_overlap(dock_r,dmg){
-        draw_dock(fb,dock_x,dock_y,dock_w,icon,gap,n_apps,apps,bounce,wins,mouse);
+
+    fn new_text_doc(&mut self) {
+        let mut name = Buf::<28>::new();
+        for k in 1..100u64 {
+            name.clear().s("Sem titulo");
+            if k > 1 { name.s(" ").u(k); }
+            name.s(".txt");
+            if find_file(name.get()).is_none() { break; }
+        }
+        let idx = fs_create(name.get());
+        if idx < 0 {
+            self.toast(Icon::Document, "Não foi possível criar", "O disco está cheio?");
+            return;
+        }
+        self.refresh_files();
+        self.panels.files_sel = idx as i32;
+        if let Some(w) = self.find_app_win(APP_FILES) { self.damage(self.wins[w].r); }
+        self.launch(APP_EDITOR, idx as i32);
     }
-    fb.clear_clip();
+
+    fn open_file(&mut self, idx: usize, force_editor: bool) {
+        if idx >= self.nfiles { return; }
+        let f = self.files[idx];
+        if !force_editor && f.ext() == b"pulse" {
+            if let Some(a) = app_by_bin(f.name()) {
+                self.launch(a.id, -1);
+            } else {
+                let name = unsafe { core::str::from_utf8_unchecked(f.name()) };
+                if spawn(name) < 0 {
+                    self.toast(Icon::Program, "Programa não iniciou", "O executável é inválido para esta arquitetura.");
+                }
+            }
+            return;
+        }
+        if f.ext() == b"pulse" {
+            self.toast(Icon::Program, "Arquivo binário", "Executáveis .pulse não podem ser editados.");
+            return;
+        }
+        self.launch(APP_EDITOR, idx as i32);
+    }
+
+    // ============================================================ input
+
+    fn handle_input(&mut self) {
+        let (ox, oy) = (self.mx, self.my);
+        for _ in 0..256 {
+            let Some(ev) = input_poll() else { break };
+            match ev.ev_type {
+                EV_ABS => {
+                    let v = ev.value.min(32767) as i32;
+                    if ev.code == ABS_X { self.mx = v * (self.w - 1) / 32767; }
+                    if ev.code == ABS_Y { self.my = v * (self.h - 1) / 32767; }
+                }
+                EV_REL if ev.code == REL_WHEEL => self.wheel += ev.value as i32,
+                EV_KEY => match ev.code {
+                    BTN_LEFT => {
+                        if self.mx != ox || self.my != oy { self.on_move(); }
+                        if ev.value != 0 { self.on_press(); } else { self.on_release(); }
+                    }
+                    BTN_RIGHT => { if ev.value != 0 { self.on_rclick(); } }
+                    BTN_MIDDLE => {}
+                    code => {
+                        if (code == key::LMETA || code == key::RMETA) && ev.value == 0 && self.meta_tap {
+                            self.meta_tap = false;
+                            self.kb.feed(code, 0);
+                            self.toggle_spotlight();
+                            continue;
+                        }
+                        if (code == key::LALT || code == key::RALT) && ev.value == 0 && self.switcher {
+                            self.kb.feed(code, 0);
+                            self.finish_switcher();
+                            continue;
+                        }
+                        if let Some(k) = self.kb.feed(code, ev.value) {
+                            self.meta_tap = (code == key::LMETA || code == key::RMETA) && k.mods == MOD_META;
+                            if !(code == key::LMETA || code == key::RMETA) { self.on_key(k); }
+                        }
+                    }
+                },
+                _ => {}
+            }
+        }
+        if self.mx != ox || self.my != oy { self.on_move(); }
+        if self.wheel != 0 {
+            let w = self.wheel;
+            self.wheel = 0;
+            self.on_wheel(w);
+        }
+    }
+
+    fn on_move(&mut self) {
+        cursor_move(self.mx, self.my);
+        let (mx, my) = (self.mx, self.my);
+        match self.drag {
+            Drag::Move { win, dx, dy, .. } => {
+                let old = self.wins[win].outer();
+                let wa = self.work_area();
+                let w = &mut self.wins[win];
+                if w.state != WState::Normal {
+                    // sair do maximizado/encaixado arrastando: restaura sob o mouse
+                    let rw = w.restore.w;
+                    w.state = WState::Normal;
+                    w.r = Rect::new(mx - rw / 2, my - 16, rw, w.restore.h);
+                    self.drag = Drag::Move { win, dx: rw / 2, dy: 16, moved: true };
+                } else {
+                    w.r.x = (mx - dx).clamp(-w.r.w + 80, self.w - 80);
+                    w.r.y = (my - dy).clamp(MENU_H, self.h - 40);
+                    self.drag = Drag::Move { win, dx, dy, moved: true };
+                }
+                let new = self.wins[win].outer();
+                self.damage(old);
+                self.damage(new);
+                // pre-visualizacao do encaixe (Aero Snap)
+                let snap = if my <= MENU_H + 2 { Some((wa, WState::Max)) }
+                    else if mx <= wa.x + 2 { Some((Rect::new(wa.x, wa.y, wa.w / 2, wa.h), WState::SnapL)) }
+                    else if mx >= self.w - 3 { Some((Rect::new(wa.x + wa.w / 2, wa.y, wa.w - wa.w / 2, wa.h), WState::SnapR)) }
+                    else { None };
+                if snap.map(|s| s.0) != self.snap.map(|s| s.0) {
+                    if let Some(s) = self.snap { self.damage(s.0.inset(-4)); }
+                    if let Some(s) = snap { self.damage(s.0.inset(-4)); }
+                    self.snap = snap;
+                }
+                return;
+            }
+            Drag::Resize { win, edges, start, mx: sx, my: sy } => {
+                let old = self.wins[win].outer();
+                let w = &mut self.wins[win];
+                let (dx, dy) = (mx - sx, my - sy);
+                let minw = if w.internal { 420 } else { 220 };
+                if edges & 1 != 0 { w.r.w = (start.w + dx).clamp(minw, SURF_W); }
+                if edges & 2 != 0 { w.r.h = (start.h + dy).clamp(160, SURF_H + TITLE_H); }
+                if edges & 4 != 0 {
+                    let nw = (start.w - dx).clamp(minw, SURF_W);
+                    w.r.x = start.x + start.w - nw;
+                    w.r.w = nw;
+                }
+                w.restore = w.r;
+                let new = self.wins[win].outer();
+                self.damage(old);
+                self.damage(new);
+                return;
+            }
+            Drag::None => {}
+        }
+        // menu aberto: troca de menu da barra ao passar o mouse; destaque
+        if let Some(m) = self.menu {
+            if my < MENU_H {
+                if let MenuKind::Bar(cur) = m.kind {
+                    if let Some(k) = self.menubar_hit(mx) {
+                        if k != cur { self.open_bar_menu(k); }
+                    }
+                }
+            }
+            if m.rect.inset(-2).contains(mx, my) || m.rect.inset(-2).contains(self.last_cx, self.last_cy) {
+                self.damage(m.rect.inset(-2));
+            }
+        }
+        if self.cc_open { self.damage(self.cc_rect()); }
+        if self.spot { self.damage(self.spot_rect().inset(-64)); }
+        // dock (ampliacao e rotulo)
+        let dz = self.dock_zone();
+        if dz.contains(mx, my) || self.dock_hover >= 0 {
+            self.damage(self.dock_area.inset(-4));
+            self.layout_dock();
+            self.damage(self.dock_area.inset(-4));
+        }
+        // semaforos e realces das janelas internas
+        let lights = self.win_at(mx, my).filter(|&i| self.wins[i].lights().contains(mx, my));
+        if lights != self.hover_light {
+            if let Some(i) = self.hover_light { self.damage(self.wins[i].lights()); }
+            if let Some(i) = lights { self.damage(self.wins[i].lights()); }
+            self.hover_light = lights;
+        }
+        if let Some(i) = self.win_at(mx, my) {
+            if self.wins[i].internal {
+                let hr = self.phits[self.wins[i].app as usize].at(mx, my).map(|h| h.0).unwrap_or(Rect::empty());
+                if hr != self.hover_hit {
+                    let o = self.hover_hit;
+                    self.damage(o.inset(-2));
+                    self.damage(hr.inset(-2));
+                    self.hover_hit = hr;
+                }
+            }
+        }
+        // forma do cursor nas bordas de redimensionamento
+        let shape = match self.win_at(mx, my).map(|i| self.resize_edges(i, mx, my)) {
+            Some(3) => cursor::Shape::ResizeDiag,
+            Some(1) | Some(4) => cursor::Shape::ResizeH,
+            Some(2) => cursor::Shape::ResizeV,
+            _ => cursor::Shape::Arrow,
+        };
+        self.set_cursor(shape);
+        self.last_cx = mx;
+        self.last_cy = my;
+    }
+
+    /// Bordas de redimensionamento sob o ponto: 1 direita, 2 base, 4 esquerda.
+    fn resize_edges(&self, i: usize, x: i32, y: i32) -> u8 {
+        let w = &self.wins[i];
+        if w.state != WState::Normal { return 0; }
+        let r = w.r;
+        let mut e = 0;
+        if x >= r.right() - RESIZE_M && x < r.right() + RESIZE_M && y > r.y + TITLE_H { e |= 1; }
+        if y >= r.bottom() - RESIZE_M && y < r.bottom() + RESIZE_M { e |= 2; }
+        if x < r.x + RESIZE_M && x >= r.x - RESIZE_M && y > r.y + TITLE_H { e |= 4; }
+        if e & 2 != 0 && e & 1 == 0 && x >= r.right() - 14 { e |= 1; }
+        e
+    }
+
+    fn close_overlays(&mut self) -> bool {
+        let mut any = false;
+        if let Some(m) = self.menu.take() {
+            self.damage(m.rect.inset(-24));
+            self.damage(Rect::new(0, 0, self.w, MENU_H));
+            any = true;
+        }
+        if self.cc_open {
+            self.cc_open = false;
+            self.damage(self.cc_rect().inset(-24));
+            any = true;
+        }
+        if self.spot {
+            self.spot = false;
+            self.damage_all();
+            any = true;
+        }
+        any
+    }
+
+    fn on_press(&mut self) {
+        self.down = true;
+        let (mx, my) = (self.mx, self.my);
+        let now = uptime_ms();
+        let double = now - self.last_click < 450 && (mx - self.last_cx).abs() < 6 && (my - self.last_cy).abs() < 6;
+        self.last_click = if double { 0 } else { now };
+        self.last_cx = mx;
+        self.last_cy = my;
+
+        // 1) dialogo modal
+        if self.dialog != Dialog::None {
+            if let Some((_, a)) = self.dialog_hits.at(mx, my) { self.do_action(a); }
+            return;
+        }
+        // 2) busca
+        if self.spot {
+            let r = self.spot_rect();
+            if r.contains(mx, my) {
+                let k = (my - r.y - 60) / 40;
+                if k >= 0 && (k as usize) < self.spot_n {
+                    self.spot_sel = k as usize;
+                    self.spot_activate();
+                }
+                return;
+            }
+            self.close_overlays();
+            return;
+        }
+        // 3) menus e central de controle
+        if let Some(m) = self.menu {
+            if let Some((_, a)) = self.menu_hits.at(mx, my) {
+                if m.rect.contains(mx, my) {
+                    self.do_action(a);
+                    self.close_overlays();
+                    return;
+                }
+            }
+            if m.rect.contains(mx, my) { return; }
+            let on_bar = my < MENU_H;
+            self.close_overlays();
+            if !on_bar { return; }
+        }
+        if self.cc_open {
+            if self.cc_rect().contains(mx, my) {
+                if let Some((_, a)) = self.cc_hits.at(mx, my) {
+                    self.do_action(a);
+                    self.damage(self.cc_rect());
+                }
+                return;
+            }
+            self.close_overlays();
+            if my >= MENU_H { return; }
+        }
+        // 4) barra de menus
+        if my < MENU_H {
+            if let Some(k) = self.menubar_hit(mx) {
+                self.open_bar_menu(k);
+            } else if mx > self.w - 320 {
+                match self.status_hit(mx) {
+                    1 => self.do_action(Action::ControlCenter),
+                    2 => self.open_spotlight(),
+                    3 => self.launch(APP_MONITOR, -1),
+                    4 => self.launch(APP_NET, -1),
+                    _ => self.do_action(Action::ControlCenter),
+                }
+            }
+            return;
+        }
+        // 5) dock
+        if let Some(app) = self.dock_hit(mx, my) {
+            match self.find_app_win(app) {
+                Some(i) if self.wins[i].minimized => self.raise(i),
+                Some(i) if self.focused() == Some(i) && self.cfg.dock_minimize => self.minimize(i),
+                _ => self.launch(app, -1),
+            }
+            return;
+        }
+        // 6) janelas
+        if let Some(i) = self.win_at(mx, my) {
+            self.raise(i);
+            let w = self.wins[i];
+            let edges = self.resize_edges(i, mx, my);
+            if edges != 0 {
+                self.drag = Drag::Resize { win: i, edges, start: w.r, mx, my };
+                return;
+            }
+            // semaforos
+            let ly = w.r.y + 19;
+            for (k, cx) in [w.r.x + 20, w.r.x + 40, w.r.x + 60].iter().enumerate() {
+                if (mx - cx).abs() <= 8 && (my - ly).abs() <= 8 {
+                    match k {
+                        0 => self.close_window(i),
+                        1 => self.minimize(i),
+                        _ => self.toggle_zoom(i),
+                    }
+                    return;
+                }
+            }
+            if w.internal {
+                if let Some((_, a)) = self.phits[w.app as usize].at(mx, my) {
+                    if let Action::FileSel(f) = a {
+                        self.do_action(a);
+                        if double { self.open_file(f as usize, false); }
+                    } else {
+                        self.do_action(a);
+                    }
+                    return;
+                }
+                // area livre do topo arrasta a janela
+                if my < w.r.y + TOOLBAR_H {
+                    if double { self.toggle_zoom(i); return; }
+                    self.drag = Drag::Move { win: i, dx: mx - w.r.x, dy: my - w.r.y, moved: false };
+                }
+                return;
+            }
+            if my < w.r.y + TITLE_H {
+                if double { self.toggle_zoom(i); return; }
+                self.drag = Drag::Move { win: i, dx: mx - w.r.x, dy: my - w.r.y, moved: false };
+                return;
+            }
+            // clique no conteudo de um app
+            self.capture = Some(i);
+            let w = &mut self.wins[i];
+            w.click = true;
+            if double { w.dbl = true; }
+            return;
+        }
+        // 7) area de trabalho
+        if self.panels.files_sel >= 0 {
+            self.panels.files_sel = -1;
+            if let Some(w) = self.find_app_win(APP_FILES) { self.damage(self.wins[w].r); }
+        }
+    }
+
+    fn on_release(&mut self) {
+        self.down = false;
+        self.capture = None;
+        if let Drag::Move { win, moved, .. } = self.drag {
+            if let Some((r, st)) = self.snap.take() {
+                self.damage(r.inset(-4));
+                if moved { self.set_state(win, st); }
+            }
+        }
+        self.drag = Drag::None;
+    }
+
+    fn on_rclick(&mut self) {
+        let (mx, my) = (self.mx, self.my);
+        if self.dialog != Dialog::None || self.spot { return; }
+        self.close_overlays();
+        if let Some(app) = self.dock_hit(mx, my) {
+            let running = self.find_app_win(app);
+            let items = if running.is_some() { M_DOCK_RUNNING } else { M_DOCK_IDLE };
+            let r = ui::menu_rect(mx - 20, my - 10 - ui::menu_rect(0, 0, items, self.w).h, items, self.w);
+            self.menu = Some(Menu { kind: MenuKind::Context, rect: r, items, target_win: running, target_app: app });
+            self.damage(r.inset(-24));
+            return;
+        }
+        if my < MENU_H { return; }
+        if let Some(i) = self.win_at(mx, my) {
+            self.raise(i);
+            let w = self.wins[i];
+            if !w.internal && my >= w.r.y + TITLE_H {
+                self.wins[i].rclick = true;
+                return;
+            }
+            if w.app == APP_FILES {
+                if let Some((_, Action::FileSel(f))) = self.phits[APP_FILES as usize].at(mx, my) {
+                    self.do_action(Action::FileSel(f));
+                    self.open_menu_at(mx, my, M_FILE, Some(i));
+                    return;
+                }
+            }
+            if my < w.r.y + TITLE_H.max(if w.internal { TOOLBAR_H } else { 0 }) {
+                self.open_menu_at(mx, my, M_TITLEBAR, Some(i));
+            }
+            return;
+        }
+        self.open_menu_at(mx, my, M_DESKTOP, None);
+    }
+
+    fn open_menu_at(&mut self, x: i32, y: i32, items: &'static [MI], target: Option<usize>) {
+        let mut r = ui::menu_rect(x, y, items, self.w);
+        if r.bottom() > self.h - 4 { r.y = (y - r.h).max(MENU_H); }
+        self.menu = Some(Menu { kind: MenuKind::Context, rect: r, items, target_win: target, target_app: 0 });
+        self.damage(r.inset(-24));
+    }
+
+    fn on_wheel(&mut self, d: i32) {
+        let (mx, my) = (self.mx, self.my);
+        if let Some(i) = self.win_at(mx, my) {
+            if self.wins[i].internal {
+                if self.wins[i].app == APP_FILES {
+                    self.panels.files_scroll -= d * 3 * 28;
+                    self.damage(self.wins[i].r);
+                }
+            } else {
+                self.wins[i].wheel += d;
+            }
+        }
+    }
+
+    fn on_key(&mut self, k: Key) {
+        let code = k.code;
+        // ---- atalhos globais ----
+        if k.ctrl() && code == key::SPACE { return self.toggle_spotlight(); }
+        if k.alt() && code == key::TAB { return self.cycle_switcher(k.shift()); }
+        if self.switcher && code == key::ESC {
+            self.switcher = false;
+            self.damage_all();
+            return;
+        }
+        if self.dialog != Dialog::None {
+            match code {
+                key::ENTER => self.do_action(Action::DialogConfirm),
+                key::ESC => self.do_action(Action::DialogCancel),
+                _ => {}
+            }
+            return;
+        }
+        if self.spot { return self.spotlight_key(k); }
+        if code == key::ESC && self.close_overlays() { return; }
+        if k.ctrl() && k.shift() && code == key::ESC { return self.launch(APP_MONITOR, -1); }
+        if k.ctrl() && k.alt() && code == key::T { return self.launch(APP_TERMINAL, -1); }
+        if (k.alt() && code == key::F4) || (k.ctrl() && (code == key::W || code == key::Q)) {
+            if let Some(i) = self.focused() { self.close_window(i); }
+            return;
+        }
+        if code == key::F1 { return self.launch(APP_HELP, -1); }
+        if k.meta() {
+            let f = self.focused();
+            match code {
+                key::UP => { if let Some(i) = f { self.set_state(i, WState::Max); } }
+                key::DOWN => {
+                    if let Some(i) = f {
+                        if self.wins[i].state != WState::Normal { self.set_state(i, WState::Normal); } else { self.minimize(i); }
+                    }
+                }
+                key::LEFT => { if let Some(i) = f { self.set_state(i, WState::SnapL); } }
+                key::RIGHT => { if let Some(i) = f { self.set_state(i, WState::SnapR); } }
+                key::D => self.show_desktop(),
+                key::E => self.launch(APP_FILES, -1),
+                key::I => self.do_action(Action::Settings(0)),
+                _ => {}
+            }
+            return;
+        }
+        if code == key::F11 {
+            if let Some(i) = self.focused() { self.toggle_zoom(i); }
+            return;
+        }
+        // ---- janela com foco ----
+        let Some(i) = self.focused() else { return };
+        if self.wins[i].internal {
+            if self.wins[i].app == APP_FILES { self.files_key(k); }
+            if code == key::ESC && self.wins[i].app != APP_FILES { self.close_window(i); }
+            return;
+        }
+        if k.code == key::LSHIFT || k.code == key::RSHIFT || k.code == key::LCTRL || k.code == key::RCTRL
+            || k.code == key::LALT || k.code == key::RALT { return; }
+        self.wins[i].push_key(k.pack());
+    }
+
+    fn files_key(&mut self, k: Key) {
+        let mut vis = [0u16; 64];
+        let n = panels::visible_files(&self.files[..self.nfiles], self.panels.files_filter, &mut vis);
+        if n == 0 { return; }
+        let cur = (0..n).find(|&j| vis[j] as i32 == self.panels.files_sel);
+        let step = if self.panels.files_view == 1 { 4 } else { 1 };
+        let next = match k.code {
+            key::DOWN => Some(cur.map(|c| (c + step).min(n - 1)).unwrap_or(0)),
+            key::UP => Some(cur.map(|c| c.saturating_sub(step)).unwrap_or(0)),
+            key::RIGHT if step > 1 => Some(cur.map(|c| (c + 1).min(n - 1)).unwrap_or(0)),
+            key::LEFT if step > 1 => Some(cur.map(|c| c.saturating_sub(1)).unwrap_or(0)),
+            key::ENTER => {
+                if self.panels.files_sel >= 0 { self.open_file(self.panels.files_sel as usize, false); }
+                None
+            }
+            _ if k.ctrl() && k.code == key::N => { self.new_text_doc(); None }
+            _ => None,
+        };
+        if let Some(j) = next {
+            self.panels.files_sel = vis[j] as i32;
+            if let Some(w) = self.find_app_win(APP_FILES) { self.damage(self.wins[w].r); }
+        }
+    }
+
+    // ===================================================== busca (Spotlight)
+
+    fn spot_rect(&self) -> Rect {
+        let w = 640;
+        Rect::new((self.w - w) / 2, self.h / 5, w, 56 + if self.query.n > 0 { 8 + 40 * self.spot_n.max(1) as i32 } else { 0 })
+    }
+
+    fn open_spotlight(&mut self) {
+        self.close_overlays();
+        self.spot = true;
+        self.query.clear();
+        self.spot_sel = 0;
+        self.spot_n = 0;
+        self.damage_all();
+    }
+
+    fn toggle_spotlight(&mut self) {
+        if self.spot { self.close_overlays(); } else { self.open_spotlight(); }
+    }
+
+    fn spotlight_key(&mut self, k: Key) {
+        let old = self.spot_rect();
+        match k.code {
+            key::ESC => { self.close_overlays(); return; }
+            key::ENTER | key::KPENTER => { self.spot_activate(); return; }
+            key::DOWN => { if self.spot_n > 0 { self.spot_sel = (self.spot_sel + 1) % self.spot_n; } }
+            key::UP => { if self.spot_n > 0 { self.spot_sel = (self.spot_sel + self.spot_n - 1) % self.spot_n; } }
+            key::BACKSPACE => {
+                // remove um caractere UTF-8 inteiro
+                while self.query.n > 0 {
+                    self.query.n -= 1;
+                    if self.query.b[self.query.n] & 0xC0 != 0x80 { break; }
+                }
+                self.search();
+            }
+            _ => {
+                if k.ch >= 32 && self.query.n < 60 {
+                    self.query.ch(k.ch);
+                    self.search();
+                }
+            }
+        }
+        self.damage(old.inset(-64));
+        self.damage(self.spot_rect().inset(-64));
+    }
+
+    fn search(&mut self) {
+        self.spot_n = 0;
+        self.spot_sel = 0;
+        let q = self.query;
+        let q = q.get();
+        if q.is_empty() { return; }
+        if let Some(v) = eval(q) {
+            self.spot_hits[0] = Hit::Calc(v);
+            self.spot_n = 1;
+        }
+        for a in APPS.iter() {
+            if self.spot_n < 8 && (contains_ci(a.name.as_bytes(), q) || contains_ci(a.keywords.as_bytes(), q)) {
+                self.spot_hits[self.spot_n] = Hit::App(a.id);
+                self.spot_n += 1;
+            }
+        }
+        for (s, a, i) in SEARCH_CMDS.iter() {
+            if self.spot_n < 8 && contains_ci(s.as_bytes(), q) {
+                self.spot_hits[self.spot_n] = Hit::Cmd(*a, s, *i);
+                self.spot_n += 1;
+            }
+        }
+        for f in 0..self.nfiles {
+            if self.spot_n < 8 && contains_ci(self.files[f].name(), q) {
+                self.spot_hits[self.spot_n] = Hit::File(f as u16);
+                self.spot_n += 1;
+            }
+        }
+    }
+
+    fn spot_activate(&mut self) {
+        if self.spot_n == 0 { return; }
+        let h = self.spot_hits[self.spot_sel];
+        self.close_overlays();
+        match h {
+            Hit::App(id) => self.launch(id, -1),
+            Hit::File(f) => self.open_file(f as usize, false),
+            Hit::Cmd(a, _, _) => self.do_action(a),
+            Hit::Calc(_) => {}
+        }
+    }
+
+    // ===================================================== Alt+Tab
+
+    fn cycle_switcher(&mut self, back: bool) {
+        if !self.switcher {
+            // lista por ordem de uso (z decrescente), inclusive minimizadas
+            let mut ids = [0usize; MAXWIN];
+            let mut n = 0;
+            for i in 0..MAXWIN { if self.wins[i].used { ids[n] = i; n += 1; } }
+            for a in 1..n {
+                let mut b = a;
+                while b > 0 && self.wins[ids[b - 1]].z < self.wins[ids[b]].z { ids.swap(b - 1, b); b -= 1; }
+            }
+            if n == 0 { return; }
+            self.sw_list = ids;
+            self.sw_n = n;
+            self.sw_sel = if n > 1 { 1 } else { 0 };
+            self.switcher = true;
+        } else if self.sw_n > 0 {
+            self.sw_sel = if back { (self.sw_sel + self.sw_n - 1) % self.sw_n } else { (self.sw_sel + 1) % self.sw_n };
+        }
+        self.damage(self.switcher_rect().inset(-30));
+    }
+
+    fn switcher_rect(&self) -> Rect {
+        let w = self.sw_n as i32 * 104 + 32;
+        Rect::new((self.w - w) / 2, (self.h - 150) / 2, w, 150)
+    }
+
+    fn finish_switcher(&mut self) {
+        self.switcher = false;
+        if self.sw_sel < self.sw_n {
+            let i = self.sw_list[self.sw_sel];
+            if self.wins[i].used { self.raise(i); }
+        }
+        self.damage_all();
+    }
+
+    // ===================================================== barra de menus
+
+    fn bar_titles(&self) -> ([i32; 8], [&'static str; 8], usize) {
+        let mut xs = [0i32; 8];
+        let mut names = [""; 8];
+        let f = self.focused().map(|i| self.wins[i].app);
+        let app_name = f.map(|a| catalog::app(a).name).unwrap_or("Pulsar");
+        let menus = f.map(|a| catalog::app(a).menus).unwrap_or(&[]);
+        let mut x = 12;
+        xs[0] = x;
+        names[0] = "";
+        x += 30;
+        xs[1] = x;
+        names[1] = app_name;
+        x += FONT_UI_BOLD.width(app_name.as_bytes()) + 22;
+        let mut n = 2;
+        for (title, _) in menus.iter() {
+            if n >= 6 { break; }
+            xs[n] = x;
+            names[n] = title;
+            x += FONT_UI.width(title.as_bytes()) + 22;
+            n += 1;
+        }
+        for t in ["Janela", "Ajuda"] {
+            xs[n] = x;
+            names[n] = t;
+            x += FONT_UI.width(t.as_bytes()) + 22;
+            n += 1;
+        }
+        (xs, names, n)
+    }
+
+    fn menubar_hit(&self, mx: i32) -> Option<usize> {
+        let (xs, names, n) = self.bar_titles();
+        for k in 0..n {
+            let w = if k == 0 { 26 } else if k == 1 { FONT_UI_BOLD.width(names[1].as_bytes()) + 16 } else { FONT_UI.width(names[k].as_bytes()) + 16 };
+            if mx >= xs[k] - 8 && mx < xs[k] - 8 + w { return Some(k); }
+        }
+        None
+    }
+
+    fn open_bar_menu(&mut self, k: usize) {
+        if let Some(m) = self.menu.take() { self.damage(m.rect.inset(-24)); }
+        let (xs, names, n) = self.bar_titles();
+        let f = self.focused();
+        let fa = f.map(|i| self.wins[i].app);
+        let items: &'static [MI] = match k {
+            0 => M_PULSAR,
+            1 => match fa {
+                Some(a) if catalog::app(a).kind == Kind::Process => &APP_MENU_PROC,
+                Some(_) => &APP_MENU_INTERNAL,
+                None => M_PULSAR,
+            },
+            _ if k == n - 2 => M_WINDOW,
+            _ if k == n - 1 => M_HELP,
+            _ => {
+                let menus = fa.map(|a| catalog::app(a).menus).unwrap_or(&[]);
+                menus.iter().find(|(t, _)| *t == names[k]).map(|m| m.1).unwrap_or(&[])
+            }
+        };
+        let r = ui::menu_rect(xs[k] - 8, MENU_H, items, self.w);
+        self.menu = Some(Menu { kind: MenuKind::Bar(k), rect: r, items, target_win: f, target_app: 0 });
+        self.damage(r.inset(-24));
+        self.damage(Rect::new(0, 0, self.w, MENU_H));
+    }
+
+    /// Itens de status a direita: 1 central de controle, 2 busca, 3 CPU, 4 rede.
+    fn status_hit(&self, mx: i32) -> u8 {
+        let x = self.w - 14 - FONT_UI.width(self.clock.get());
+        if mx >= x { return 1; }
+        let x = x - 30;
+        if mx >= x { return 1; }
+        let x = x - 28;
+        if mx >= x { return 2; }
+        let x = x - 28;
+        if mx >= x { return 4; }
+        3
+    }
+
+    // ===================================================== dock
+
+    fn dock_zone(&self) -> Rect {
+        let s = self.cfg.icon_size();
+        let depth = s * 2 + 30;
+        if self.cfg.dock_left { Rect::new(0, MENU_H, depth, self.h - MENU_H) }
+        else { Rect::new(0, self.h - depth, self.w, depth) }
+    }
+
+    fn dock_items(&self, out: &mut [u8; 16]) -> (usize, usize) {
+        let mut n = 0;
+        for &a in DOCK.iter() { out[n] = a; n += 1; }
+        let sep = n;
+        out[n] = DOCK_TAIL;
+        n += 1;
+        for w in self.wins.iter() {
+            if w.used && !DOCK.contains(&w.app) && w.app != DOCK_TAIL && !out[..n].contains(&w.app) && n < 16 {
+                out[n] = w.app;
+                n += 1;
+            }
+        }
+        (n, sep)
+    }
+
+    /// Calcula a posicao (ampliada) de cada icone e o retangulo do dock.
+    fn layout_dock(&mut self) {
+        let s = self.cfg.icon_size();
+        let pad = s * 18 / 100;
+        let gap = s * 14 / 100;
+        let sepw = gap * 2 + 1;
+        let mut items = [0u8; 16];
+        let (n, sep) = self.dock_items(&mut items);
+        let horiz = !self.cfg.dock_left;
+        let along_m = if horiz { self.mx } else { self.my };
+        let near = self.dock_zone().contains(self.mx, self.my) && self.dialog == Dialog::None && !self.spot;
+        // posicoes base (sem ampliacao)
+        let total0 = n as i32 * s + (n as i32 - 1) * gap + sepw;
+        let screen_len = if horiz { self.w } else { self.h - MENU_H };
+        let start0 = (if horiz { 0 } else { MENU_H }) + (screen_len - total0) / 2;
+        let mut sizes = [s; 16];
+        let mut centers = [0i32; 16];
+        let mut p = start0;
+        for k in 0..n {
+            if k == sep { p += sepw; }
+            centers[k] = p + s / 2;
+            p += s + gap;
+        }
+        if near && self.cfg.dock_magnify {
+            let range = s * 5 / 2;
+            for k in 0..n {
+                let d = (along_m - centers[k]).abs();
+                if d < range {
+                    let f = 256 - d * d * 256 / (range * range); // 0..256
+                    sizes[k] = s + s * 6 / 10 * f / 256;
+                }
+            }
+        }
+        let total: i32 = sizes[..n].iter().sum::<i32>() + (n as i32 - 1) * gap + sepw;
+        let start = (if horiz { 0 } else { MENU_H }) + (screen_len - total) / 2;
+        let thick = s + pad * 2;
+        let margin = 6;
+        let base = if horiz { Rect::new(start - pad, self.h - margin - thick, total + pad * 2, thick) }
+            else { Rect::new(margin, start - pad, thick, total + pad * 2) };
+        let mut p = start;
+        self.dock_n = n;
+        self.dock_hover = -1;
+        let now = uptime_ms();
+        for k in 0..n {
+            if k == sep { p += sepw; }
+            let sz = sizes[k];
+            let mut lift = 0;
+            let b = self.bounce[items[k] as usize];
+            if b > now {
+                let t = ((b - now) * 256 / 700) as i32; // 256 -> 0
+                lift = gfx::sin256(256 - t).abs() * (s / 2) / 1024 * t / 256;
+            }
+            let r = if horiz { Rect::new(p, base.bottom() - pad - sz - lift, sz, sz) }
+                else { Rect::new(base.x + pad + lift, p, sz, sz) };
+            self.dock_rects[k] = (r, items[k]);
+            if near && r.contains(self.mx, self.my) { self.dock_hover = k as i32; }
+            p += sz + gap;
+        }
+        let mut area = base;
+        for k in 0..n { area = area.union(&self.dock_rects[k].0); }
+        self.dock_area = area.inset(-12).union(&Rect::new(area.x, area.y - 40, area.w, 40));
+    }
+
+    fn dock_hit(&self, x: i32, y: i32) -> Option<u8> {
+        (0..self.dock_n).find(|&k| self.dock_rects[k].0.contains(x, y)).map(|k| self.dock_rects[k].1)
+    }
+
+    // ===================================================== periodico
+
+    fn fast_tick(&mut self, now: u64) {
+        // apps que morreram
+        for i in 0..MAXWIN {
+            let w = self.wins[i];
+            if !w.used || w.internal || w.pid < 0 { continue; }
+            if !is_alive(w.pid as usize) {
+                self.wins[i].used = false;
+                if self.capture == Some(i) { self.capture = None; }
+                if let Drag::Move { win, .. } | Drag::Resize { win, .. } = self.drag { if win == i { self.drag = Drag::None; } }
+                self.damage(w.outer());
+                self.damage(Rect::new(0, 0, self.w, MENU_H));
+                self.damage(self.dock_area);
+                if !w.want_close {
+                    let crashed = last_crash() == Some(w.pid as usize);
+                    let def = catalog::app(w.app);
+                    self.toast(def.icon, if crashed { "O aplicativo travou" } else { "O aplicativo foi encerrado" },
+                        if crashed { "O kernel isolou a falha; o resto do sistema segue normal." } else { "O processo terminou." });
+                }
+            } else if w.want_close && now > w.close_at {
+                // nao respondeu ao pedido de fechar: "finalizar tarefa"
+                kill(w.pid as usize);
+                self.wins[i].close_at = now + 100_000;
+                let def = catalog::app(w.app);
+                self.toast(def.icon, "O aplicativo não respondia", "Ele foi encerrado à força.");
+            }
+        }
+        // animacao do dock (pulo ao abrir um app)
+        if self.bounce.iter().any(|&b| b != 0) {
+            for b in self.bounce.iter_mut() { if *b != 0 && *b <= now { *b = 0; } }
+            self.damage(self.dock_area.inset(-4));
+            self.layout_dock();
+            self.damage(self.dock_area.inset(-4));
+        }
+        // avisos que expiraram
+        for k in 0..3 {
+            if self.toasts[k].active && now > self.toasts[k].until {
+                self.toasts[k].active = false;
+                self.damage(self.toast_area());
+            }
+        }
+        // cursor piscando na busca
+        let caret = (now / 530) % 2 == 0;
+        if self.spot && caret != self.caret_on {
+            self.caret_on = caret;
+            self.damage(self.spot_rect());
+        }
+    }
+
+    fn slow_tick(&mut self, now: u64) {
+        if self.update_clock() { self.damage(Rect::new(self.w - 340, 0, 340, MENU_H)); }
+        let mut changed = false;
+        for c in 0..8 {
+            let l = cpu_load(c).unwrap_or(0);
+            if l != self.loads[c] { self.loads[c] = l; changed = true; }
+        }
+        if changed {
+            if self.cfg.cpu_meter { self.damage(Rect::new(self.w - 400, 0, 400, MENU_H)); }
+            if self.cc_open { self.damage(self.cc_rect()); }
+        }
+        if (now / 500) % 4 == 0 {
+            let n = fs_count().min(MAX_FILES);
+            if n != self.nfiles {
+                self.refresh_files();
+                if let Some(w) = self.find_app_win(APP_FILES) { self.damage(self.wins[w].r); }
+            }
+            self.watch_config();
+            self.sys = sysinfo();
+            for app in [APP_ABOUT, APP_SETTINGS] {
+                if let Some(w) = self.find_app_win(app) { self.damage(self.wins[w].r); }
+            }
+        }
+    }
+
+    // ===================================================== composicao
+
+    fn render(&mut self) {
+        // o dock muda de tamanho quando apps entram/saem: repinta as duas areas
+        let old_dock = self.dock_area;
+        self.layout_dock();
+        if self.dock_area != old_dock {
+            self.damage(old_dock.union(&self.dock_area));
+        }
+        if self.ndmg == 0 { return self.flush_commits(); }
+        let rects = self.dmg;
+        let n = self.ndmg;
+        self.ndmg = 0;
+        let t0 = uptime_ms();
+        for k in 0..n {
+            self.compose(rects[k]);
+        }
+        let t1 = uptime_ms();
+        for k in 0..n {
+            fb_present(rects[k]);
+        }
+        let t2 = uptime_ms();
+        self.flush_commits();
+        if PERF_LOG {
+            let p = unsafe { &mut *(&raw mut PERF) };
+            p.0 += 1;
+            p.1 += t1 - t0;
+            p.2 += t2 - t1;
+            for k in 0..n { p.3 += (rects[k].w * rects[k].h) as u64; }
+            if p.0 == 120 {
+                let mut b = Buf::<96>::new();
+                b.s("[wm] 120 quadros: compor ").u(p.1 * 10 / p.0).s("/10 ms, apresentar ")
+                    .u(p.2 * 10 / p.0).s("/10 ms, ").u(p.3 / p.0 / 1000).s(" kpx/quadro\n");
+                write_bytes(b.get());
+                *p = (0, 0, 0, 0);
+            }
+        }
+    }
+
+    /// Libera os apps que aguardavam a composicao do seu quadro.
+    fn flush_commits(&mut self) {
+        for k in 0..self.npending {
+            let (pid, i) = self.pending[k];
+            let mut r = Msg::new(WM_OP_COMMIT);
+            if self.wins[i].used && self.wins[i].pid == pid as i64 { self.fill_poll(i, &mut r); }
+            reply(pid, &r);
+        }
+        self.npending = 0;
+    }
+
+    fn compose(&mut self, dmg: Rect) {
+        let mut scr = self.scr;
+        scr.set_clip(dmg);
+        // janelas: comeca pela mais alta que cobre todo o dano (oclusao)
+        let mut order = [0usize; MAXWIN];
+        let n = self.z_order(&mut order);
+        let mut start = 0;
+        let mut covered = false;
+        for k in (0..n).rev() {
+            let w = &self.wins[order[k]];
+            if w.opaque().contains_rect(&dmg) && (w.internal || w.committed) {
+                start = k;
+                covered = true;
+                break;
+            }
+        }
+        if !covered { scr.copy_from(&self.wall, dmg); }
+        let focus = self.focused();
+        for k in start..n {
+            let i = order[k];
+            if self.wins[i].outer().overlaps(&dmg) {
+                self.draw_window(&scr, i, focus == Some(i));
+            }
+        }
+        if let Some((r, _)) = self.snap {
+            scr.round_rect_a(r.inset(6), 14, self.th.accent, 50);
+            scr.round_border(r.inset(6), 14, self.th.accent, 200);
+        }
+        if self.dock_area.overlaps(&dmg) { self.draw_dock(&scr); }
+        if dmg.y < MENU_H { self.draw_menubar(&scr); }
+        if let Some(m) = self.menu {
+            if m.rect.inset(-24).overlaps(&dmg) {
+                let th = self.th;
+                let cfg = self.cfg;
+                let checks = |a: Action| match a {
+                    Action::FilesView(v) => self.panels.files_view == v,
+                    Action::FilesFilter(f) => self.panels.files_filter == f,
+                    Action::ToggleDark => cfg.dark,
+                    _ => false,
+                };
+                let mut hits = Hits::new();
+                ui::menu(&scr, m.rect, m.items, self.mx, self.my, &th, &mut hits, &checks);
+                self.menu_hits = hits;
+            }
+        }
+        if self.cc_open { self.draw_control_center(&scr); }
+        self.draw_toasts(&scr);
+        if self.spot { self.draw_spotlight(&scr); }
+        if self.switcher { self.draw_switcher(&scr); }
+        if self.dialog != Dialog::None { self.draw_dialog(&scr); }
+    }
+
+    fn draw_window(&mut self, scr: &Fb, i: usize, focused: bool) {
+        let w = self.wins[i];
+        let th = self.th;
+        let r = w.r;
+        let dark = th.dark;
+        scr.shadow(r, WIN_RAD, if focused { 30 } else { 18 }, if focused { 12 } else { 6 },
+            if focused { if dark { 160 } else { 95 } } else if dark { 110 } else { 55 });
+        if w.internal {
+            let ctx = Ctx {
+                scr, th: &th, cfg: &self.cfg, focused, mx: self.mx, my: self.my,
+                files: &self.files[..self.nfiles], thumbs: thumbs(), sys: &self.sys,
+                disk_free_kb: 8192u32.saturating_sub(self.files[..self.nfiles].iter().map(|f| f.size.div_ceil(1024)).sum::<u32>()),
+            };
+            let hits = &mut self.phits[w.app as usize];
+            hits.clear();
+            match w.app {
+                APP_FILES => panels::draw_files(&ctx, r, &mut self.panels, hits),
+                APP_SETTINGS => panels::draw_settings(&ctx, r, &self.panels, hits),
+                APP_ABOUT => panels::draw_about(&ctx, r, hits),
+                _ => panels::draw_help(&ctx, r),
+            }
+            if w.app == APP_ABOUT || w.app == APP_HELP {
+                let tr = Rect::new(r.x + 80, r.y, r.w - 160, TITLE_H);
+                scr.text_center(&FONT_UI_BOLD, tr, w.title(), if focused { th.text } else { th.text3 });
+            }
+        } else {
+            let c0 = w.client();
+            let covers = w.committed && w.slot >= 0 && w.commit_w >= c0.w && w.commit_h >= c0.h;
+            if !covers { scr.round_rect(r, WIN_RAD, th.win_bg); }
+            let tb = Rect::new(r.x, r.y, r.w, TITLE_H + WIN_RAD);
+            scr.round_rect_grad(tb, WIN_RAD, th.title_top, th.title_bot, 255);
+            scr.fill(Rect::new(r.x, r.y + TITLE_H - 1, r.w, 1), th.sep);
+            let c = w.client();
+            if w.committed && w.slot >= 0 {
+                let src = Fb::new(surface_ptr(w.slot as u64), SURF_W, SURF_H, SURF_W);
+                let (bw, bh) = (c.w.min(w.commit_w), c.h.min(w.commit_h));
+                let mut cc = *scr;
+                cc.set_clip(scr.clip.intersect(&c));
+                cc.blit_rounded(&src, 0, 0, bw, bh, c.x, c.y, WIN_RAD, false, bh >= c.h);
+            } else {
+                // ainda carregando: indicador discreto
+                let cx = c.x + c.w / 2;
+                let cy = c.y + c.h / 2;
+                let t = (uptime_ms() / 80) as i32;
+                for k in 0..8 {
+                    let a = k * 32;
+                    let alpha = 40 + ((k + t) % 8) as u32 * 25;
+                    scr.line16(cx * 16 + 9 * gfx::sin256(a) / 64, cy * 16 - 9 * gfx::cos256(a) / 64,
+                        cx * 16 + 16 * gfx::sin256(a) / 64, cy * 16 - 16 * gfx::cos256(a) / 64, 40, th.text2, alpha);
+                }
+                self.damage(Rect::new(cx - 20, cy - 20, 40, 40));
+            }
+            let tr = Rect::new(r.x + 76, r.y, r.w - 152, TITLE_H);
+            let tw = FONT_UI_BOLD.width(w.title()).min(tr.w);
+            scr.text_clip(&FONT_UI_BOLD, tr.x + (tr.w - tw) / 2, r.y + (TITLE_H - FONT_UI_BOLD.height) / 2, tr.w,
+                w.title(), if focused { th.text } else { th.text3 });
+        }
+        // semaforos
+        let hover = self.hover_light == Some(i);
+        let cols = [0xFF5F57, 0xFEBC2E, 0x28C840];
+        for (k, col) in cols.iter().enumerate() {
+            let (cx, cy) = (r.x + 20 + k as i32 * 20, r.y + 19);
+            let c = if focused || hover { *col } else if dark { 0x4A4B52 } else { 0xD3D3D8 };
+            scr.disc(cx, cy, 6, c, 255);
+            scr.ring(cx, cy, 6, 1, 0x000000, if focused || hover { 30 } else { 15 });
+            if hover {
+                let g = 0x5A1A10;
+                match k {
+                    0 => { scr.line(cx - 2, cy - 2, cx + 2, cy + 2, 1, g, 200); scr.line(cx + 2, cy - 2, cx - 2, cy + 2, 1, g, 200); }
+                    1 => scr.line(cx - 3, cy, cx + 3, cy, 1, 0x7A4A00, 220),
+                    _ => { scr.line(cx - 3, cy, cx + 3, cy, 1, 0x0A4A10, 220); scr.line(cx, cy - 3, cx, cy + 3, 1, 0x0A4A10, 220); }
+                }
+            }
+        }
+        scr.round_border(r, WIN_RAD, if dark { 0xFFFFFF } else { 0x000000 }, if dark { 34 } else { 40 });
+    }
+
+    fn draw_menubar(&mut self, scr: &Fb) {
+        let th = self.th;
+        let bar = Rect::new(0, 0, self.w, MENU_H);
+        if self.cfg.glass {
+            scr.copy_from(&self.blur, bar);
+            scr.fill_a(bar, if th.dark { 0x101114 } else { 0xF6F7FA }, if th.dark { 130 } else { 150 });
+        } else {
+            scr.fill(bar, th.title_top);
+        }
+        scr.hline(0, MENU_H - 1, self.w, 0x000000, if th.dark { 90 } else { 30 });
+        let (xs, names, n) = self.bar_titles();
+        let open = match self.menu { Some(Menu { kind: MenuKind::Bar(k), .. }) => Some(k), _ => None };
+        for k in 0..n {
+            let font = if k == 1 { &FONT_UI_BOLD } else { &FONT_UI };
+            let w = if k == 0 { 26 } else { font.width(names[k].as_bytes()) + 16 };
+            if open == Some(k) {
+                scr.round_rect_a(Rect::new(xs[k] - 8, 3, w, MENU_H - 6), 5, th.text, 40);
+            }
+            if k == 0 {
+                icons::logo(scr, (xs[0] + 5) * 16, (MENU_H / 2) * 16, 7 * 16, th.text);
+            } else {
+                scr.text(font, xs[k], (MENU_H - FONT_UI.height) / 2, names[k].as_bytes(), th.text);
+            }
+        }
+        // area de status (direita para a esquerda)
+        let mut x = self.w - 14;
+        let cw = FONT_UI.width(self.clock.get());
+        x -= cw;
+        scr.text(&FONT_UI, x, (MENU_H - FONT_UI.height) / 2, self.clock.get(), th.text);
+        x -= 30;
+        icons::sym(scr, Sym::Toggles, x + 6, 7, 15, th.text);
+        x -= 28;
+        icons::sym(scr, Sym::Search, x + 6, 7, 14, th.text);
+        x -= 28;
+        if self.net_up { icons::sym(scr, Sym::Network, x + 5, 6, 16, th.text); }
+        if self.cfg.cpu_meter {
+            let nc = (self.sys.ncpus as usize).clamp(1, 8) as i32;
+            x -= nc * 5 + 10;
+            for c in 0..nc {
+                let bx = x + c * 5;
+                let full = 14;
+                let hgt = (self.loads[c as usize] as i32 * full / 100).max(1);
+                scr.fill_a(Rect::new(bx, 7, 3, full), th.text, 50);
+                scr.fill(Rect::new(bx, 7 + full - hgt, 3, hgt), if self.loads[c as usize] > 80 { 0xFF453A } else { th.accent });
+            }
+        }
+    }
+
+    fn draw_dock(&mut self, scr: &Fb) {
+        let th = self.th;
+        let s = self.cfg.icon_size();
+        let pad = s * 18 / 100;
+        let n = self.dock_n;
+        if n == 0 { return; }
+        let mut items = [0u8; 16];
+        let (_, sep) = self.dock_items(&mut items);
+        let horiz = !self.cfg.dock_left;
+        // fundo de vidro
+        let first = self.dock_rects[0].0;
+        let last = self.dock_rects[n - 1].0;
+        let thick = s + pad * 2;
+        let bg = if horiz {
+            Rect::new(first.x - pad, self.h - 6 - thick, last.right() - first.x + pad * 2, thick)
+        } else {
+            Rect::new(6, first.y - pad, thick, last.bottom() - first.y + pad * 2)
+        };
+        let rad = (thick * 30 / 100).min(22);
+        scr.shadow(bg, rad, 20, 6, if th.dark { 120 } else { 60 });
+        ui::glass(scr, &self.blur, bg, rad, &th, self.cfg.glass);
+        for k in 0..n {
+            let (r, app) = self.dock_rects[k];
+            if k == sep {
+                if horiz {
+                    let x = r.x - s * 14 / 100 - 1;
+                    scr.vline(x, bg.y + pad, s, th.text, 50);
+                } else {
+                    let y = r.y - s * 14 / 100 - 1;
+                    scr.hline(bg.x + pad, y, s, th.text, 50);
+                }
+            }
+            let def = catalog::app(app);
+            scr.shadow(r, r.w * 23 / 100, (r.w / 8).max(3), 2, 60);
+            icons::draw(scr, def.icon, r.x, r.y, r.w);
+            if self.dock_hover == k as i32 && self.down && self.dock_area.contains(self.mx, self.my) {
+                scr.round_rect_a(r, r.w * 23 / 100, 0x000000, 70);
+            }
+            let running = self.wins.iter().any(|w| w.used && w.app == app);
+            if running {
+                if horiz { scr.disc(r.x + r.w / 2, bg.bottom() - 4, 2, th.text, 200); }
+                else { scr.disc(bg.x + 4, r.y + r.h / 2, 2, th.text, 200); }
+            }
+        }
+        if self.dock_hover >= 0 && self.menu.is_none() {
+            let (r, app) = self.dock_rects[self.dock_hover as usize];
+            let name = catalog::app(app).name.as_bytes();
+            if horiz {
+                ui::label_pill(scr, r.x + r.w / 2, r.y - 8, name, &th);
+            } else {
+                let w = FONT_UI.width(name) + 22;
+                ui::label_pill(scr, r.right() + 18 + w / 2, r.y + r.h / 2 + 13, name, &th);
+            }
+        }
+    }
+
+    fn cc_rect(&self) -> Rect {
+        Rect::new(self.w - 344, MENU_H + 6, 334, 420)
+    }
+
+    fn draw_control_center(&mut self, scr: &Fb) {
+        let th = self.th;
+        let r = self.cc_rect();
+        let mut hits = Hits::new();
+        scr.shadow(r, 16, 24, 8, if th.dark { 140 } else { 80 });
+        ui::glass(scr, &self.blur, r, 16, &th, self.cfg.glass);
+        if self.cfg.glass { scr.round_rect_a(r, 16, th.menu_bg, 90); }
+        let tile = |x: i32, y: i32, w: i32, h: i32| -> Rect {
+            let t = Rect::new(r.x + x, r.y + y, w, h);
+            scr.round_rect_a(t, 12, if th.dark { 0xFFFFFF } else { 0xFFFFFF }, if th.dark { 26 } else { 170 });
+            t
+        };
+        // rede
+        let t = tile(12, 12, 150, 64);
+        scr.disc(t.x + 26, t.y + 32, 15, if self.net_up { th.accent } else { th.text3 }, 255);
+        icons::sym(scr, Sym::Network, t.x + 17, t.y + 22, 18, 0xFFFFFF);
+        scr.text(&FONT_UI_BOLD, t.x + 50, t.y + 13, b"Rede", th.text);
+        scr.text(&FONT_SMALL, t.x + 50, t.y + 34, if self.net_up { b"10.0.2.15" as &[u8] } else { b"Desconectado" }, th.text2);
+        hits.push(t, Action::Launch(APP_NET));
+        // modo escuro
+        let t = tile(172, 12, 150, 64);
+        scr.disc(t.x + 26, t.y + 32, 15, if self.cfg.dark { th.accent } else { th.text3 }, 255);
+        icons::sym(scr, Sym::Moon, t.x + 17, t.y + 23, 18, 0xFFFFFF);
+        scr.text(&FONT_UI_BOLD, t.x + 50, t.y + 13, b"Modo escuro", th.text);
+        scr.text(&FONT_SMALL, t.x + 50, t.y + 34, if self.cfg.dark { b"Ativado" as &[u8] } else { b"Desativado" }, th.text2);
+        hits.push(t, Action::ToggleDark);
+        // CPUs
+        let nc = (self.sys.ncpus as i32).clamp(1, 8);
+        let t = tile(12, 86, 310, 40 + nc * 18);
+        let mut b = Buf::<48>::new();
+        b.s("Processadores · ").u(nc as u64).s(" núcleos");
+        scr.text(&FONT_UI_BOLD, t.x + 14, t.y + 10, b.get(), th.text);
+        for c in 0..nc {
+            let y = t.y + 36 + c * 18;
+            let l = self.loads[c as usize] as i32;
+            let mut lb = Buf::<16>::new();
+            lb.s("CPU ").u(c as u64);
+            scr.text(&FONT_SMALL, t.x + 14, y - 1, lb.get(), th.text2);
+            let bar = Rect::new(t.x + 64, y + 3, 190, 8);
+            scr.round_rect(bar, 4, if th.dark { 0x3A3B41 } else { 0xE2E2E8 });
+            scr.round_rect(Rect::new(bar.x, bar.y, (bar.w * l / 100).max(8), 8), 4, if l > 80 { 0xFF453A } else { th.accent });
+            lb.clear().u(l as u64).s("%");
+            scr.text_right(&FONT_SMALL, t.right() - 12, y - 1, lb.get(), th.text2);
+        }
+        hits.push(t, Action::Launch(APP_MONITOR));
+        // papel de parede
+        let ty = t.bottom() + 10 - r.y;
+        let t = tile(12, ty, 310, 92);
+        scr.text(&FONT_UI_BOLD, t.x + 14, t.y + 8, b"Papel de parede", th.text);
+        for k in 0..6 {
+            let tr = Rect::new(t.x + 14 + k * 48, t.y + 36, 42, 42);
+            let src = Fb::new(thumbs().as_ptr().wrapping_add(k as usize * (THUMB_W * THUMB_H) as usize) as *mut u32,
+                THUMB_W, THUMB_H, THUMB_W);
+            scr.blit_rounded(&src, (THUMB_W - 42) / 2, (THUMB_H - 42) / 2, 42, 42, tr.x, tr.y, 8, true, true);
+            if self.cfg.wallpaper == k as u8 { scr.round_border(tr.inset(-2), 6, th.accent, 255); }
+            hits.push(tr, Action::SetWallpaper(k as u8));
+        }
+        // destaque
+        let ty = t.bottom() + 10 - r.y;
+        let t = tile(12, ty, 310, 56);
+        scr.text(&FONT_UI_BOLD, t.x + 14, t.y + 8, b"Destaque", th.text);
+        for (k, (col, _)) in theme::ACCENTS.iter().enumerate() {
+            let sr = ui::swatch(scr, t.x + 120 + k as i32 * 24, t.y + 28, *col, self.cfg.accent == k as u8, &th);
+            hits.push(sr, Action::SetAccent(k as u8));
+        }
+        // botao
+        let b = Rect::new(r.x + 12, t.bottom() + 10, 310, 30);
+        ui::button(scr, b, "Configurações do Sistema...", &th, false, b.contains(self.mx, self.my));
+        hits.push(b, Action::Settings(0));
+        self.cc_hits = hits;
+    }
+
+    fn draw_toasts(&mut self, scr: &Fb) {
+        let th = self.th;
+        let mut y = MENU_H + 10;
+        for t in self.toasts.iter() {
+            if !t.active { continue; }
+            let r = Rect::new(self.w - 350, y, 336, 68);
+            scr.shadow(r, 14, 18, 6, if th.dark { 130 } else { 70 });
+            ui::glass(scr, &self.blur, r, 14, &th, self.cfg.glass);
+            if self.cfg.glass { scr.round_rect_a(r, 14, th.menu_bg, 120); }
+            icons::draw(scr, t.icon, r.x + 12, r.y + 14, 40);
+            scr.text_clip(&FONT_UI_BOLD, r.x + 64, r.y + 12, r.w - 76, &t.title[..t.tl], th.text);
+            scr.text_clip(&FONT_SMALL, r.x + 64, r.y + 36, r.w - 76, &t.body[..t.bl], th.text2);
+            y += 78;
+        }
+    }
+
+    fn draw_spotlight(&mut self, scr: &Fb) {
+        let th = self.th;
+        let r = self.spot_rect();
+        scr.shadow(r, 16, 34, 14, if th.dark { 170 } else { 100 });
+        scr.round_rect_a(r, 16, th.menu_bg, 250);
+        scr.round_border(r, 16, if th.dark { 0xFFFFFF } else { 0x000000 }, 34);
+        let f = Rect::new(r.x + 14, r.y + 10, r.w - 28, 36);
+        icons::sym(scr, Sym::Search, f.x + 4, f.y + 8, 20, th.text2);
+        let tx = f.x + 36;
+        let ty = f.y + (36 - FONT_TITLE.height) / 2;
+        if self.query.n == 0 {
+            scr.text(&FONT_TITLE, tx, ty, "Buscar apps, arquivos e comandos".as_bytes(), th.text3);
+            if self.caret_on { scr.fill(Rect::new(tx - 2, f.y + 6, 2, 24), th.accent); }
+        } else {
+            let w = scr.text(&FONT_TITLE, tx, ty, self.query.get(), th.text);
+            if self.caret_on { scr.fill(Rect::new(tx + w + 1, f.y + 6, 2, 24), th.accent); }
+        }
+        if self.query.n == 0 { return; }
+        scr.hline(r.x, r.y + 54, r.w, th.sep, 255);
+        if self.spot_n == 0 {
+            scr.text(&FONT_UI, r.x + 24, r.y + 70, "Nenhum resultado".as_bytes(), th.text2);
+            return;
+        }
+        for k in 0..self.spot_n {
+            let row = Rect::new(r.x + 8, r.y + 60 + k as i32 * 40, r.w - 16, 38);
+            let sel = k == self.spot_sel;
+            if sel { scr.round_rect(row, 8, th.accent); }
+            let tc = if sel { 0xFFFFFF } else { th.text };
+            let tc2 = if sel { 0xE6EEFF } else { th.text2 };
+            let (icon, name, kind): (Icon, Buf<40>, &str) = match self.spot_hits[k] {
+                Hit::App(id) => { let mut b = Buf::new(); b.s(catalog::app(id).name); (catalog::app(id).icon, b, "Aplicativo") }
+                Hit::File(f) => { let fi = self.files[f as usize]; let mut b = Buf::new(); b.bytes(fi.name()); (panels::file_icon(&fi), b, panels::file_kind_label(&fi)) }
+                Hit::Cmd(_, s, i) => { let mut b = Buf::new(); b.s(s); (i, b, "Comando") }
+                Hit::Calc(v) => { let mut b = Buf::new(); b.s("= ").i(v); (Icon::Calc, b, "Calculadora") }
+            };
+            icons::draw(scr, icon, row.x + 8, row.y + 5, 28);
+            scr.text(&FONT_UI, row.x + 46, row.y + 9, name.get(), tc);
+            scr.text_right(&FONT_SMALL, row.right() - 12, row.y + 11, kind.as_bytes(), tc2);
+        }
+    }
+
+    fn draw_switcher(&mut self, scr: &Fb) {
+        let th = self.th;
+        let r = self.switcher_rect();
+        scr.shadow(r, 20, 30, 10, if th.dark { 160 } else { 90 });
+        scr.round_rect_a(r, 20, th.menu_bg, 252);
+        scr.round_border(r, 20, if th.dark { 0xFFFFFF } else { 0x000000 }, 30);
+        for k in 0..self.sw_n {
+            let w = self.wins[self.sw_list[k]];
+            let cell = Rect::new(r.x + 16 + k as i32 * 104, r.y + 16, 96, 96);
+            if k == self.sw_sel { scr.round_rect_a(cell, 14, th.text, 40); }
+            icons::draw(scr, catalog::app(w.app).icon, cell.x + 14, cell.y + 12, 68);
+            if w.minimized { scr.disc(cell.x + 48, cell.bottom() - 6, 2, th.text2, 255); }
+        }
+        if self.sw_sel < self.sw_n {
+            let w = self.wins[self.sw_list[self.sw_sel]];
+            scr.text_center(&FONT_UI_BOLD, Rect::new(r.x, r.bottom() - 34, r.w, 24), w.title(), th.text);
+        }
+    }
+
+    fn draw_dialog(&mut self, scr: &Fb) {
+        let th = self.th;
+        scr.fill_a(Rect::new(0, 0, self.w, self.h), 0x000000, 70);
+        let r = Rect::new((self.w - 420) / 2, (self.h - 190) / 2, 420, 190);
+        scr.shadow(r, 14, 40, 16, 150);
+        scr.round_rect(r, 14, th.menu_bg);
+        scr.round_border(r, 14, if th.dark { 0xFFFFFF } else { 0x000000 }, 34);
+        icons::draw(scr, Icon::Pulsar, r.x + 24, r.y + 26, 56);
+        scr.text(&FONT_UI_BOLD, r.x + 98, r.y + 30, "Deseja desligar o computador agora?".as_bytes(), th.text);
+        scr.text(&FONT_UI, r.x + 98, r.y + 56, "Os aplicativos abertos serão fechados".as_bytes(), th.text2);
+        scr.text(&FONT_UI, r.x + 98, r.y + 76, "e o QEMU será encerrado.".as_bytes(), th.text2);
+        let mut hits = Hits::new();
+        let b1 = Rect::new(r.right() - 250, r.bottom() - 50, 110, 30);
+        let b2 = Rect::new(r.right() - 130, r.bottom() - 50, 110, 30);
+        ui::button(scr, b1, "Cancelar", &th, false, b1.contains(self.mx, self.my));
+        ui::button(scr, b2, "Desligar", &th, true, b2.contains(self.mx, self.my));
+        hits.push(b1, Action::DialogCancel);
+        hits.push(b2, Action::DialogConfirm);
+        self.dialog_hits = hits;
+    }
 }
 
-/// Dois retangulos se sobrepoem?
-fn rects_overlap(a:Rect,b:Rect)->bool{
-    a.x < b.x+b.w && b.x < a.x+a.w && a.y < b.y+b.h && b.y < a.y+a.h
+/// Menu com o nome do app (segundo item da barra).
+static APP_MENU_PROC: [MI; 4] = [
+    MI("Sobre o Pulsar OS", Action::About, ""),
+    SEP,
+    MI("Encerrar", Action::QuitApp, "Ctrl+Q"),
+    MI("Forçar encerramento", Action::ForceQuit, ""),
+];
+static APP_MENU_INTERNAL: [MI; 3] = [
+    MI("Sobre o Pulsar OS", Action::About, ""),
+    SEP,
+    MI("Fechar", Action::CloseWin, "Ctrl+W"),
+];
+
+/// Busca sem diferenciar maiusculas (ASCII) nem acentos comuns.
+fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    let fold = |s: &[u8], out: &mut [u8; 96]| -> usize {
+        let mut n = 0;
+        let mut i = 0;
+        while i < s.len() && n < 96 {
+            let cp = text::next_char(s, &mut i);
+            let c = match cp {
+                0xE0..=0xE5 | 0xC0..=0xC5 => b'a',
+                0xE8..=0xEB | 0xC8..=0xCB => b'e',
+                0xEC..=0xEF | 0xCC..=0xCF => b'i',
+                0xF2..=0xF6 | 0xD2..=0xD6 => b'o',
+                0xF9..=0xFC | 0xD9..=0xDC => b'u',
+                0xE7 | 0xC7 => b'c',
+                c if c < 128 => (c as u8).to_ascii_lowercase(),
+                _ => b'?',
+            };
+            out[n] = c;
+            n += 1;
+        }
+        n
+    };
+    let (mut h, mut q) = ([0u8; 96], [0u8; 96]);
+    let hn = fold(hay, &mut h);
+    let qn = fold(needle, &mut q);
+    if qn == 0 { return false; }
+    (0..=hn.saturating_sub(qn)).any(|p| hn >= qn && h[p..p + qn] == q[..qn])
 }
 
-fn blit_surface(fb:&Fb, slot:u64, dst:Rect){
-    let surf=surf_ptr(slot);
-    let cw=(dst.w.min(SURF_W).min(fb.w.saturating_sub(dst.x))) as usize;
-    let ch=dst.h.min(SURF_H);
-    let base=fb.base_ptr();
-    for y in 0..ch{
-        let dy=dst.y+y;
-        if dy>=fb.h {break;}
-        let so=(y*SURF_W) as usize;
-        let doo=(dy*fb.w+dst.x) as usize;
-        unsafe{ core::ptr::copy_nonoverlapping(surf.add(so), base.add(doo), cw); }
+/// Avalia expressoes inteiras simples (+ - * / e parenteses) da busca.
+fn eval(s: &[u8]) -> Option<i64> {
+    if !s.iter().any(|c| b"+-*/x".contains(c)) || !s.iter().any(|c| c.is_ascii_digit()) { return None; }
+    if !s.iter().all(|c| c.is_ascii_digit() || b"+-*/x() ".contains(c)) { return None; }
+    let mut p = 0;
+    let v = expr(s, &mut p)?;
+    skip_ws(s, &mut p);
+    if p == s.len() { Some(v) } else { None }
+}
+fn skip_ws(s: &[u8], p: &mut usize) { while *p < s.len() && s[*p] == b' ' { *p += 1; } }
+fn expr(s: &[u8], p: &mut usize) -> Option<i64> {
+    let mut v = term(s, p)?;
+    loop {
+        skip_ws(s, p);
+        match s.get(*p) {
+            Some(b'+') => { *p += 1; v = v.checked_add(term(s, p)?)?; }
+            Some(b'-') => { *p += 1; v = v.checked_sub(term(s, p)?)?; }
+            _ => return Some(v),
+        }
     }
 }
-
-fn compose_wallpaper(fb:&Fb,w:u32,h:u32){
-    let wf=fb.wall_fb();
-    // gradiente base vertical (mais escuro no topo, azul profundo embaixo)
-    wf.vgrad(Rect{x:0,y:0,w,h},WALL_TOP,WALL_BOT);
-    // aurora principal (canto superior, luz fria)
-    let gx=(w as i32*40/100) as i32; let gy=(h as i32*28/100) as i32;
-    // segunda luz (canto inferior direito, tom mais quente/roxo)
-    let gx2=(w as i32*82/100) as i32; let gy2=(h as i32*78/100) as i32;
-    for y in 0..h{for x in 0..w{
-        let (xi,yi)=(x as i32,y as i32);
-        // aurora 1
-        let dx=xi-gx; let dy=yi-gy; let dd=(dx*dx+dy*dy)as u32;
-        if dd<520*520{let a=(58u32).saturating_sub(isqrt(dd)/10); if a>0{wf.blend(x,y,AURORA,a);}}
-        // aurora 2 (roxo suave)
-        let ex=xi-gx2; let ey=yi-gy2; let ee=(ex*ex+ey*ey)as u32;
-        if ee<460*460{let a=(34u32).saturating_sub(isqrt(ee)/12); if a>0{wf.blend(x,y,0x007A6ACE,a);}}
-        // vinheta suave nas bordas (escurece cantos p/ profundidade)
-        let mx=(xi-(w as i32/2)).abs(); let my=(yi-(h as i32/2)).abs();
-        let edge=((mx*mx+my*my) as u32).saturating_sub(360*360);
-        if edge>0 { let v=(isqrt(edge)/26).min(40); if v>0 { wf.blend(x,y,0x00000000,v); } }
-    }}
-}
-fn draw_menubar(fb:&Fb,w:u32,_secs:u32,wins:&[Win;MAXWIN],zmax:u8,menu_open:i32){
-    fb.vgrad_alpha(Rect{x:0,y:0,w,h:MENU_H},0x001A2439,0x00121A2C,235);
-    fb.pulsar_logo(20,MENU_H/2,9,WHITE,false);
-    let app=app_menu_name(wins,zmax);
-    let ak=focused_app(wins,zmax).map(|i|wins[i].app_kind).unwrap_or(0);
-    let lab=menu_labels_for(ak);
-    let xs=menu_x_positions(wins,zmax);
-    // realca o menu aberto; nome do app sempre em destaque
-    let hl=|i:usize|->u32{ if menu_open==i as i32 {WHITE} else if i==0 {WHITE} else {0x00C8D4E8} };
-    fb.text_ui(xs[0],6,app,hl(0));
-    // menus do app (pulando ausentes)
-    if !lab[0].is_empty(){ fb.text_ui_a(xs[1],6,lab[0],hl(1),215); }
-    if !lab[1].is_empty(){ fb.text_ui_a(xs[2],6,lab[1],hl(2),215); }
-    if !lab[2].is_empty(){ fb.text_ui_a(xs[3],6,lab[2],hl(3),215); }
-    // canto direito: indicador discreto do Pulsar (sem uptime)
-    let brand=b"Pulsar OS";
-    let bw=Fb::text_ui_width(brand);
-    fb.text_ui_a(w as i32-bw-16,6,brand,0x0090A0C0,150);
-}
-fn draw_dropdown(fb:&Fb,menu:i32,wins:&[Win;MAXWIN],zmax:u8){
-    let xs=menu_x_positions(wins,zmax);
-    let dx=xs[menu as usize] as u32;
-    let items=dropdown_items(menu,wins,zmax);
-    let cnt=items.iter().filter(|x|!x.is_empty()).count() as u32;
-    let boxr=Rect{x:dx-6,y:MENU_H,w:190,h:cnt*26+8};
-    fb.drop_shadow(boxr,10,8);
-    fb.round_rect(boxr,10,0x00FDFEFF);
-    fb.round_frame(boxr,10,0x00D0D8E4,180);
-    let mut yy=MENU_H+4;
-    for it in items.iter(){
-        if it.is_empty(){continue;}
-        fb.text_ui(dx as i32+8,yy as i32,it,INK);
-        yy+=26;
+fn term(s: &[u8], p: &mut usize) -> Option<i64> {
+    let mut v = atom(s, p)?;
+    loop {
+        skip_ws(s, p);
+        match s.get(*p) {
+            Some(b'*') | Some(b'x') => { *p += 1; v = v.checked_mul(atom(s, p)?)?; }
+            Some(b'/') => { *p += 1; let d = atom(s, p)?; if d == 0 { return None; } v /= d; }
+            _ => return Some(v),
+        }
     }
 }
-
-fn draw_chrome(fb:&Fb,r:Rect,title:&[u8],focused:bool){
-    fb.drop_shadow(r,18,if focused{20}else{10});
-    fb.round_rect_grad(r,16,GLASS,GLASS_BOT);
-    // barra de titulo com leve gradiente
-    fb.round_rect_grad(Rect{x:r.x,y:r.y,w:r.w,h:TITLE_H},16,
-        if focused{0x00FFFFFF}else{0x00F4F6FA}, if focused{0x00F6F8FC}else{0x00EDEFF4});
-    // linha separadora sutil sob a barra de titulo (macOS-like)
-    fb.fill(Rect{x:r.x+1,y:r.y+TITLE_H-1,w:r.w-2,h:1}, if focused{0x00E2E6EE}else{0x00E8EAF0});
-    // semaforos: contorno leve quando focado, cinza quando nao
-    fb.disc(r.x+24,r.y+20,7,if focused{0x00FF5F57}else{0x00D0D4DB});
-    fb.disc(r.x+48,r.y+20,7,if focused{0x00FEBC2E}else{0x00D0D4DB});
-    fb.disc(r.x+72,r.y+20,7,if focused{0x0028C840}else{0x00D0D4DB});
-    if focused {
-        // brilho sutil no topo de cada semaforo
-        fb.disc(r.x+24,r.y+18,2,0x00FF9089);
-        fb.disc(r.x+48,r.y+18,2,0x00FFD46B);
-        fb.disc(r.x+72,r.y+18,2,0x0060DE7C);
-    }
-    let tw=Fb::text_ui_width(title);
-    fb.text_ui(r.x as i32+r.w as i32/2-tw/2,r.y as i32+10,title,if focused{INK}else{INK_DIM});
-    fb.round_frame(r,16,WHITE,if focused{70}else{35});
-}
-fn draw_files(fb:&Fb,win:&Win,cache:&[FileMeta;9],nfiles:u32,focused:bool,sel:i32,mouse:&Mouse){
-    draw_chrome(fb,win.r,b"Arquivos",focused);
-    let cx=(win.r.x+20)as i32; let cy=(win.r.y+52)as i32;
-    for i in 0..nfiles.min(9){
-        let fm=&cache[i as usize];
-        let ne=fm.nlen as usize; let name=fm.name; let size=fm.size; let kind=fm.kind;
-        let y=cy+(i as i32)*30;
-        let rr=Rect{x:win.r.x+10,y:y as u32-4,w:win.r.w-20,h:28};
-        if sel==i as i32{fb.round_rect(rr,6,0x005B9BF0);}
-        else if rr.contains(mouse.x,mouse.y){fb.round_rect(rr,6,0x00E8EEFA);}
-        let tc=if sel==i as i32{WHITE}else{INK};
-        let ic=if kind==1{0x0032D256}else{0x00579BFF};
-        fb.round_rect(Rect{x:cx as u32,y:(y+3)as u32,w:18,h:18},4,if sel==i as i32{WHITE}else{ic});
-        fb.text_ui(cx+28,y,&name[..ne],tc);
-        if size>=0{let mut sb=[0u8;10];let si=u32_dec(size as u32,&mut sb);
-            let sw=Fb::text_ui_width(&sb[si..])+18;
-            fb.text_ui_a((win.r.x+win.r.w)as i32-sw,y,&sb[si..],if sel==i as i32{WHITE}else{INK_DIM},220);}
-    }
-    fb.text_ui_a(cx,(win.r.y+win.r.h-24)as i32,b"Duplo-clique abre no editor",INK_DIM,160);
-}
-fn draw_dock(fb:&Fb,dx:u32,dy:u32,dw:u32,icon:u32,gap:u32,n:u32,apps:&[AppDef;8],bounce:&mut[u32;8],wins:&[Win;MAXWIN],mouse:&Mouse){
-    let dock=Rect{x:dx,y:dy,w:dw,h:DOCK_H};
-    fb.drop_shadow(dock,24,9);
-    fb.round_rect_grad(dock,24,0x99F2F5FC,0x77DEE6F4);
-    fb.round_frame(dock,24,WHITE,70);
-    for i in 0..n{
-        let b=&mut bounce[i as usize]; let lift=if *b>0{*b/2}else{0}; if *b>0{*b-=1;}
-        let ix=dx+gap+i*(icon+gap); let iy=dy+12-lift;
-        let a=&apps[i as usize];
-        let hover=Rect{x:ix,y:dy+12,w:icon,h:icon}.contains(mouse.x,mouse.y);
-        fb.drop_shadow(Rect{x:ix,y:iy,w:icon,h:icon},14,4);
-        let top=Fb::lerp(a.color,WHITE,if hover{120}else{75});
-        fb.round_rect_grad(Rect{x:ix,y:iy,w:icon,h:icon},14,top,a.color);
-        fb.round_frame(Rect{x:ix,y:iy,w:icon,h:icon},14,WHITE,55);
-        let g=[a.glyph]; let gw=Fb::text_ui_width(&g);
-        fb.text_ui(ix as i32+(icon as i32-gw)/2,iy as i32+icon as i32/2-9,&g,WHITE);
-        let running=if a.bin.is_empty(){wins[0].open}else{wins.iter().any(|x|x.used&&x.app_kind==a.kind&&x.open)};
-        if running{fb.disc(ix+icon/2,dy+DOCK_H-6,2,WHITE);}
+fn atom(s: &[u8], p: &mut usize) -> Option<i64> {
+    skip_ws(s, p);
+    match s.get(*p)? {
+        b'(' => { *p += 1; let v = expr(s, p)?; skip_ws(s, p); if s.get(*p) == Some(&b')') { *p += 1; Some(v) } else { None } }
+        b'-' => { *p += 1; Some(-atom(s, p)?) }
+        c if c.is_ascii_digit() => {
+            let mut v: i64 = 0;
+            while let Some(c) = s.get(*p).filter(|c| c.is_ascii_digit()) {
+                v = v.checked_mul(10)?.checked_add((c - b'0') as i64)?;
+                *p += 1;
+            }
+            Some(v)
+        }
+        _ => None,
     }
 }

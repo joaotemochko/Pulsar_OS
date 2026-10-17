@@ -110,10 +110,24 @@ el0_sync_entry:
     RESTORE_CONTEXT
     eret
 
-/* IRQ (timer). */
+/* IRQ (timer / IPI), vindo de EL0 ou do laco ocioso em EL1. */
 irq_entry:
     SAVE_CONTEXT
     mov     x0, sp
     bl      rust_irq_handler
+    RESTORE_CONTEXT
+    eret
+
+/* arch_enter_frame(ctx, stack_top): copia o Context (288 bytes, fora da
+   pilha) para o topo da pilha desta CPU e retorna para ele. */
+.global arch_enter_frame
+arch_enter_frame:
+    sub     sp, x1, #288
+    mov     x2, sp
+    mov     x3, #36
+1:  ldr     x4, [x0], #8
+    str     x4, [x2], #8
+    subs    x3, x3, #1
+    b.ne    1b
     RESTORE_CONTEXT
     eret

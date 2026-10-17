@@ -1,17 +1,11 @@
-# Calculadora do Pulsar (em C)
+# Calculadora (C)
 
-Segundo app funcional em C (depois do terminal). Cliente do Window Manager:
-superficie propria, recebe cliques locais (ev.mx/ev.my) e desenha um teclado
-no estilo macOS (operadores em laranja, numeros em cinza).
+Calculadora no estilo macOS, cliente do WM com superfície própria.
 
-## Recursos
-- Aritmetica inteira: + - * / , troca de sinal (+/-), porcentagem, limpar (C).
-- Roteamento de clique do WM para os botoes.
-- Integra com a barra de menu por-programa: menu "Calcular > Limpar".
-- Display alinhado a direita com a fonte AA Poppins.
+- Ponto fixo com 6 casas decimais e formatação brasileira (`1.234,56`).
+- Operações `+ − × ÷`, `%`, troca de sinal, `AC`; Backspace apaga o último dígito.
+- Teclado completo: dígitos, `+ - * /`, `,`/`.`, Enter/`=`, Esc.
+- Realce ao passar o mouse e ao pressionar; segue o tema claro/escuro.
+- Menu da barra: **Calcular > Limpar**.
 
-## Compilar
-```
-cd user/calc && ./build.sh
-python3 tools/mkpulse.py calc.elf calc.pulse 0x12400000
-```
+Compilada pelo `Makefile` da raiz (`make`, ou `make ARCH=riscv64`).
