@@ -1,0 +1,3 @@
+[submodule "user/vela"]
+	path = user/vela
+	url = https://github.com/joaotemochko/VelaBrowser.git
