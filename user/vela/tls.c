@@ -84,6 +84,12 @@ static void save_session(Tls* t){
     br_ssl_engine_get_session_parameters(&t->sc.eng, &sessions[slot].p);
 }
 
+int tls_ready(Tls* t){ return t->ready; }
+int tls_has_session(const char* host){
+    for(int i = 0; i < nsessions; i++) if(!strcmp(sessions[i].host, host)) return 1;
+    return 0;
+}
+
 int tls_error(Tls* t){ int e = br_ssl_engine_last_error(&t->sc.eng); return e ? e : t->ioerr; }
 
 /* Avanca o motor sem bloquear: envia o que der de `out` (a partir de

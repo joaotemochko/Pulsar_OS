@@ -38,7 +38,7 @@ pub enum Action {
     SetSeconds(bool),
     SetCpuMeter(bool),
     SetGlass(bool),
-    SetLayout(bool),
+    SetLayout(Layout),
     SetDockMinimize(bool),
     SettingsPage(u8),
     EditConfig,

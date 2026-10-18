@@ -19,6 +19,7 @@ mod catalog;
 mod config;
 mod cursor;
 mod panels;
+mod sprites;
 mod ui;
 mod wallpaper;
 
@@ -54,6 +55,10 @@ const POLL_MAX_MS: u64 = 250;
 /// Imprime na serial o custo medio de composicao/apresentacao.
 const PERF_LOG: bool = false;
 static mut PERF: (u64, u64, u64, u64) = (0, 0, 0, 0); // quadros, ms compondo, ms apresentando, px
+static mut PHASE: [u64; 6] = [0; 6]; // ms: fundo, janelas, dock, resto; desenhos do dock, composicoes
+/// Relogio das medicoes: so custa um syscall com PERF_LOG ligado.
+#[inline(always)]
+fn perf_ms() -> u64 { if PERF_LOG { uptime_ms() } else { 0 } }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WState { Normal, Max, SnapL, SnapR }
@@ -383,7 +388,7 @@ impl Wm {
 
     fn apply_config(&mut self, wallpaper_changed: bool) {
         self.th = Theme::new(self.cfg.dark, self.cfg.accent_rgb());
-        self.kb.layout = if self.cfg.abnt2 { Layout::Abnt2 } else { Layout::Us };
+        self.kb.layout = self.cfg.layout;
         if wallpaper_changed {
             let t0 = uptime_ms();
             wallpaper::render(self.cfg.wallpaper, &self.wall);
@@ -392,8 +397,46 @@ impl Wm {
             b.s("[wm] papel de parede '").s(config::WALLPAPERS[self.cfg.wallpaper as usize % 6])
                 .s("' gerado em ").u(uptime_ms() - t0).s(" ms\n");
             write_bytes(b.get());
+            if PERF_LOG { self.bench(); }
         }
         self.damage_all();
+    }
+
+    /// Microbenchmark das primitivas (so com PERF_LOG): ms por 20 execucoes.
+    fn bench(&mut self) {
+        let scr = self.scr;
+        let r = Rect::new(200, 150, 640, 420);
+        let th = self.th;
+        let mut b = Buf::<512>::new();
+        b.s("[bench] 640x420 x20 (ms):");
+        macro_rules! t { ($name:expr, $e:expr) => {{
+            let t0 = uptime_ms();
+            for _ in 0..20 { $e; }
+            b.s(" ").s($name).s("=").u(uptime_ms() - t0);
+        }}}
+        t!("copy", scr.copy_from(&self.wall, r));
+        t!("fill", scr.fill(r, 0x123456));
+        t!("filla", scr.fill_a(r, 0x123456, 128));
+        t!("rrect", scr.round_rect(r, WIN_RAD, th.win_bg));
+        t!("grad", scr.round_rect_grad(Rect::new(r.x, r.y, r.w, 52), WIN_RAD, th.title_top, th.title_bot, 255));
+        t!("shadow", scr.shadow(r, WIN_RAD, 30, 12, 95));
+        t!("blitr", scr.blit_rounded(&self.wall, r.x, r.y, r.w, r.h, r.x, r.y, WIN_RAD, false, true));
+        t!("border", scr.round_border(r, WIN_RAD, 0, 40));
+        t!("text", scr.text(&FONT_UI, r.x, r.y, b"The quick brown fox jumps over the lazy dog 0123456789", 0));
+        t!("lights", for k in 0..3 { scr.disc(r.x + 20 + k * 20, r.y + 19, 6, 0xFF5F57, 255); scr.ring(r.x + 20 + k * 20, r.y + 19, 6, 1, 0, 30); });
+        t!("glass", ui::glass(&scr, &self.blur, Rect::new(300, 700, 600, 80), 22, &th, true));
+        t!("icon", icons::draw(&scr, catalog::app(0).icon, 400, 300, 56));
+        self.layout_dock();
+        t!("dock", self.draw_dock(&scr));
+        let bg = Rect::new(330, 714, 620, 76);
+        t!("dshadow", scr.shadow(bg, 22, 20, 6, 60));
+        t!("dglass", ui::glass(&scr, &self.blur, bg, 22, &th, true));
+        t!("ishadow", for k in 0..9 { let r = Rect::new(340 + k * 64, 724, 56, 56); scr.shadow(r, 12, 7, 2, 60); });
+        t!("icons", for k in 0..9 { icons::draw(&scr, catalog::app(k as u8).icon, 340 + k * 64, 724, 56); });
+        t!("sprites", for k in 0..9 { sprites::dock_icon(&scr, catalog::app(k as u8).icon, Rect::new(340 + k * 64, 724, 56, 56)); });
+        t!("icons96", for k in 0..9 { icons::draw(&scr, catalog::app(k as u8).icon, 340 + k * 64, 624, 96); });
+        b.s("\n");
+        write_bytes(b.get());
     }
 
     fn save_config(&mut self) {
@@ -473,6 +516,26 @@ impl Wm {
             self.damage(Rect::new(c.x, c.bottom() - WIN_RAD, c.w, WIN_RAD));
         } else {
             self.damage(c);
+        }
+    }
+
+    /// Como `damage_client`, mas so o retangulo `d` (coordenadas da
+    /// superficie) que o app informou no COMMIT.
+    fn damage_client_rect(&mut self, i: usize, d: Rect) {
+        let c = self.wins[i].client();
+        let r = d.offset(c.x, c.y).intersect(&c);
+        if r.is_empty() { return; }
+        let z = self.wins[i].z;
+        if self.wins.iter().any(|w| w.used && !w.minimized && w.z > z && w.opaque().contains_rect(&r)) {
+            return;
+        }
+        // a faixa dos cantos inferiores fica num retangulo proprio (oclusao)
+        let cut = c.bottom() - WIN_RAD;
+        if r.y < cut && r.bottom() > cut {
+            self.damage(Rect::new(r.x, r.y, r.w, cut - r.y));
+            self.damage(Rect::new(r.x, cut, r.w, r.bottom() - cut));
+        } else {
+            self.damage(r);
         }
     }
 
@@ -658,14 +721,21 @@ impl Wm {
                 WM_OP_COMMIT => {
                     if let Some(i) = wi {
                         let w = &mut self.wins[i];
+                        let first = !w.committed;
                         w.committed = true;
                         let c = w.client();
                         let (cw, ch) = ((m.data[1] >> 16) as i32 & 0xFFFF, m.data[1] as i32 & 0xFFFF);
                         // (c so serve de padrao quando o app nao informa o tamanho)
+                        let (ow, oh) = (w.commit_w, w.commit_h);
                         w.commit_w = if cw > 0 { cw } else { c.w };
                         w.commit_h = if ch > 0 { ch } else { c.h };
+                        let same = !first && ow == w.commit_w && oh == w.commit_h;
                         if !w.minimized {
-                            self.damage_client(i);
+                            // data[2] (opcional): so este retangulo mudou
+                            match commit_damage(m.data[2]) {
+                                Some(d) if same => self.damage_client_rect(i, d),
+                                _ => self.damage_client(i),
+                            }
                             if self.npending < MAXWIN {
                                 self.pending[self.npending] = (from, i);
                                 self.npending += 1;
@@ -695,6 +765,18 @@ impl Wm {
                         let tb = Rect::new(self.wins[i].r.x, self.wins[i].r.y, self.wins[i].r.w, TITLE_H);
                         self.damage(tb);
                         if self.focused() == Some(i) { self.damage(Rect::new(0, 0, self.w, MENU_H)); }
+                    }
+                }
+                WM_OP_BYE => {
+                    // o app fecha a janela de proposito (sem aviso de encerramento)
+                    if let Some(i) = wi {
+                        let w = self.wins[i];
+                        self.wins[i].used = false;
+                        if self.capture == Some(i) { self.capture = None; }
+                        if let Drag::Move { win, .. } | Drag::Resize { win, .. } = self.drag { if win == i { self.drag = Drag::None; } }
+                        self.damage(w.outer());
+                        self.damage(Rect::new(0, 0, self.w, MENU_H));
+                        self.damage(self.dock_area);
                     }
                 }
                 _ => {}
@@ -1039,7 +1121,7 @@ impl Wm {
             Action::SetSeconds(v) => { self.set_cfg(|c| c.seconds = v); self.update_clock(); }
             Action::SetCpuMeter(v) => self.set_cfg(|c| c.cpu_meter = v),
             Action::SetGlass(v) => self.set_cfg(|c| c.glass = v),
-            Action::SetLayout(v) => self.set_cfg(|c| c.abnt2 = v),
+            Action::SetLayout(v) => self.set_cfg(|c| c.layout = v),
             Action::SetDockMinimize(v) => self.set_cfg(|c| c.dock_minimize = v),
             Action::EditConfig => {
                 if let Some(i) = find_file(config::CFG_NAME) { self.launch(APP_EDITOR, i as i32); }
@@ -1822,7 +1904,8 @@ impl Wm {
                 let d = (along_m - centers[k]).abs();
                 if d < range {
                     let f = 256 - d * d * 256 / (range * range); // 0..256
-                    sizes[k] = s + s * 6 / 10 * f / 256;
+                    // tamanhos pares: metade das variantes no cache de sprites
+                    sizes[k] = (s + s * 6 / 10 * f / 256) & !1;
                 }
             }
         }
@@ -1948,15 +2031,15 @@ impl Wm {
         let rects = self.dmg;
         let n = self.ndmg;
         self.ndmg = 0;
-        let t0 = uptime_ms();
+        let t0 = perf_ms();
         for k in 0..n {
-            self.compose(rects[k]);
+            self.compose_split(rects[k], 0);
         }
-        let t1 = uptime_ms();
+        let t1 = perf_ms();
         for k in 0..n {
             fb_present(rects[k]);
         }
-        let t2 = uptime_ms();
+        let t2 = perf_ms();
         self.flush_commits();
         if PERF_LOG {
             let p = unsafe { &mut *(&raw mut PERF) };
@@ -1964,10 +2047,13 @@ impl Wm {
             p.1 += t1 - t0;
             p.2 += t2 - t1;
             for k in 0..n { p.3 += (rects[k].w * rects[k].h) as u64; }
-            if p.0 == 120 {
-                let mut b = Buf::<96>::new();
-                b.s("[wm] 120 quadros: compor ").u(p.1 * 10 / p.0).s("/10 ms, apresentar ")
-                    .u(p.2 * 10 / p.0).s("/10 ms, ").u(p.3 / p.0 / 1000).s(" kpx/quadro\n");
+            if p.0 == 60 {
+                let mut b = Buf::<160>::new();
+                b.s("[wm] 60 quadros: compor ").u(p.1 * 10 / p.0).s("/10 ms, apresentar ")
+                    .u(p.2 * 10 / p.0).s("/10 ms, ").u(p.3 / p.0 / 1000).s(" kpx/quadro");
+                let ph = unsafe { &mut *(&raw mut PHASE) };
+                b.s(" [nd ").u(ph[4]).s(" nc ").u(ph[5]).s(" fundo ").u(ph[0]).s(" jan ").u(ph[1]).s(" dock ").u(ph[2]).s(" resto ").u(ph[3]).s("]\n");
+                *ph = [0; 6];
                 write_bytes(b.get());
                 *p = (0, 0, 0, 0);
             }
@@ -1985,7 +2071,38 @@ impl Wm {
         self.npending = 0;
     }
 
+    /// Divide o dano em volta da area opaca da janela mais alta que o
+    /// cruza: a parte coberta comeca nessa janela (sem papel de parede nem
+    /// janelas de baixo) e so as sobras passam pelo caminho completo.
+    /// Arrastar uma janela deixa de repintar tudo que fica por baixo dela.
+    fn compose_split(&mut self, dmg: Rect, depth: u32) {
+        if depth < 3 {
+            let mut order = [0usize; MAXWIN];
+            let n = self.z_order(&mut order);
+            for k in (0..n).rev() {
+                let w = &self.wins[order[k]];
+                let o = w.opaque().intersect(&dmg);
+                if o.is_empty() { continue; }
+                if !(w.internal || w.committed) || o.contains_rect(&dmg) { break; }
+                if (o.w * o.h) * 4 < dmg.w * dmg.h { break; } // nao compensa
+                self.compose(o);
+                let pieces = [
+                    Rect::new(dmg.x, dmg.y, dmg.w, o.y - dmg.y),
+                    Rect::new(dmg.x, o.bottom(), dmg.w, dmg.bottom() - o.bottom()),
+                    Rect::new(dmg.x, o.y, o.x - dmg.x, o.h),
+                    Rect::new(o.right(), o.y, dmg.right() - o.right(), o.h),
+                ];
+                for p in pieces {
+                    if !p.is_empty() { self.compose_split(p, depth + 1); }
+                }
+                return;
+            }
+        }
+        self.compose(dmg);
+    }
+
     fn compose(&mut self, dmg: Rect) {
+        if PERF_LOG { unsafe { PHASE[5] += 1; } }
         let mut scr = self.scr;
         scr.set_clip(dmg);
         // janelas: comeca pela mais alta que cobre todo o dano (oclusao)
@@ -2001,7 +2118,9 @@ impl Wm {
                 break;
             }
         }
+        let t0 = perf_ms();
         if !covered { scr.copy_from(&self.wall, dmg); }
+        let t1 = perf_ms();
         let focus = self.focused();
         for k in start..n {
             let i = order[k];
@@ -2009,11 +2128,14 @@ impl Wm {
                 self.draw_window(&scr, i, focus == Some(i));
             }
         }
+        let t2 = perf_ms();
         if let Some((r, _)) = self.snap {
             scr.round_rect_a(r.inset(6), 14, self.th.accent, 50);
             scr.round_border(r.inset(6), 14, self.th.accent, 200);
         }
-        if self.dock_area.overlaps(&dmg) { self.draw_dock(&scr); }
+        let t3 = perf_ms();
+        if self.dock_area.overlaps(&dmg) { self.draw_dock(&scr); if PERF_LOG { unsafe { PHASE[4] += 1; } } }
+        let t4 = perf_ms();
         if dmg.y < MENU_H { self.draw_menubar(&scr); }
         if let Some(m) = self.menu {
             if m.rect.inset(-24).overlaps(&dmg) {
@@ -2035,6 +2157,11 @@ impl Wm {
         if self.spot { self.draw_spotlight(&scr); }
         if self.switcher { self.draw_switcher(&scr); }
         if self.dialog != Dialog::None { self.draw_dialog(&scr); }
+        if PERF_LOG {
+            let ph = unsafe { &mut *(&raw mut PHASE) };
+            ph[0] += t1 - t0; ph[1] += t2 - t1; ph[2] += t4 - t3;
+            ph[3] += perf_ms() - t4 + t3 - t2;
+        }
     }
 
     fn draw_window(&mut self, scr: &Fb, i: usize, focused: bool) {
@@ -2195,8 +2322,7 @@ impl Wm {
                 }
             }
             let def = catalog::app(app);
-            scr.shadow(r, r.w * 23 / 100, (r.w / 8).max(3), 2, 60);
-            icons::draw(scr, def.icon, r.x, r.y, r.w);
+            sprites::dock_icon(scr, def.icon, r);
             if self.dock_hover == k as i32 && self.down && self.dock_area.contains(self.mx, self.my) {
                 scr.round_rect_a(r, r.w * 23 / 100, 0x000000, 70);
             }

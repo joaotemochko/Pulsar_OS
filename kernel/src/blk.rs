@@ -90,3 +90,31 @@ pub fn read_sectors(lba: u64, count: u32, buf_pa: u64) -> bool {
 pub fn write_sectors(lba: u64, count: u32, buf_pa: u64) -> bool {
     transfer(T_OUT, lba, count, buf_pa)
 }
+
+/// Maximo de segmentos de dados numa requisicao (a fila tem 64 descritores:
+/// cabecalho + dados + status).
+pub const MAX_SEGS: usize = 62;
+
+/// Le ou escreve setores consecutivos a partir de `lba` usando varios
+/// buffers fisicos (scatter-gather), numa unica requisicao ao dispositivo.
+/// Cada segmento e (endereco fisico, bytes), multiplo de 512.
+pub fn transfer_sg(write: bool, lba: u64, segs: &[(u64, u32)]) -> bool {
+    let blk = unsafe { (&raw mut BLK).as_mut().unwrap().as_mut() };
+    let Some(blk) = blk else { return false };
+    if segs.is_empty() || segs.len() > MAX_SEGS { return false; }
+    let total: u64 = segs.iter().map(|s| s.1 as u64).sum();
+    if lba + total / SECTOR_SIZE as u64 > blk.capacity { return false; }
+    let req_type = if write { T_OUT } else { T_IN };
+    unsafe {
+        REQ.0 = BlkReq { req_type, _reserved: 0, sector: lba };
+        STATUS = 0xFF;
+        let mut bufs = [(0u64, 0u32, false); MAX_SEGS + 2];
+        bufs[0] = (&raw const REQ.0 as u64, size_of::<BlkReq>() as u32, false);
+        for (i, &(pa, len)) in segs.iter().enumerate() {
+            bufs[1 + i] = (pa, len, !write);
+        }
+        bufs[1 + segs.len()] = (&raw mut STATUS as u64, 1, true);
+        blk.queue.request_sync(&bufs[..segs.len() + 2]);
+        core::ptr::read_volatile(&raw const STATUS) == 0
+    }
+}

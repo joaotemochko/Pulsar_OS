@@ -73,7 +73,72 @@ static void svg_done(Task* t){
     free(q->src); free(q);
 }
 
+/* data: (base64 ou texto com %xx) -> bytes */
+static int b64v(int c){
+    if(c >= 'A' && c <= 'Z') return c - 'A';
+    if(c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if(c >= '0' && c <= '9') return c - '0' + 52;
+    if(c == '+' || c == '-') return 62;
+    if(c == '/' || c == '_') return 63;
+    return -1;
+}
+static u8* data_url_bytes(const char* u, int* len){
+    const char* c = strchr(u, ',');
+    if(!c) return NULL;
+    int b64 = 0;
+    for(const char* p = u; p < c; p++) if(!strncmp(p, ";base64", 7)) b64 = 1;
+    size_t n = strlen(c + 1);
+    u8* o = (u8*)malloc(n + 1); int k = 0;
+    if(b64){
+        u32 acc = 0; int bits = 0;
+        for(const char* p = c + 1; *p; p++){
+            int v = b64v((u8)*p); if(v < 0) continue;
+            acc = acc << 6 | (u32)v; bits += 6;
+            if(bits >= 8){ bits -= 8; o[k++] = (u8)(acc >> bits); }
+        }
+    } else {
+        for(const char* p = c + 1; *p; p++){
+            if(*p == '%' && p[1] && p[2]){
+                int h = 0;
+                for(int q = 1; q <= 2; q++){ int d = lower((u8)p[q]); h = h * 16 + (d <= '9' ? d - '0' : d - 'a' + 10); }
+                o[k++] = (u8)h; p += 2;
+            } else o[k++] = (u8)*p;
+        }
+    }
+    o[k] = 0; *len = k;
+    return o;
+}
+typedef struct { Task t; Image* im; char* src; int ok; } DataTask;
+static void data_run(Task* t){
+    DataTask* q = (DataTask*)t;
+    int n = 0; u8* b = data_url_bytes(q->src, &n);
+    q->ok = b && decode(q->im, b, n);
+    free(b);
+}
+static void data_done(Task* t){
+    DataTask* q = (DataTask*)t;
+    img_finish(q->im, q->ok);
+    free(q->src); free(q);
+}
+
 Image* image_get(const char* url){
+    if(str_istarts(url, "data:")){
+        /* chave: hash do conteudo (a URL pode ser enorme) */
+        char key[64]; snprintf(key, sizeof key, "data:#%08x:%u", hash_str(url, (int)strlen(url)), (unsigned)strlen(url));
+        for(Image* im = images; im; im = im->next) if(!strcmp(im->url, key)) return im;
+        if(nimages >= MAX_IMAGES * 2) return NULL;
+        Image* im = (Image*)calloc(1, sizeof *im);
+        snprintf(im->url, sizeof im->url, "%s", key);
+        im->next = images; images = im;
+        nimages++;
+        DataTask* q = (DataTask*)calloc(1, sizeof *q);
+        q->t.run = data_run; q->t.done = data_done;
+        q->im = im; q->src = strdup(url);
+        inflight++;
+        work_hold();
+        work_submit(&q->t);
+        return im;
+    }
     if(!str_istarts(url, "http://") && !str_istarts(url, "https://")) return NULL;
     for(Image* im = images; im; im = im->next) if(!strcmp(im->url, url)) return im;
     if(nimages >= MAX_IMAGES) return NULL;
@@ -251,6 +316,41 @@ void image_reset(void){
     images = NULL; nimages = 0;
     mutex_lock(&budget_lock); used = 0; mutex_unlock(&budget_lock);
     changed = 0;
+}
+
+/* fundo/mascara: a imagem em ladrilhos de tw x th a partir de (ox, oy),
+ * repetidos (rep: bit0 x, bit1 y), dentro de box. mask: a imagem so da o
+ * alfa; a cor pintada e `color`. */
+void image_draw_tiled(Fb* fb, Image* im, Rect box, i32 ox, i32 oy, i32 tw, i32 th, int rep, u8 alpha, int mask, u32 color){
+    if(!im || im->state != 1 || tw <= 0 || th <= 0 || box.w <= 0 || box.h <= 0) return;
+    Rect area = rect_and(box, fb->clip);
+    if(area.w <= 0 || area.h <= 0) return;
+    /* ladrilhos que cobrem a area */
+    i32 x0 = ox, y0 = oy, x1 = ox + tw, y1 = oy + th;
+    if(rep & 1){ while(x0 > area.x) x0 -= tw; x1 = area.x + area.w; }
+    if(rep & 2){ while(y0 > area.y) y0 -= th; y1 = area.y + area.h; }
+    u32 rgb = color & 0xFFFFFF, ca = mask ? (color >> 24) : 255;
+    for(i32 ty = y0; ty < y1; ty += th){
+        for(i32 tx = x0; tx < x1; tx += tw){
+            Rect r = rect_and(rect(tx, ty, tw, th), area);
+            for(i32 y = r.y; y < r.y + r.h; y++){
+                i32 sy = (i32)((i64)(y - ty) * im->ph / th);
+                const u32* srow = im->px + (i64)sy * im->pw;
+                u32* drow = fb->base + (i64)y * fb->stride;
+                for(i32 x = r.x; x < r.x + r.w; x++){
+                    u32 p = srow[(i32)((i64)(x - tx) * im->pw / tw)];
+                    u32 a = p >> 24;
+                    if(mask) a = a * ca / 255;
+                    if(alpha < 255) a = a * alpha / 255;
+                    if(!a) continue;
+                    u32 c = mask ? rgb : (p & 0xFFFFFF);
+                    drow[x] = a >= 255 ? c : mix(drow[x], c, a);
+                }
+            }
+            if(!(rep & 1)) break;
+        }
+        if(!(rep & 2)) break;
+    }
 }
 
 /* desenha a imagem esticada em dst; cover: recorta para preencher sem distorcer */

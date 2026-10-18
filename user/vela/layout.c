@@ -20,7 +20,8 @@ static u32 mgen = 1, lgen = 1;
 static i32 VW, VH;
 static int fixed_depth = 0, hide_depth = 0;
 
-typedef struct { i32 w, h, extent; } Out;
+typedef struct { i32 w, h, extent, base; } Out;     /* base: linha de base da ultima linha (da borda da margem), -1 sem linhas */
+static i32 g_base = -0x7FFFFFFF;                     /* linha de base da ultima linha posta (y absoluto) */
 static void layout_box(Node* e, i32 x, i32 y, i32 cbw, i32 forced_w, i32 forced_h, i32 cshift, Out* o);
 
 /* filhos para o layout: ::before, os filhos do DOM, ::after */
@@ -135,6 +136,28 @@ static void node_box(Node* n, i32 x, i32 y, i32 w, i32 h){
 }
 
 /* --------------------------------------------------------------- estilos */
+/* ladrilho de uma camada de fundo/mascara numa caixa pw x ph */
+static void layer_tile(Image* im, u8 szk, Len sw, Len sh, Len px, Len py, i32 pw, i32 ph, i32* ox, i32* oy, i32* tw, i32* th){
+    i32 iw = im->w > 0 ? im->w : pw, ih = im->h > 0 ? im->h : ph;
+    i32 w = iw, h = ih;
+    if(szk == 1 || szk == 2){
+        /* cover: a maior escala; contain: a menor */
+        int wide = (i64)pw * ih > (i64)ph * iw;
+        if((szk == 1) == wide){ w = pw; h = (i32)((i64)ih * pw / iw); }
+        else { h = ph; w = (i32)((i64)iw * ph / ih); }
+    } else if(szk == 3){
+        int hw = sw.kind == L_VAL, hh = sh.kind == L_VAL;
+        if(hw) w = len_res(sw, pw);
+        if(hh) h = len_res(sh, ph);
+        if(hw && !hh) h = iw ? (i32)((i64)ih * w / iw) : h;
+        if(hh && !hw) w = ih ? (i32)((i64)iw * h / ih) : w;
+    }
+    if(w < 1) w = 1;
+    if(h < 1) h = 1;
+    *tw = w; *th = h;
+    *ox = px.px + (i32)((i64)px.pct * (pw - w) / 10000);
+    *oy = py.px + (i32)((i64)py.pct * (ph - h) / 10000);
+}
 static i32 res(Len l, i32 base){ return l.kind == L_VAL ? len_res(l, base) : 0; }
 static FontInst* sfont(const Style* s){
     i32 px = s->font_size;
@@ -578,6 +601,7 @@ static void lb_flush(LB* lb, int force){
         else if(lb->align == TA_RIGHT) dx = free_w;
     }
     i32 base = lb->y + asc;
+    if(lb->nf) g_base = base;
     if(DL){
         /* fundos de elementos inline */
         for(int i = 0; i < lb->nf; i++){
@@ -789,8 +813,8 @@ static void lb_atomic(LB* lb, Node* e){
     f->x -= ml;                     /* layout_box recebe a borda da margem */
     i32 h = o.h;
     if(s->valign == VA_MIDDLE){ f->asc = h / 2 + font_px(sfont(lb->bs)) / 4; f->desc = h - f->asc; }
-    else if(s->valign == VA_TOP || s->valign == VA_BOTTOM || is_replaced(e)){ f->asc = h; f->desc = 0; }
-    else { i32 d = lb->sdesc < h ? lb->sdesc : h; f->asc = h - d; f->desc = d; }
+    else if(s->valign == VA_TOP || s->valign == VA_BOTTOM || is_replaced(e) || o.base < 0 || s->overflow_hidden){ f->asc = h; f->desc = 0; }
+    else { f->asc = o.base; f->desc = h - o.base; if(f->desc < 0){ f->desc = 0; f->asc = h; } }
     lb->x = f->x + adv;
     lb->space = 0;
 }
@@ -1480,9 +1504,10 @@ static void layout_box(Node* e, i32 x, i32 y, i32 cbw, i32 forced_w, i32 forced_
     if((d = emit(DL_HIT))){ hit_i = DL->n - 1; d->node = e; }
     int canvas = DL && DL->bg_node == e;
     if((s->bg >> 24) && s->visibility && !canvas && !s->masked && (d = emit(DL_RECT))){ bg_i = DL->n - 1; d->color = s->bg; d->radius = s->radius; d->node = e; }
-    if(s->bg_url && s->visibility){
-        /* imagem de fundo: baixada como as <img>; desenhada esticada na caixa */
-        if(!s->bg_img && doc){ char u[URLMAX]; if(url_resolve(doc->url, s->bg_url, u, sizeof u)) s->bg_img = image_get(u); }
+    if(s->visibility && doc){
+        /* imagens de fundo e de mascara: baixadas como as <img> (a URL ja e absoluta) */
+        if(s->bg_url && !s->bg_img) s->bg_img = image_get(s->bg_url);
+        if(s->masked && s->mask_url && !s->mask_img) s->mask_img = image_get(s->mask_url);
     }
     if((bt || br || bb || bl) && s->visibility && (d = emit(DL_BORDER))){
         bd_i = DL->n - 1; d->radius = s->radius;
@@ -1497,6 +1522,7 @@ static void layout_box(Node* e, i32 x, i32 y, i32 cbw, i32 forced_w, i32 forced_
     if(s->position != POS_STATIC){ cb.x = bx + bl; cb.y = by + bt; cb.w = bw - bl - br; cb.h = 0; }
     int content = dl_mark();
     i32 extent = 0, ch;
+    i32 saved_base = g_base; g_base = -0x7FFFFFFF;
     /* contexto de floats proprio */
     FCtx own_fc; FCtx* saved_fc = FC; int has_fc = 0;
     if(!intrinsic && !replaced && (!FC || makes_bfc(e))){ memset(&own_fc, 0, sizeof own_fc); FC = &own_fc; has_fc = 1; }
@@ -1532,16 +1558,40 @@ static void layout_box(Node* e, i32 x, i32 y, i32 cbw, i32 forced_w, i32 forced_
         if(bg_i >= 0){ it[bg_i].x = bx; it[bg_i].y = by; it[bg_i].w = bw; it[bg_i].h = bh; }
         if(bd_i >= 0){ it[bd_i].x = bx; it[bd_i].y = by; it[bd_i].w = bw; it[bd_i].h = bh; }
         if(clip_i >= 0){ it[clip_i].x = bx + bl; it[clip_i].y = by + bt; it[clip_i].w = bw - bl - br; it[clip_i].h = bh - bt - bb; }
-        if(s->bg_img && s->bg_img->state == 1 && bw > 0 && bh > 0){
-            /* desenha o fundo logo depois da cor (antes do conteudo) */
-            DItem tmp; memset(&tmp, 0, sizeof tmp);
-            tmp.kind = DL_IMAGE; tmp.x = bx; tmp.y = by; tmp.w = bw; tmp.h = bh; tmp.img = s->bg_img; tmp.alpha = 255;
-            tmp.fixed = fixed_depth > 0; tmp.radius = 1;      /* radius=1: modo "cover" */
-            int at = bg_i >= 0 ? bg_i + 1 : (hit_i >= 0 ? hit_i + 1 : start);
-            if(!hide_depth && emit(DL_IMAGE)){
+        /* gradiente de fundo: logo depois da cor */
+        if(s->bg_grad && s->visibility && !hide_depth && bw > 0 && bh > 0 && !s->masked){
+            Grad* g = grad_build(&frame_arena, s->bg_grad, bw, bh);
+            if(g && emit(DL_GRAD)){
+                DItem tmp = DL->it[DL->n - 1];
+                tmp.x = bx; tmp.y = by; tmp.w = bw; tmp.h = bh; tmp.grad = g; tmp.radius = s->radius; tmp.alpha = (u8)s->opacity; tmp.node = e;
+                int at = bg_i >= 0 ? bg_i + 1 : (hit_i >= 0 ? hit_i + 1 : start);
                 memmove(&DL->it[at + 1], &DL->it[at], sizeof(DItem) * (size_t)(DL->n - 1 - at));
                 DL->it[at] = tmp;
                 if(clip_i >= at) clip_i++;
+                if(bd_i >= at) bd_i++;
+                bg_i = at;
+            }
+        }
+        /* fundo (imagem) e icone por mascara: logo depois da cor, antes do conteudo */
+        for(int layer = 0; layer < 2; layer++){
+            int mk = layer == 1;
+            Image* im = mk ? (s->masked && (s->bg >> 24) ? s->mask_img : NULL) : (s->masked && s->mask_url ? NULL : s->bg_img);
+            if(!im || im->state != 1 || !s->visibility) continue;
+            i32 px0 = bx + bl, py0 = by + bt, pw = bw - bl - br, ph = bh - bt - bb;      /* caixa do padding */
+            if(pw <= 0 || ph <= 0) continue;
+            DItem tmp; memset(&tmp, 0, sizeof tmp);
+            tmp.kind = mk ? DL_MASK : DL_BGIMAGE; tmp.x = px0; tmp.y = py0; tmp.w = pw; tmp.h = ph; tmp.img = im; tmp.alpha = (u8)s->opacity;
+            tmp.fixed = fixed_depth > 0; tmp.color = s->bg; tmp.node = e;
+            layer_tile(im, mk ? s->mask_szk : s->bg_szk, mk ? s->mask_sw : s->bg_sw, mk ? s->mask_sh : s->bg_sh,
+                       mk ? s->mask_px : s->bg_px, mk ? s->mask_py : s->bg_py, pw, ph, &tmp.ix, &tmp.iy, &tmp.iw, &tmp.ih);
+            tmp.rep = mk ? s->mask_rep : s->bg_rep;
+            int at = bg_i >= 0 ? bg_i + 1 : (hit_i >= 0 ? hit_i + 1 : start);
+            if(!hide_depth && emit(DL_BGIMAGE)){
+                memmove(&DL->it[at + 1], &DL->it[at], sizeof(DItem) * (size_t)(DL->n - 1 - at));
+                DL->it[at] = tmp;
+                if(clip_i >= at) clip_i++;
+                if(bd_i >= at) bd_i++;
+                bg_i = at;
             }
         }
         if(clip_i >= 0) emit(DL_UNCLIP);
@@ -1561,6 +1611,8 @@ static void layout_box(Node* e, i32 x, i32 y, i32 cbw, i32 forced_w, i32 forced_
         if(DL){ dl_shift(start, dx, dy); }
     }
     if(hidden) hide_depth--;
+    o->base = g_base == -0x7FFFFFFF ? -1 : g_base - y;
+    if(g_base == -0x7FFFFFFF || s->floating || s->position == POS_ABSOLUTE || s->position == POS_FIXED) g_base = saved_base;
     o->w = bw;
     o->h = mt + bh + mb;
     o->extent = (px_width ? bw : extent + hpad) + oml + omr;

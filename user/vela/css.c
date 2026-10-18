@@ -34,14 +34,15 @@ enum {
     P_JUSTIFY_CONTENT, P_JUSTIFY_ITEMS, P_JUSTIFY_SELF, P_LEFT, P_LETTER_SPACING, P_LINE_HEIGHT,
     P_LIST_STYLE, P_LIST_STYLE_IMAGE, P_LIST_STYLE_TYPE, P_MARGIN, P_MARGIN_BLOCK, P_MARGIN_BLOCK_END,
     P_MARGIN_BLOCK_START, P_MARGIN_BOTTOM, P_MARGIN_INLINE, P_MARGIN_INLINE_END, P_MARGIN_INLINE_START,
-    P_MARGIN_LEFT, P_MARGIN_RIGHT, P_MARGIN_TOP, P_MASK, P_MASK_IMAGE, P_MAX_HEIGHT, P_MAX_WIDTH,
-    P_MIN_HEIGHT, P_MIN_WIDTH, P_OBJECT_FIT, P_OPACITY, P_ORDER, P_OVERFLOW, P_OVERFLOW_CLIP_MARGIN,
-    P_OVERFLOW_WRAP, P_OVERFLOW_X, P_OVERFLOW_Y, P_PADDING, P_PADDING_BLOCK, P_PADDING_BLOCK_END,
-    P_PADDING_BLOCK_START, P_PADDING_BOTTOM, P_PADDING_INLINE, P_PADDING_INLINE_END, P_PADDING_INLINE_START,
-    P_PADDING_LEFT, P_PADDING_RIGHT, P_PADDING_TOP, P_PLACE_CONTENT, P_PLACE_ITEMS, P_PLACE_SELF, P_POSITION,
-    P_RIGHT, P_ROW_GAP, P_TEXT_ALIGN, P_TEXT_DECORATION, P_TEXT_DECORATION_COLOR, P_TEXT_DECORATION_LINE,
-    P_TEXT_INDENT, P_TEXT_OVERFLOW, P_TEXT_SHADOW, P_TEXT_TRANSFORM, P_TOP, P_TRANSFORM, P_TRANSLATE,
-    P_VERTICAL_ALIGN, P_VISIBILITY, P_WHITE_SPACE, P_WIDTH, P_WORD_BREAK, P_WORD_WRAP, P_Z_INDEX,
+    P_MARGIN_LEFT, P_MARGIN_RIGHT, P_MARGIN_TOP, P_MASK, P_MASK_IMAGE, P_MASK_POSITION, P_MASK_REPEAT,
+    P_MASK_SIZE, P_MAX_HEIGHT, P_MAX_WIDTH, P_MIN_HEIGHT, P_MIN_WIDTH, P_OBJECT_FIT, P_OPACITY, P_ORDER,
+    P_OVERFLOW, P_OVERFLOW_CLIP_MARGIN, P_OVERFLOW_WRAP, P_OVERFLOW_X, P_OVERFLOW_Y, P_PADDING,
+    P_PADDING_BLOCK, P_PADDING_BLOCK_END, P_PADDING_BLOCK_START, P_PADDING_BOTTOM, P_PADDING_INLINE,
+    P_PADDING_INLINE_END, P_PADDING_INLINE_START, P_PADDING_LEFT, P_PADDING_RIGHT, P_PADDING_TOP,
+    P_PLACE_CONTENT, P_PLACE_ITEMS, P_PLACE_SELF, P_POSITION, P_RIGHT, P_ROW_GAP, P_TEXT_ALIGN,
+    P_TEXT_DECORATION, P_TEXT_DECORATION_COLOR, P_TEXT_DECORATION_LINE, P_TEXT_INDENT, P_TEXT_OVERFLOW,
+    P_TEXT_SHADOW, P_TEXT_TRANSFORM, P_TOP, P_TRANSFORM, P_TRANSLATE, P_VERTICAL_ALIGN, P_VISIBILITY,
+    P_WHITE_SPACE, P_WIDTH, P_WORD_BREAK, P_WORD_WRAP, P_Z_INDEX,
     P_COUNT
 };
 /* em ordem alfabetica: busca binaria */
@@ -61,14 +62,15 @@ static const char* const PROP_NAMES[] = {
     "justify-content", "justify-items", "justify-self", "left", "letter-spacing", "line-height",
     "list-style", "list-style-image", "list-style-type", "margin", "margin-block", "margin-block-end",
     "margin-block-start", "margin-bottom", "margin-inline", "margin-inline-end", "margin-inline-start",
-    "margin-left", "margin-right", "margin-top", "mask", "mask-image", "max-height", "max-width",
-    "min-height", "min-width", "object-fit", "opacity", "order", "overflow", "overflow-clip-margin",
-    "overflow-wrap", "overflow-x", "overflow-y", "padding", "padding-block", "padding-block-end",
-    "padding-block-start", "padding-bottom", "padding-inline", "padding-inline-end", "padding-inline-start",
-    "padding-left", "padding-right", "padding-top", "place-content", "place-items", "place-self", "position",
-    "right", "row-gap", "text-align", "text-decoration", "text-decoration-color", "text-decoration-line",
-    "text-indent", "text-overflow", "text-shadow", "text-transform", "top", "transform", "translate",
-    "vertical-align", "visibility", "white-space", "width", "word-break", "word-wrap", "z-index",
+    "margin-left", "margin-right", "margin-top", "mask", "mask-image", "mask-position", "mask-repeat",
+    "mask-size", "max-height", "max-width", "min-height", "min-width", "object-fit", "opacity", "order",
+    "overflow", "overflow-clip-margin", "overflow-wrap", "overflow-x", "overflow-y", "padding",
+    "padding-block", "padding-block-end", "padding-block-start", "padding-bottom", "padding-inline",
+    "padding-inline-end", "padding-inline-start", "padding-left", "padding-right", "padding-top",
+    "place-content", "place-items", "place-self", "position", "right", "row-gap", "text-align",
+    "text-decoration", "text-decoration-color", "text-decoration-line", "text-indent", "text-overflow",
+    "text-shadow", "text-transform", "top", "transform", "translate", "vertical-align", "visibility",
+    "white-space", "width", "word-break", "word-wrap", "z-index",
 };
 
 static int prop_id(const char* s, int n){
@@ -456,7 +458,7 @@ int css_query(Node* root, const char* selector, Node** out, int max){
 typedef struct { u16 prop; u8 important; const char* name; const char* val; int vlen; } Decl;
 /* bloco de declaracoes guardado cru: so e analisado quando alguma regra
  * dele casa com um elemento (a maioria das regras de um site nunca casa) */
-typedef struct { const char* src; int len; Arena* a; Decl* d; int nd; u8 parsed; } Block;
+typedef struct { const char* src; int len; Arena* a; Decl* d; int nd; u8 parsed; u8 uses_attr; struct Sheet* sheet; } Block;
 typedef struct Rule { Sel* sel; u32 spec, order; u8 origin; Block* b; u32 anc[4]; u8 nanc; u8 anc_ready; u8 multi; } Rule;
 typedef struct FFace { const char* family; const char* src; int wlo, whi, italic, latin; } FFace;
 struct Sheet { Rule** rules; int n, cap; Sheet* next; FFace* faces; int nfaces, cfaces; const char* base; int faces_done; };
@@ -779,7 +781,7 @@ static void parse_rules(Sheet* sh, Arena* a, const char* s, int n, int origin){
         for(int k = 0; k < bl; k++) if(!is_ws((u8)s[b0 + k])){ empty = 0; break; }
         if(empty) continue;
         Block* blk = (Block*)arena_alloc(a, sizeof(Block));
-        blk->src = arena_strndup(a, s + b0, (size_t)bl); blk->len = bl; blk->a = a;
+        blk->src = arena_strndup(a, s + b0, (size_t)bl); blk->len = bl; blk->a = a; blk->sheet = sh;
         for(Sel* sl = list; sl; sl = sl->next){
             Rule* ru = (Rule*)arena_alloc(a, sizeof(Rule));
             ru->sel = sl; ru->spec = sl->spec; ru->origin = (u8)origin;   /* order: na montagem do indice */
@@ -1153,7 +1155,7 @@ u32 css_parse_color(const char* s, int n, int* ok){
 /* ============================================================ valores */
 #define CUR_COLOR 0x01020304u           /* sentinela: currentColor */
 
-typedef struct { Style* st; const Style* parent; Node* el; i32 root_fs; Arena* ar; } Ctx;
+typedef struct { Style* st; const Style* parent; Node* el; i32 root_fs; Arena* ar; const char* base; } Ctx;   /* base: URL da folha (url()) */
 
 /* comprimento; aceita px em, rem, %, vw, vh, pt, calc()/min()/max()/clamp() */
 static int parse_len_at(Ctx* c, const char* s, int n, int* i, Len* out);
@@ -1513,21 +1515,104 @@ static int display_of(const char* v, int n){
 }
 
 /* gradiente: usa a primeira cor visivel como fundo liso */
-static int gradient_color(const char* v, u32* out){
-    const char* p = strchr(v, '(');
-    if(!p) return 0;
-    for(p++; *p; p++){
-        if(*p == '#' || str_istarts(p, "rgb") || str_istarts(p, "hsl") || (*p >= 'a' && *p <= 'z')){
-            const char* e = p; int d = 0;
-            while(*e && !((*e == ',' || *e == ')' || *e == ' ') && d == 0)){ if(*e == '(') d++; else if(*e == ')') d--; e++; }
-            if(*e == ')' && d == 0 && (str_istarts(p, "rgb") || str_istarts(p, "hsl"))) e++;
-            int ok; u32 col = css_parse_color(p, (int)(e - p), &ok);
-            if(ok && (col >> 24)){ *out = col; return 1; }
-            p = e; if(!*p) break;
+/* ---- camadas de fundo/mascara: url, tamanho, posicao, repeticao ---- */
+/* url(...) -> URL absoluta (relativa a folha de estilo, nao a pagina) */
+static const char* css_url(Ctx* c, const char* v){
+    const char* u = strstr(v, "url(");
+    if(!u) return NULL;
+    u += 4;
+    while(*u == ' ') u++;
+    char q = (*u == '"' || *u == '\'') ? *u++ : 0;
+    const char* e = u;
+    while(*e && (q ? *e != q : *e != ')')) e++;
+    while(!q && e > u && e[-1] == ' ') e--;
+    if(e - u >= 5 && str_istarts(u, "data:")) return arena_strndup(c->ar, u, (size_t)(e - u));
+    char rel[URLMAX], abs_[URLMAX];
+    if(e - u >= URLMAX) return NULL;
+    memcpy(rel, u, (size_t)(e - u)); rel[e - u] = 0;
+    const char* base = c->base ? c->base : (doc ? doc->url : "");
+    if(!url_resolve(base, rel, abs_, sizeof abs_)) return NULL;
+    return arena_strdup(c->ar, abs_);
+}
+static int pos_kw(const char* t, int l, Len* out, int* axis){
+    Len p = { 0, 0, L_VAL };
+    if(str_ieqn(t, "left", l)){ *axis = 1; }
+    else if(str_ieqn(t, "right", l)){ p.pct = 10000; *axis = 1; }
+    else if(str_ieqn(t, "top", l)){ *axis = 2; }
+    else if(str_ieqn(t, "bottom", l)){ p.pct = 10000; *axis = 2; }
+    else if(str_ieqn(t, "center", l)){ p.pct = 5000; *axis = 0; }
+    else return 0;
+    *out = p; return 1;
+}
+/* posicao: "center", "right 10px"... ; tok ja separados */
+static void set_pos(Ctx* c, const char** tok, int* tl, int k, Len* px, Len* py){
+    Len v[2]; int ax[2]; int nv = 0;
+    for(int i = 0; i < k && nv < 2; i++){
+        int a = 0; Len l;
+        if(pos_kw(tok[i], tl[i], &l, &a)){
+            /* "right 10px": deslocamento a partir daquela borda */
+            Len off;
+            if(k >= 3 && a && i + 1 < k && parse_len(c, tok[i + 1], tl[i + 1], &off) && off.kind == L_VAL){
+                if(l.pct){ l.px -= off.px; l.pct -= off.pct; } else { l.px += off.px; l.pct += off.pct; }
+                i++;
+            }
+            v[nv] = l; ax[nv++] = a;
         }
+        else if(parse_len(c, tok[i], tl[i], &l) && l.kind == L_VAL){ v[nv] = l; ax[nv++] = 0; }
     }
+    Len half = { 0, 5000, L_VAL };
+    if(nv == 0) return;
+    if(nv == 1){
+        if(ax[0] == 2){ *py = v[0]; *px = half; } else { *px = v[0]; *py = half; }
+        return;
+    }
+    if(ax[0] == 2 || ax[1] == 1){ *py = v[0]; *px = v[1]; } else { *px = v[0]; *py = v[1]; }
+}
+static void set_size(Ctx* c, const char** tok, int* tl, int k, u8* kind, Len* w, Len* h){
+    if(!k) return;
+    if(str_ieqn(tok[0], "cover", tl[0])){ *kind = 1; return; }
+    if(str_ieqn(tok[0], "contain", tl[0])){ *kind = 2; return; }
+    Len a = { 0, 0, L_AUTO }, b = { 0, 0, L_AUTO };
+    if(!str_ieqn(tok[0], "auto", tl[0])) parse_len(c, tok[0], tl[0], &a);
+    if(k > 1 && !str_ieqn(tok[1], "auto", tl[1])) parse_len(c, tok[1], tl[1], &b);
+    *kind = a.kind == L_VAL || b.kind == L_VAL ? 3 : 0;
+    *w = a; *h = b;
+}
+static int set_repeat(const char* t, int l, u8* rep){
+    if(str_ieqn(t, "no-repeat", l)){ *rep = 0; return 1; }
+    if(str_ieqn(t, "repeat-x", l)){ *rep = 1; return 1; }
+    if(str_ieqn(t, "repeat-y", l)){ *rep = 2; return 1; }
+    if(str_ieqn(t, "repeat", l) || str_ieqn(t, "space", l) || str_ieqn(t, "round", l)){ *rep = 3; return 1; }
     return 0;
 }
+/* atalho background/mask: cor, url, repeticao, posicao [/ tamanho] */
+static void set_layer(Ctx* c, const char* v, int n, int mask){
+    Style* st = c->st;
+    const char* tok[16]; int tl[16];
+    int k = split_tokens(v, n, tok, tl, 16);
+    const char* pt[4]; int pl[4]; int np = 0;
+    const char* zt[2]; int zl[2]; int nz = 0; int after_slash = 0;
+    u8* rep = mask ? &st->mask_rep : &st->bg_rep;
+    for(int i = 0; i < k; i++){
+        const char* t = tok[i]; int l = tl[i];
+        if(str_istarts(t, "url(")){ const char* u = css_url(c, t); if(mask) st->mask_url = u; else st->bg_url = u; continue; }
+        if(set_repeat(t, l, rep)) continue;
+        const char* sl = memchr(t, '/', (size_t)l);
+        if(sl && !str_istarts(t, "url(")){
+            if(sl > t && np < 4){ pt[np] = t; pl[np++] = (int)(sl - t); }
+            after_slash = 1;
+            if(sl + 1 < t + l && nz < 2){ zt[nz] = sl + 1; zl[nz++] = (int)(t + l - sl - 1); }
+            continue;
+        }
+        int a; Len tmp;
+        int is_pos = pos_kw(t, l, &tmp, &a) || (t[0] >= '0' && t[0] <= '9') || t[0] == '-' || t[0] == '.' || str_istarts(t, "calc(");
+        if(after_slash){ if(nz < 2 && (is_pos || str_ieqn(t, "auto", l) || str_ieqn(t, "cover", l) || str_ieqn(t, "contain", l))){ zt[nz] = t; zl[nz++] = l; } continue; }
+        if(is_pos && np < 4){ pt[np] = t; pl[np++] = l; }
+    }
+    if(np) set_pos(c, pt, pl, np, mask ? &st->mask_px : &st->bg_px, mask ? &st->mask_py : &st->bg_py);
+    if(nz) set_size(c, zt, zl, nz, mask ? &st->mask_szk : &st->bg_szk, mask ? &st->mask_sw : &st->bg_sw, mask ? &st->mask_sh : &st->bg_sh);
+}
+
 
 static int is_global_kw(const char* v, int n){
     return str_ieqn(v, "inherit", n) || str_ieqn(v, "initial", n) || str_ieqn(v, "unset", n) || str_ieqn(v, "revert", n) || str_ieqn(v, "revert-layer", n);
@@ -1680,30 +1765,25 @@ static void apply_decl(Ctx* c, int prop, const char* v, int n){
         break;
     case P_BACKGROUND:
         /* o atalho redefine tudo: cor transparente e sem imagem, salvo o que vier */
-        st->bg = 0; st->bg_url = NULL;
+        st->bg = 0; st->bg_url = NULL; st->bg_grad = NULL;
+        st->bg_rep = 3; st->bg_szk = 0; st->bg_px = len_px(0); st->bg_py = len_px(0);
         if(str_ieqn(v, "none", n)) break;
+        set_layer(c, v, n, 0);
         k = split_tokens(v, n, tok, tl, 8);
         for(int i = 0; i < k; i++){
             col = css_parse_color(tok[i], tl[i], &ok);
             if(ok) st->bg = col;
-            else if(str_istarts(tok[i], "url(")) goto bg_image;
-            else if(str_istarts(tok[i], "linear-gradient") || str_istarts(tok[i], "radial-gradient") || str_istarts(tok[i], "repeating-")){
-                u32 g; if(gradient_color(tok[i], &g) && !(st->bg >> 24)) st->bg = g;
-            }
+            else if(str_istarts(tok[i], "url(")) {}
+            else if((str_istarts(tok[i], "linear-gradient") || str_istarts(tok[i], "radial-gradient") || str_istarts(tok[i], "repeating-")) && !st->bg_grad)
+                st->bg_grad = arena_strndup(c->ar, tok[i], (size_t)tl[i]);
         }
         break;
     case P_BACKGROUND_IMAGE:
-        if(str_istarts(v, "url(")){
-        bg_image:;
-            const char* u = strstr(v, "url(");
-            if(!u) break;
-            u += 4;
-            while(*u == ' ' || *u == '"' || *u == '\'') u++;
-            const char* e = u; while(*e && *e != ')' && *e != '"' && *e != '\'') e++;
-            st->bg_url = arena_strndup(c->ar, u, (size_t)(e - u));
-        } else if(str_ieqn(v, "none", n)) st->bg_url = NULL;
+        st->bg_url = NULL; st->bg_grad = NULL;
+        if(str_istarts(v, "url(")) st->bg_url = css_url(c, v);
         else if(str_istarts(v, "linear-gradient") || str_istarts(v, "radial-gradient") || str_istarts(v, "repeating-")){
-            u32 g; if(gradient_color(v, &g) && !(st->bg >> 24)) st->bg = g;
+            k = split_tokens(v, n, tok, tl, 8);
+            st->bg_grad = arena_strndup(c->ar, tok[0], (size_t)tl[0]);
         }
         break;
     case P_FONT_SIZE: break;                              /* aplicado antes */
@@ -1915,7 +1995,29 @@ static void apply_decl(Ctx* c, int prop, const char* v, int n){
         else if(str_ieqn(v, "super", n)) st->valign = VA_SUPER;
         else st->valign = VA_BASELINE;
         break;
-    case P_MASK: case P_MASK_IMAGE: st->masked = !str_ieqn(v, "none", n); break;
+    case P_MASK:
+        st->masked = !str_ieqn(v, "none", n); st->mask_url = NULL;
+        st->mask_rep = 3; st->mask_szk = 0; st->mask_px = len_px(0); st->mask_py = len_px(0);
+        if(st->masked) set_layer(c, v, n, 1);
+        break;
+    case P_MASK_IMAGE: st->masked = !str_ieqn(v, "none", n); st->mask_url = str_istarts(v, "url(") ? css_url(c, v) : NULL; break;
+    case P_MASK_SIZE: case P_BACKGROUND_SIZE: {
+        int m = prop == P_MASK_SIZE;
+        k = split_tokens(v, n, tok, tl, 8);
+        set_size(c, tok, tl, k, m ? &st->mask_szk : &st->bg_szk, m ? &st->mask_sw : &st->bg_sw, m ? &st->mask_sh : &st->bg_sh);
+        break;
+    }
+    case P_MASK_POSITION: case P_BACKGROUND_POSITION: {
+        int m = prop == P_MASK_POSITION;
+        k = split_tokens(v, n, tok, tl, 8);
+        set_pos(c, tok, tl, k, m ? &st->mask_px : &st->bg_px, m ? &st->mask_py : &st->bg_py);
+        break;
+    }
+    case P_MASK_REPEAT: case P_BACKGROUND_REPEAT:
+        k = split_tokens(v, n, tok, tl, 8);
+        if(k == 2){ u8 a = 0, b = 0; set_repeat(tok[0], tl[0], &a); set_repeat(tok[1], tl[1], &b); u8 r = (u8)((a & 1) | (b & 2)); if(prop == P_MASK_REPEAT) st->mask_rep = r; else st->bg_rep = r; }
+        else if(k) set_repeat(tok[0], tl[0], prop == P_MASK_REPEAT ? &st->mask_rep : &st->bg_rep);
+        break;
     case P_TRANSFORM: case P_TRANSLATE: {
         /* so translacoes: translate(x[, y]), translateX/Y, translate3d; o resto e ignorado */
         st->tx = len_px(0); st->ty = len_px(0);
@@ -2026,6 +2128,9 @@ static const Style* initial_style(void){
         ua_initial.font_size = 16;
         ua_initial.color = 0xFF000000;
         ua_initial.fam = FAM_SERIF; ua_initial.ffb = FAM_SERIF; ua_initial.weight = 400;
+        ua_initial.bg_rep = 3; ua_initial.mask_rep = 3;
+        ua_initial.bg_sw.kind = L_AUTO; ua_initial.bg_sh.kind = L_AUTO; ua_initial.mask_sw.kind = L_AUTO; ua_initial.mask_sh.kind = L_AUTO;
+        ua_initial.bg_px = len_px(0); ua_initial.bg_py = len_px(0); ua_initial.mask_px = len_px(0); ua_initial.mask_py = len_px(0);
         ua_initial.visibility = 1;
         ua_initial.opacity = 255;
         ua_initial.flex_shrink = 100;
@@ -2167,7 +2272,7 @@ static void build_index(Doc* d){
 /* compartilhamento de estilo: elementos com o mesmo pai (o mesmo Style),
  * a mesma tag e as mesmas regras casadas, sem estilo inline nem atributos de
  * apresentacao, tem o mesmo estilo computado */
-typedef struct { u32 h; const Style* parent; const char* tag; Rule** rules; int nr; Style* st; } Share;
+typedef struct { u32 h; const Style* parent; const char* tag; Rule** rules; int nr, npr; Style* st; Style* ps[2]; } Share;
 #define NSHARE 2048
 typedef struct SCtx { Rule** matched; int nm, cm; Rule** pm; int npm, cpm; Rule** tmp; int ntmp, ctmp; u16 bloom[BLOOM]; Arena* ar;
                       Share share[NSHARE]; int shared, computed; } SCtx;
@@ -2213,7 +2318,7 @@ static void try_rules(SCtx* x, Node* e, Rule** rs, int n){
             Block* b = r->b;
             if(!__atomic_load_n(&b->parsed, __ATOMIC_ACQUIRE)){
                 mutex_lock(&block_lock);
-                if(!b->parsed){ b->nd = parse_decls(b->a, b->src, b->len, &b->d); __atomic_store_n(&b->parsed, 1, __ATOMIC_RELEASE); }
+                if(!b->parsed){ b->nd = parse_decls(b->a, b->src, b->len, &b->d); b->uses_attr = strstr(b->src, "attr(") != NULL; __atomic_store_n(&b->parsed, 1, __ATOMIC_RELEASE); }
                 mutex_unlock(&block_lock);
             }
             if(b->nd){
@@ -2254,7 +2359,14 @@ static void set_var(Arena* ar, Style* st, const Style* parent, const char* name,
         sc->tab = (Var*)arena_alloc(ar, sizeof(Var) * (size_t)sc->cap);
         for(int i = 0; i < oc; i++) if(old[i].hash) var_put(sc, old[i].name, old[i].value, old[i].hash);
     }
-    var_put(sc, name, val, hash_str(name, (int)strlen(name)) | 1);
+    /* "--x: var(--x, 1rem)": ciclo -> a propriedade fica invalida e quem
+     * usar var(--x, ...) pega o valor reserva */
+    int nl = (int)strlen(name);
+    for(const char* p = val; p && (p = strstr(p, "var(")); p += 4){
+        const char* q = p + 4; while(is_ws((u8)*q)) q++;
+        if(!strncmp(q, name, (size_t)nl) && (q[nl] == ',' || q[nl] == ')' || is_ws((u8)q[nl]))){ val = NULL; break; }
+    }
+    var_put(sc, name, val, hash_str(name, nl) | 1);
 }
 
 static void apply_value(Ctx* c, int prop, const char* v, int n){
@@ -2358,7 +2470,7 @@ static void cascade(SCtx* x, Node* e, Style* st, const Style* parent, i32 root_f
     /* 1) propriedades --custom (normais, depois !important) */
     for(int imp = 0; imp < 2; imp++){
         for(int i = 0; i < NM; i++) for(int k = 0; k < M[i]->b->nd; k++){
-            Decl* d = &M[i]->b->d[k];
+            Decl* d = &M[i]->b->d[k]; c.base = M[i]->b->sheet ? M[i]->b->sheet->base : NULL;
             if(d->prop == P_CUSTOM && d->important == imp) set_var(x->ar, st, parent, d->name, d->val);
         }
         for(int k = 0; k < nid; k++) if(idecl[k].prop == P_CUSTOM && idecl[k].important == imp) set_var(x->ar, st, parent, idecl[k].name, idecl[k].val);
@@ -2367,7 +2479,7 @@ static void cascade(SCtx* x, Node* e, Style* st, const Style* parent, i32 root_f
     const Decl* fs = NULL;
     for(int imp = 0; imp < 2; imp++){
         for(int i = 0; i < NM; i++) for(int k = 0; k < M[i]->b->nd; k++){
-            Decl* d = &M[i]->b->d[k];
+            Decl* d = &M[i]->b->d[k]; c.base = M[i]->b->sheet ? M[i]->b->sheet->base : NULL;
             if((d->prop == P_FONT_SIZE || d->prop == P_FONT) && d->important == imp) fs = d;
         }
         for(int k = 0; k < nid; k++) if((idecl[k].prop == P_FONT_SIZE || idecl[k].prop == P_FONT) && idecl[k].important == imp) fs = &idecl[k];
@@ -2387,22 +2499,22 @@ static void cascade(SCtx* x, Node* e, Style* st, const Style* parent, i32 root_f
     int ua_end = 0;
     while(ua_end < NM && M[ua_end]->origin == 0) ua_end++;
     for(int i = 0; i < ua_end; i++) for(int k = 0; k < M[i]->b->nd; k++){
-        Decl* d = &M[i]->b->d[k];
+        Decl* d = &M[i]->b->d[k]; c.base = M[i]->b->sheet ? M[i]->b->sheet->base : NULL;
         if(!d->important && d->prop != P_CUSTOM && d->prop != P_FONT_SIZE) apply_value(&c, d->prop, d->val, d->vlen);
     }
     if(!pseudo) presentational(&c, e, 0);
     for(int i = ua_end; i < NM; i++) for(int k = 0; k < M[i]->b->nd; k++){
-        Decl* d = &M[i]->b->d[k];
+        Decl* d = &M[i]->b->d[k]; c.base = M[i]->b->sheet ? M[i]->b->sheet->base : NULL;
         if(!d->important && d->prop != P_CUSTOM && d->prop != P_FONT_SIZE && d->prop != P_FONT) apply_value(&c, d->prop, d->val, d->vlen);
     }
     for(int k = 0; k < nid; k++) if(!idecl[k].important && idecl[k].prop != P_CUSTOM && idecl[k].prop != P_FONT_SIZE && idecl[k].prop != P_FONT)
-        apply_value(&c, idecl[k].prop, idecl[k].val, idecl[k].vlen);
+        { c.base = NULL; apply_value(&c, idecl[k].prop, idecl[k].val, idecl[k].vlen); }
     for(int i = 0; i < NM; i++) for(int k = 0; k < M[i]->b->nd; k++){
-        Decl* d = &M[i]->b->d[k];
+        Decl* d = &M[i]->b->d[k]; c.base = M[i]->b->sheet ? M[i]->b->sheet->base : NULL;
         if(d->important && d->prop != P_CUSTOM && d->prop != P_FONT_SIZE && d->prop != P_FONT) apply_value(&c, d->prop, d->val, d->vlen);
     }
     for(int k = 0; k < nid; k++) if(idecl[k].important && idecl[k].prop != P_CUSTOM && idecl[k].prop != P_FONT_SIZE && idecl[k].prop != P_FONT)
-        apply_value(&c, idecl[k].prop, idecl[k].val, idecl[k].vlen);
+        { c.base = NULL; apply_value(&c, idecl[k].prop, idecl[k].val, idecl[k].vlen); }
 
     /* acertos finais */
     for(int s = 0; s < 4; s++) if(st->border_c[s] == CUR_COLOR) st->border_c[s] = st->color;
@@ -2433,8 +2545,18 @@ static void cascade(SCtx* x, Node* e, Style* st, const Style* parent, i32 root_f
 
 
 /* ::before / ::after: um Node gerado (fora do DOM) com um texto filho */
-static void style_pseudos(SCtx* x, Node* e, Style* st, i32 root_fs){
-    if(x->npm > 1) qsort(x->pm, (size_t)x->npm, sizeof(Rule*), rule_cmp);
+static void make_pseudo(SCtx* x, Node* e, int pe, Style* ps){
+    Node* p = (Node*)arena_alloc(x->ar, sizeof(Node));
+    Node* t = (Node*)arena_alloc(x->ar, sizeof(Node));
+    memset(p, 0, sizeof *p); memset(t, 0, sizeof *t);
+    p->type = N_ELEM; p->tag = pe == 1 ? "::before" : "::after"; p->flags = NF_PSEUDO;
+    p->parent = e; p->cs = ps; p->first = p->last = t;
+    t->type = N_TEXT; t->parent = p; t->text = (char*)ps->content; t->tlen = (int)strlen(ps->content);
+    if(!t->tlen){ p->first = p->last = NULL; }
+    e->pse[pe - 1] = p;
+}
+/* ps[]: os estilos gerados (NULL = sem caixa), para o compartilhamento */
+static void style_pseudos(SCtx* x, Node* e, Style* st, i32 root_fs, Style** out){
     for(int pe = 1; pe <= 2; pe++){
         x->ntmp = 0;
         for(int i = 0; i < x->npm; i++) if(x->pm[i]->sel->pe == pe) bucket_push(&x->tmp, &x->ntmp, &x->ctmp, x->pm[i]);
@@ -2442,14 +2564,8 @@ static void style_pseudos(SCtx* x, Node* e, Style* st, i32 root_fs){
         Style* ps = new_style(x, st);
         cascade(x, e, ps, st, root_fs, x->tmp, x->ntmp, NULL, 0, pe);
         if(!ps->content || ps->display == D_NONE) continue;
-        Node* p = (Node*)arena_alloc(x->ar, sizeof(Node));
-        Node* t = (Node*)arena_alloc(x->ar, sizeof(Node));
-        memset(p, 0, sizeof *p); memset(t, 0, sizeof *t);
-        p->type = N_ELEM; p->tag = pe == 1 ? "::before" : "::after"; p->flags = NF_PSEUDO;
-        p->parent = e; p->cs = ps; p->first = p->last = t;
-        t->type = N_TEXT; t->parent = p; t->text = (char*)ps->content; t->tlen = (int)strlen(ps->content);
-        if(!t->tlen){ p->first = p->last = NULL; }
-        e->pse[pe - 1] = p;
+        make_pseudo(x, e, pe, ps);
+        if(out) out[pe - 1] = ps;
     }
 }
 
@@ -2457,10 +2573,10 @@ static void style_pseudos(SCtx* x, Node* e, Style* st, i32 root_fs){
  * casadas pode influir: sem atributos de apresentacao, sem tags especiais) */
 static int can_share(const Node* e){
     static const char* const TAGS[] = { "td", "th", "table", "font", "body", "img", "canvas", "svg", "hr", "html",
-        "input", "select", "textarea", "ul", "ol", "li", "iframe", "video", "embed", "object", NULL };
+        "input", "select", "textarea", "iframe", "video", "embed", "object", NULL };
     for(int i = 0; TAGS[i]; i++) if(!strcmp(e->tag, TAGS[i])) return 0;
     static const char* const ATTRS[] = { "align", "bgcolor", "border", "cellspacing", "cellpadding", "color", "face", "height",
-        "hspace", "nowrap", "size", "text", "valign", "vspace", "width", "type", "dir", "hidden", NULL };
+        "hspace", "nowrap", "size", "text", "valign", "vspace", "width", "type", "dir", "hidden", "start", "value", NULL };
     for(int k = 0; k < e->nattr; k++){
         const char* n = e->attrs[k].name;
         for(int i = 0; ATTRS[i]; i++) if(!strcmp(n, ATTRS[i])) return 0;
@@ -2506,13 +2622,19 @@ static void style_element(SCtx* x, Node* e, const Style* parent, i32 root_fs){
 
     const char* inl = dom_attr(e, "style");
     Share* sh = NULL; u32 h = 0;
-    if(!x->npm && !(inl && *inl) && parent && can_share(e)){
+    if(x->npm > 1) qsort(x->pm, (size_t)x->npm, sizeof(Rule*), rule_cmp);
+    int attr_content = 0;
+    for(int i = 0; i < x->npm; i++) if(x->pm[i]->b->uses_attr) attr_content = 1;
+    if(!attr_content && !(inl && *inl) && parent && can_share(e)){
         h = (u32)(u64)parent * 2654435761u ^ hash_str(e->tag, (int)strlen(e->tag));
         for(int i = 0; i < x->nm; i++) h = h * 31u + (u32)((u64)x->matched[i] >> 4);
+        for(int i = 0; i < x->npm; i++) h = h * 37u + (u32)((u64)x->pm[i] >> 4);
         sh = &x->share[h & (NSHARE - 1)];
-        if(sh->st && sh->h == h && sh->parent == parent && sh->nr == x->nm && !strcmp(sh->tag, e->tag)
-           && !memcmp(sh->rules, x->matched, sizeof(Rule*) * (size_t)x->nm)){
+        if(sh->st && sh->h == h && sh->parent == parent && sh->nr == x->nm && sh->npr == x->npm && !strcmp(sh->tag, e->tag)
+           && !memcmp(sh->rules, x->matched, sizeof(Rule*) * (size_t)x->nm)
+           && !memcmp(sh->rules + x->nm, x->pm, sizeof(Rule*) * (size_t)x->npm)){
             e->cs = sh->st; x->shared++;
+            for(int pe = 1; pe <= 2; pe++) if(sh->ps[pe - 1]) make_pseudo(x, e, pe, sh->ps[pe - 1]);
             return;
         }
     }
@@ -2522,12 +2644,15 @@ static void style_element(SCtx* x, Node* e, const Style* parent, i32 root_fs){
     Style* st = new_style(x, parent);
     e->cs = st;
     cascade(x, e, st, parent, root_fs, x->matched, x->nm, idecl, nid, 0);
-    if(x->npm && st->display != D_NONE) style_pseudos(x, e, st, root_fs);
+    Style* pst[2] = { NULL, NULL };
+    if(x->npm && st->display != D_NONE) style_pseudos(x, e, st, root_fs, pst);
     x->computed++;
     if(sh){
-        sh->h = h; sh->parent = parent; sh->tag = e->tag; sh->nr = x->nm; sh->st = st;
-        sh->rules = (Rule**)arena_alloc(x->ar, sizeof(Rule*) * (size_t)(x->nm ? x->nm : 1));
+        sh->h = h; sh->parent = parent; sh->tag = e->tag; sh->nr = x->nm; sh->npr = x->npm; sh->st = st;
+        sh->ps[0] = pst[0]; sh->ps[1] = pst[1];
+        sh->rules = (Rule**)arena_alloc(x->ar, sizeof(Rule*) * (size_t)(x->nm + x->npm + 1));
         memcpy(sh->rules, x->matched, sizeof(Rule*) * (size_t)x->nm);
+        memcpy(sh->rules + x->nm, x->pm, sizeof(Rule*) * (size_t)x->npm);
     }
 }
 
@@ -2549,9 +2674,9 @@ static void style_tree(SCtx* x, Node* n, const Style* parent, i32 root_fs){
 /* ---- estilo em paralelo: subarvores grandes viram tarefas executadas
  * pelos workers e pela propria thread principal. Cada tarefa tem seu
  * contexto e sua arena; o pai de cada subarvore ja tem estilo. */
-#define MAXJOBS 256
+#define MAXJOBS 1024
 #define MAXHELP 4
-typedef struct { Node* n; i32 rfs; } SJob;
+typedef struct { Node* n; Node* last; i32 rfs; int size; } SJob;   /* irmaos n..last */
 static struct {
     SJob job[MAXJOBS]; int njobs;
     volatile int next, finished;
@@ -2564,24 +2689,45 @@ static SCtx job_ctx[MAXHELP + 1];          /* 0 = thread principal */
 static Arena job_arena[MAXHELP + 1];
 static Task help_task[MAXHELP];
 
+/* tamanho de cada subarvore (indice = id do nodo), calculado uma vez por passo */
+static int* subsz = NULL; static int csubsz = 0;
+static void subtree_sizes(Doc* d){
+    if(csubsz < d->nnodes + 1){ csubsz = d->nnodes + 64; subsz = (int*)realloc(subsz, sizeof(int) * (size_t)csubsz); }
+    memset(subsz, 0, sizeof(int) * (size_t)(d->nnodes + 1));
+    /* em pos-ordem: cada nodo soma 1 + o seu tamanho ao pai */
+    Node* n = d->root;
+    while(n->first) n = n->first;
+    for(;;){
+        if(n == d->root) break;
+        Node* p = n->parent;
+        if(n->id > 0 && n->id <= d->nnodes && p && p->id > 0 && p->id <= d->nnodes) subsz[p->id] += subsz[n->id] + 1;
+        if(n->next){ n = n->next; while(n->first) n = n->first; }
+        else n = p;
+    }
+}
 static int count_nodes(Node* n, int cap){
-    int c = 0;
-    for(Node* k = n->first; k && c < cap; k = dom_next_in_tree(k, n)) c++;
-    return c;
+    (void)cap;
+    return n->id > 0 ? subsz[n->id] : 0;
 }
 
 static void run_jobs(SCtx* x){
     for(;;){
         int i = __atomic_fetch_add(&sp.next, 1, __ATOMIC_ACQ_REL);
         if(i >= sp.njobs) return;
-        Node* k = sp.job[i].n;
-        /* filtro de ancestrais desta subarvore */
+        Node* k0 = sp.job[i].n;
+        /* filtro de ancestrais destas subarvores */
         memset(x->bloom, 0, sizeof x->bloom);
-        for(Node* a = k->parent; a && a->type == N_ELEM; a = a->parent) bloom_node(x, a, 1);
-        style_element(x, k, k->parent && k->parent->type == N_ELEM ? k->parent->cs : NULL, sp.job[i].rfs);
-        i32 rfs = (k->parent && k->parent->type == N_DOC) ? k->cs->font_size : sp.job[i].rfs;
-        if(k->cs->display == D_NONE){ clear_styles(k); k->cs = NULL; }
-        else if(k->first){ bloom_node(x, k, 1); style_tree(x, k, k->cs, rfs); }
+        for(Node* a = k0->parent; a && a->type == N_ELEM; a = a->parent) bloom_node(x, a, 1);
+        const Style* par = k0->parent && k0->parent->type == N_ELEM ? k0->parent->cs : NULL;
+        for(Node* k = k0; k; k = k->next){
+            if(k->type == N_ELEM){
+                style_element(x, k, par, sp.job[i].rfs);
+                i32 rfs = (k->parent && k->parent->type == N_DOC) ? k->cs->font_size : sp.job[i].rfs;
+                if(k->cs->display == D_NONE){ clear_styles(k); k->cs = NULL; }
+                else if(k->first){ bloom_node(x, k, 1); style_tree(x, k, k->cs, rfs); bloom_node(x, k, 0); }
+            } else k->cs = NULL;
+            if(k == sp.job[i].last) break;
+        }
         if(__atomic_add_fetch(&sp.finished, 1, __ATOMIC_ACQ_REL) == sp.njobs){
             __atomic_store_n(&sp.all_done, 1, __ATOMIC_RELEASE);
             sys_futex_wake(&sp.all_done, 1);
@@ -2601,18 +2747,25 @@ static void help_run(Task* t){
 /* estiliza ate a profundidade em que as subarvores ficam "do tamanho certo";
  * as grandes demais sao divididas, as boas viram tarefa */
 static void split(SCtx* x, Node* n, const Style* parent, i32 rfs0, int target){
+    int open = -1;                  /* tarefa juntando irmaos pequenos seguidos */
     for(Node* k = n->first; k; k = k->next){
-        if(k->type != N_ELEM){ k->cs = NULL; continue; }
+        if(k->type != N_ELEM){ if(open < 0) k->cs = NULL; continue; }
         i32 rfs = (n->type == N_DOC) ? 16 : rfs0;
-        int size = count_nodes(k, target * 2 + 1);
-        if(size < 32 || sp.njobs >= MAXJOBS - 1){
+        int size = count_nodes(k, target * 2 + 1) + 1;
+        if(sp.njobs >= MAXJOBS - 1 || n->type == N_DOC){
             style_element(x, k, parent, rfs);
             if(n->type == N_DOC) rfs = k->cs->font_size;
             if(k->cs->display == D_NONE){ clear_styles(k); k->cs = NULL; }
+            else if(n->type == N_DOC && k->first && size > target){ bloom_node(x, k, 1); split(x, k, k->cs, rfs, target); bloom_node(x, k, 0); }
             else if(k->first){ bloom_node(x, k, 1); style_tree(x, k, k->cs, rfs); bloom_node(x, k, 0); }
             continue;
         }
-        if(size <= target){ sp.job[sp.njobs].n = k; sp.job[sp.njobs].rfs = rfs; sp.njobs++; continue; }
+        if(size <= target){
+            if(open >= 0 && sp.job[open].size + size <= target){ sp.job[open].last = k; sp.job[open].size += size; }
+            else { open = sp.njobs++; sp.job[open].n = k; sp.job[open].last = k; sp.job[open].rfs = rfs; sp.job[open].size = size; }
+            continue;
+        }
+        open = -1;
         /* grande: estiliza o proprio elemento aqui e divide os filhos */
         style_element(x, k, parent, rfs);
         if(n->type == N_DOC) rfs = k->cs->font_size;
@@ -2644,6 +2797,7 @@ void css_style_doc(Doc* d, i32 vw, i32 vh){
     if(helpers < 1 || total < 400){ style_tree(x, d->root, NULL, 16); return; }
     /* fase 1 (principal): o topo da arvore e a lista de subarvores */
     sp.njobs = 0; sp.next = 0; sp.finished = 0; sp.all_done = 0;
+    subtree_sizes(d);
     split(x, d->root, NULL, 16, total / (helpers * 4) + 1);
     u64 t2 = sys_time_ms();
     if(!sp.njobs) return;

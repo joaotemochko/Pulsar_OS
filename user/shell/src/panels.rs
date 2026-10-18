@@ -353,8 +353,11 @@ pub fn draw_settings(c: &Ctx, r: Rect, st: &Panels, hits: &mut Hits) {
             let cr = Rect::new(x, y, w, 60);
             card(c, cr);
             row_label(c, cr, cr.y + 30, "Layout do teclado", "");
-            ui::segmented(c.scr, Rect::new(cr.right() - 236, cr.y + 16, 220, 28), &["ABNT2 (Brasil)", "US"],
-                if cfg.abnt2 { 0 } else { 1 }, th, hits, &[Action::SetLayout(true), Action::SetLayout(false)]);
+            const LAYOUTS: [Layout; 4] = [Layout::Abnt, Layout::Abnt2, Layout::Us, Layout::UsIntl];
+            let sel = LAYOUTS.iter().position(|&l| l == cfg.layout).unwrap_or(1);
+            ui::segmented(c.scr, Rect::new(cr.right() - 336, cr.y + 16, 320, 28), &["ABNT", "ABNT2", "US", "US Intl."],
+                sel, th, hits, &[Action::SetLayout(Layout::Abnt), Action::SetLayout(Layout::Abnt2),
+                                 Action::SetLayout(Layout::Us), Action::SetLayout(Layout::UsIntl)]);
             y += 76;
             let cr = Rect::new(x, y, w, 186);
             card(c, cr);

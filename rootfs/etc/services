@@ -1,0 +1,7 @@
+# Servicos do Pulsar OS, iniciados e supervisionados pelo init (um por linha:
+# caminho [argumentos]). Se um servico cair, o init o reinicia; se cair mais
+# de 5 vezes em 30 segundos, desiste dele (para nao ficar em laco).
+/fsd.pulse
+/shell.pulse
+# compatibilidade: programas graficos Linux (Wayland) viram janelas do Pulsar
+/wlsrv.pulse

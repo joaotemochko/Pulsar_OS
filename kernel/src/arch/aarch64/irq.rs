@@ -29,14 +29,35 @@ pub extern "C" fn rust_el0_sync_handler(frame: *mut Context) {
     if ec == 0x15 {
         // SVC: ELR ja aponta para a instrucao seguinte.
         crate::trap::on_syscall(frame);
-    } else {
-        let what = match ec {
-            0x20 | 0x21 => "Instruction Abort",
-            0x24 | 0x25 => "Data Abort",
-            0x00 => "instrucao invalida",
-            0x07 => "acesso a FP/SIMD (softfloat)",
-            _ => "excecao sincrona",
+    } else if ec == 0x20 || ec == 0x24 {
+        // abort de EL0: falta de traducao (0b0001xx) ou de permissao
+        // (0b0011xx) pode ser uma pagina preguicosa do mmap
+        use crate::vm::Access;
+        let fsc = esr & 0x3C;
+        let (what, access) = if ec == 0x20 {
+            ("Instruction Abort", Access::Exec)
+        } else if esr & (1 << 6) != 0 {
+            ("Data Abort", Access::Write)
+        } else {
+            ("Data Abort", Access::Read)
         };
-        crate::trap::on_user_fault(frame, what, far);
+        if fsc == 0x04 || fsc == 0x0C {
+            crate::trap::on_page_fault(frame, what, far, access);
+        } else if esr & 0x3F == 0x21 {
+            crate::trap::on_user_fault_sig(frame, "acesso desalinhado", far, crate::signal::SIGBUS, 1);
+        } else {
+            crate::trap::on_user_fault(frame, what, far);
+        }
+    } else {
+        // sinal e si_code do Linux para cada classe de excecao
+        let pc = unsafe { (*frame).pc() };
+        let (what, sig, code, addr) = match ec {
+            0x22 | 0x26 => ("pc/sp desalinhado", crate::signal::SIGBUS, 1, far),
+            0x3C => ("breakpoint", crate::signal::SIGTRAP, 1, pc),
+            0x2C => ("excecao de ponto flutuante", crate::signal::SIGFPE, 0, pc),
+            0x00 => ("instrucao invalida", crate::signal::SIGILL, 1, pc),
+            _ => ("excecao sincrona", crate::signal::SIGILL, 1, pc),
+        };
+        crate::trap::on_user_fault_sig(frame, what, addr, sig, code);
     }
 }

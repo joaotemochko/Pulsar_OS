@@ -111,6 +111,8 @@ int  dns_resolve(const char* name, u32* ip);
 typedef struct Tls Tls;
 Tls* tls_new(const char* host);                        /* sem I/O ainda */
 int  tls_io(Tls* t, i64 sock, const u8* out, int outn, int* done, Buf* in, int* prog);  /* 0 segue, 1 fim, -1 erro */
+int  tls_ready(Tls* t);                       /* handshake concluido */
+int  tls_has_session(const char* host);        /* ha sessao para retomar */
 int  tls_error(Tls* t);
 void tls_close(Tls* t);
 const char* tls_error_text(int code);
@@ -213,6 +215,13 @@ struct Style {
     u32 color;                                /* 0xAARRGGBB */
     u32 bg;                                   /* alpha 0 = transparente */
     struct Image* bg_img; const char* bg_url;
+    /* camada de imagem de fundo e de mascara: tamanho (szk 0 auto, 1 cover,
+     * 2 contain, 3 explicito), posicao (pct = da sobra caixa - imagem), repeticao (bit0 x, bit1 y) */
+    u8  bg_szk, bg_rep, mask_szk, mask_rep;
+    Len bg_sw, bg_sh, bg_px, bg_py;
+    struct Image* mask_img; const char* mask_url;
+    const char* bg_grad;                      /* linear-/radial-gradient() de fundo (texto) */
+    Len mask_sw, mask_sh, mask_px, mask_py;
     Len margin[4], padding[4];                /* top right bottom left */
     i16 border_w[4]; u32 border_c[4];
     i16 radius;
@@ -280,11 +289,15 @@ int    image_pump(void);                      /* 1 se alguma imagem chegou desde
 int    image_pending(void);
 void   image_reset(void);
 void   image_draw(Fb* fb, Image* im, Rect dst, u8 alpha, int cover);
+void   image_draw_tiled(Fb* fb, Image* im, Rect box, i32 ox, i32 oy, i32 tw, i32 th, int rep, u8 alpha, int mask, u32 color);
 Image* image_svg_inline(const char* key, const char* svg, int len, u32 color);
 void   svg_serialize(const Node* n, Buf* out);
 
 /* ----------------------------------------------------------- layout.c */
-enum { DL_RECT, DL_BORDER, DL_TEXT, DL_IMAGE, DL_CLIP, DL_UNCLIP, DL_HIT, DL_CARET };
+enum { DL_RECT, DL_BORDER, DL_TEXT, DL_IMAGE, DL_CLIP, DL_UNCLIP, DL_HIT, DL_CARET, DL_BGIMAGE, DL_MASK, DL_GRAD };
+typedef struct Grad Grad;
+Grad* grad_build(Arena* ar, const char* spec, i32 w, i32 h);
+void  grad_draw(Fb* fb, Grad* g, Rect box, i32 radius, u8 alpha);
 typedef struct {
     u8  kind; u8 alpha; u8 fixed;        /* fixed: nao rola com a pagina */
     i32 x, y, w, h;
@@ -295,6 +308,8 @@ typedef struct {
     u8  bw[4]; u32 bc[4];
     Image* img;
     i16 ls;                              /* texto: letter-spacing (px) */
+    i32 ix, iy, iw, ih; u8 rep;          /* DL_BGIMAGE/DL_MASK: origem e tamanho do ladrilho, repeticao */
+    Grad* grad;                          /* DL_GRAD */
 } DItem;
 typedef struct { DItem* it; int n, cap; i32 width, height; u32 bg; Node* bg_node; } DList;
 void layout_doc(Doc* d, DList* dl, i32 vw, i32 vh);

@@ -5,13 +5,14 @@ resto do navegador roda no userspace:
 
 | Arquivo | O que faz |
 |---|---|
-| `net.c` | DNS (resolvedor do QEMU, `10.0.2.3`) com cache, HTTP/1.1 (chunked, redirecionamentos, POST), cookies |
+| `net.c` | DNS (resolvedor do QEMU, `10.0.2.3`) com cache, HTTP/1.1 (chunked, gzip/deflate, redirecionamentos, POST), cookies |
 | `tls.c`, `certs.c` | HTTPS com o BearSSL: TLS 1.0–1.2, validação X.509 pelas raízes da Mozilla, retomada de sessão por host |
 | `url.c` | URLs absolutas/relativas (RFC 3986) e o que se digita na barra (palavras soltas viram busca) |
 | `dom.c` | árvore DOM e parser HTML tolerante (tags implícitas, texto bruto, entidades, modo quirks) |
 | `css.c` | folhas de estilo, seletores, cascata, `var()`, `calc()`, cores modernas, `@media`, `@supports` |
 | `layout.c` | caixas → display list: blocos, linhas, inline-block, flex, grid, tabelas, posicionamento |
-| `paint.c`, `font.c`, `image.c` | pintura, texto TrueType (Noto + símbolos DejaVu) e imagens PNG/JPEG/GIF/SVG |
+| `paint.c`, `image.c`, `gradient.c` | pintura, imagens PNG/JPEG/GIF/SVG (inclusive `data:`), fundos em ladrilho, máscaras e gradientes |
+| `font.c`, `woff.c`, `varfont.c` | texto TrueType/OpenType: fontes embutidas, fontes web (WOFF/WOFF2) e instâncias de fontes variáveis |
 | `js.c`, `prelude.js` | QuickJS: o DOM exposto por funções nativas e a API do navegador escrita em JS |
 | `main.c` | interface, laço de eventos, carga da página, formulários, histórico |
 | `work.c` | threads: fila de tarefas dos workers e entrega dos resultados à thread principal |
@@ -27,8 +28,12 @@ resto do navegador roda no userspace:
   flexbox (wrap, grow/shrink, justify/align, `order`, `gap`), grid
   (`repeat()`, `fr`, `minmax`, `auto-fill`), tabelas (colspan, larguras
   min/max), `position` relative/absolute/fixed com `z-index`, `transform:
-  translate`, `overflow: hidden`, listas, bordas arredondadas, gradientes
-  (como cor sólida), fundo com imagem.
+  translate`, `overflow: hidden`, listas, bordas arredondadas, `float`/`clear`
+  com texto contornando (e `flow-root`/`overflow` contendo floats),
+  `::before`/`::after` com `content` (texto, `attr()`, aspas), gradientes
+  lineares/radiais/repetidos, `background-size/position/repeat`, `mask-image`
+  (ícones), `@font-face` (TTF/OTF/WOFF/WOFF2, `unicode-range`, fontes
+  variáveis instanciadas no peso pedido) e `font-weight` de 100 a 900.
 - **JavaScript** (QuickJS, ES2023): DOM (Node/Element/Document, `innerHTML`,
   `querySelector`, `classList`, `dataset`, `style`), eventos com captura e
   bolha, `setTimeout`/`setInterval`/`requestAnimationFrame`, `fetch`,
@@ -55,8 +60,14 @@ O Vela usa vários núcleos:
 - Até 8 conexões em paralelo (TCP e TLS não bloqueantes), conexões
   reaproveitadas por host (keep-alive) e sessões TLS retomadas; ChaCha20-Poly1305
   é preferido por ser mais rápido que AES em software.
-- Folhas de estilo, scripts e imagens são baixados em lotes paralelos. As
-  declarações CSS só são analisadas quando a regra casa com algum elemento.
+- Folhas de estilo, scripts e imagens são baixados em lotes paralelos, com
+  gzip. Novas conexões a um host esperam o primeiro handshake TLS e então
+  só retomam a sessão. As declarações CSS só são analisadas quando a regra
+  casa com algum elemento.
+- Estilo: índice de regras incremental (`:root`, `:is()`/`:where()` em
+  baldes próprios), elementos irmãos iguais compartilham o estilo calculado,
+  e o estilo só é refeito quando o DOM, as folhas ou a janela mudam (imagens
+  e fontes que chegam só refazem o layout).
 - A página aparece assim que HTML + CSS chegam; depois, scripts e lotes de
   imagens se alternam, um por volta do laço, sem travar rolagem e cliques.
   Mudanças vindas do JS refazem o layout com intervalo proporcional ao seu custo.
@@ -67,8 +78,9 @@ O Vela usa vários núcleos:
 
 - TLS 1.3 não existe no BearSSL: servidores que só aceitam 1.3 falham.
 - WebP, AVIF, vídeo, áudio, canvas (o contexto 2D existe, mas não desenha).
-- Floats viram blocos inline (colunas lado a lado funcionam; texto não contorna).
-- Sem `:hover` e sem animações/transições CSS.
+- Sem `:hover`, `box-shadow`, `grid-template-areas` e animações/transições CSS.
+- Fontes de sistema: Noto (sans/serif/mono) e métricas de Arial/Times; outros
+  nomes sem `@font-face` caem na família genérica seguinte, como no Firefox.
 - O JavaScript roda com ponto flutuante por software e sob emulação no QEMU:
   páginas muito pesadas demoram, e cada script tem 15 s de orçamento.
 

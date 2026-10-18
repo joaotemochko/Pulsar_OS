@@ -31,29 +31,39 @@ pub extern "C" fn rust_trap(frame: *mut Context) {
     }
 
     if !from_user {
-        // Excecao dentro do kernel: bug. Reporta e para esta hart.
+        // Excecao dentro do kernel: bug.
         let mut serial = crate::uart::RawUart;
         use core::fmt::Write;
         let _ = write!(serial,
             "\n[EXCECAO NO KERNEL] hart={} scause={:#x} stval={:#x} sepc={:#x}\n",
             super::cpu_id(), scause, stval, unsafe { (*frame).sepc });
-        loop { super::wait_for_interrupt(); }
+        // vira um oops: o processo atendido morre, o sistema segue
+        panic!("excecao no kernel (scause {:#x}) em {:#x}, endereco {:#x}", scause, unsafe { (*frame).sepc }, stval);
     }
     if scause == EXC_ECALL_U {
         unsafe { (*frame).sepc += 4 };
         crate::trap::on_syscall(frame);
-    } else {
-        let what = match scause {
-            0 => "instrucao desalinhada",
-            1 => "Instruction Access Fault",
-            2 => "instrucao ilegal",
-            5 => "Load Access Fault",
-            7 => "Store Access Fault",
-            12 => "Instruction Page Fault",
-            13 => "Load Page Fault",
-            15 => "Store Page Fault",
-            _ => "excecao sincrona",
+    } else if scause == 12 || scause == 13 || scause == 15 {
+        use crate::vm::Access;
+        let (what, access) = match scause {
+            12 => ("Instruction Page Fault", Access::Exec),
+            13 => ("Load Page Fault", Access::Read),
+            _ => ("Store Page Fault", Access::Write),
         };
-        crate::trap::on_user_fault(frame, what, stval);
+        crate::trap::on_page_fault(frame, what, stval, access);
+    } else {
+        use crate::signal::{SIGBUS, SIGILL, SIGSEGV, SIGTRAP};
+        let pc = unsafe { (*frame).sepc };
+        let (what, sig, code, addr) = match scause {
+            0 => ("instrucao desalinhada", SIGBUS, 1, stval),
+            4 | 6 => ("acesso desalinhado", SIGBUS, 1, stval),
+            1 => ("Instruction Access Fault", SIGSEGV, 2, stval),
+            5 => ("Load Access Fault", SIGSEGV, 2, stval),
+            7 => ("Store Access Fault", SIGSEGV, 2, stval),
+            3 => ("breakpoint", SIGTRAP, 1, pc),
+            2 => ("instrucao ilegal", SIGILL, 1, pc),
+            _ => ("excecao sincrona", SIGILL, 1, pc),
+        };
+        crate::trap::on_user_fault_sig(frame, what, addr, sig, code);
     }
 }

@@ -57,6 +57,54 @@
 //! 50 FUTEX_WAIT(addr, val, ms) dorme se *addr == val; 0 acordado, -1 mudou, -2 tempo
 //! 51 FUTEX_WAKE(addr, n)     acorda ate n threads esperando em addr; ret quantas
 //! 52 EXIT_GROUP              termina o processo inteiro (todas as threads)
+//! 53 MMAP(addr, len, prot | flags)  memoria anonima zerada e preguicosa;
+//!                            prot: 1 R, 2 W, 4 X; flags: 1<<8 FIXED,
+//!                            1<<9 NOREPLACE. Ret endereco ou -errno
+//! 54 MUNMAP(addr, len)       ret 0 ou -errno
+//! 55 MPROTECT(addr, len, prot) ret 0 ou -errno (a faixa precisa estar mapeada)
+//!
+//! Arquivos (ext2, ver file.rs). Caminhos sao (ptr, len), absolutos; flags
+//! de open, `struct stat` e `linux_dirent64` seguem o Linux generico. Todas
+//! retornam o valor ou -errno. Argumentos alem do terceiro vao em x3/a3.
+//! 56 OPEN(path, len, flags | mode << 32)   ret fd
+//! 57 CLOSE(fd)
+//! 58 READ(fd, buf, n)          59 WRITE(fd, buf, n)
+//! 60 LSEEK(fd, off, whence)    ret novo offset
+//! 61 FSTAT(fd, stat)           62 STAT(path, len, stat; x3: 1 = nao segue link)
+//! 63 GETDENTS(fd, buf, n)      ret bytes (0 = fim)
+//! 64 MKDIR(path, len, mode)    65 UNLINK(path, len, 1 = rmdir)
+//! 66 RENAME(old, oldlen, new; x3: newlen)
+//! 67 FTRUNCATE(fd, len)
+//! 68 SYMLINK(alvo, alvolen, path; x3: pathlen)
+//! 69 READLINK(path, len, buf; x3: bufsiz)  ret bytes
+//! 70 DUP(fd, novo)             novo = -1: o menor livre; senao dup2
+//! 71 PREAD(fd, buf, n; x3: off)   72 PWRITE(fd, buf, n; x3: off)
+//! 73 FSINFO(ptr)               5 u64: bloco, blocos, livres, inodes, inodes livres
+//!
+//! Processos:
+//! 74 SPAWN_EX(path, len, args; x3: args_len)  executa um ELF (ABI Linux) ou
+//!                            .pulse por caminho. args = u32 argc, u32 envc e as
+//!                            strings (argv depois envp) terminadas em NUL. Ret pid
+//! 75 WAIT(pid, status_ptr, flags)  pid -1 = qualquer filho; flags 1 = WNOHANG.
+//!                            Ret pid colhido (0 com WNOHANG), status estilo wait()
+//! 76 PIPE(fds_ptr, flags)     dois i32: leitura, escrita. flags: O_CLOEXEC, O_NONBLOCK
+//!
+//! Servicos do kernel comuns as duas ABIs (o mesmo codigo atende os
+//! processos da camada Linux). Estruturas e flags sao as POSIX (sockaddr_un,
+//! msghdr com SCM_RIGHTS, pollfd, PROT_*/MAP_* de mmap); ate 6 argumentos
+//! (x0..x5 / a0..a5); retornam o valor ou -errno.
+//! 78 SOCKET(dominio, tipo)          79 BIND(fd, end, tam)
+//! 80 LISTEN(fd, fila)               81 ACCEPT(fd, end, tam*, flags)
+//! 82 CONNECT(fd, end, tam)          83 SENDMSG(fd, msghdr, flags)
+//! 84 RECVMSG(fd, msghdr, flags)     85 PPOLL(pollfds, n, timespec*, 0)
+//! 86 MMAP_FD(end, tam, prot, flags, fd, off)   87 MEMFD(nome, flags)
+//! 88 SOCKETPAIR(dominio, tipo, 0, fds*)        89 SHUTDOWN(fd, como)
+//! 99 DEBUG_OOPS(tipo)        testa a recuperacao de falhas do kernel provocando uma
+//!                            na chamada: 0 panic, 1 acesso invalido no kernel, 2 panic
+//!                            segurando a trava do sistema de arquivos. So o chamador morre.
+//! 77 FCNTL(fd, cmd, arg)      F_GETFD 1, F_SETFD 2, F_GETFL 3, F_SETFL 4 (O_NONBLOCK,
+//!                            O_APPEND). O filho de SPAWN_EX herda os descritores sem
+//!                            close-on-exec (ex.: uma pipe no lugar do stdout).
 
 use crate::arch::{self, Context};
 use crate::process::{self, Message};
@@ -117,6 +165,32 @@ const SYS_THREAD_CREATE: u64 = 49;
 const SYS_FUTEX_WAIT: u64 = 50;
 const SYS_FUTEX_WAKE: u64 = 51;
 const SYS_EXIT_GROUP: u64 = 52;
+const SYS_MMAP: u64 = 53;
+const SYS_MUNMAP: u64 = 54;
+const SYS_MPROTECT: u64 = 55;
+const SYS_OPEN: u64 = 56;
+const SYS_CLOSE: u64 = 57;
+const SYS_READ: u64 = 58;
+const SYS_WRITE_FD: u64 = 59;
+const SYS_LSEEK: u64 = 60;
+const SYS_FSTAT: u64 = 61;
+const SYS_STAT: u64 = 62;
+const SYS_GETDENTS: u64 = 63;
+const SYS_MKDIR: u64 = 64;
+const SYS_UNLINK: u64 = 65;
+const SYS_RENAME: u64 = 66;
+const SYS_FTRUNCATE: u64 = 67;
+const SYS_SYMLINK: u64 = 68;
+const SYS_READLINK: u64 = 69;
+const SYS_DUP: u64 = 70;
+const SYS_PREAD: u64 = 71;
+const SYS_PWRITE: u64 = 72;
+const SYS_FSINFO: u64 = 73;
+const SYS_SPAWN_EX: u64 = 74;
+const SYS_WAIT: u64 = 75;
+const SYS_PIPE: u64 = 76;
+const SYS_FCNTL: u64 = 77;
+const SYS_DEBUG_OOPS: u64 = 99;
 
 const ERR: u64 = u64::MAX; // -1
 
@@ -146,13 +220,17 @@ struct ProcInfo {
 /// O intervalo [ptr, ptr+len) pertence ao processo corrente (e e
 /// gravavel, se `write`)? Toda syscall que toca memoria de usuario passa
 /// por aqui: um ponteiro invalido vira erro, nunca um fault no kernel.
-fn user_ok(ptr: u64, len: u64, write: bool) -> bool {
+pub fn user_ok(ptr: u64, len: u64, write: bool) -> bool {
     if len == 0 { return true; }
     let Some(end) = ptr.checked_add(len) else { return false };
     let root = process::current_root();
     let mut va = ptr & !0xFFF;
+    let access = if write { crate::vm::Access::Write } else { crate::vm::Access::Read };
     while va < end {
-        if arch::mmu::translate_user(root, va, write).is_none() {
+        // paginas de mmap ainda nao tocadas sao criadas aqui, como no fault
+        if arch::mmu::translate_user(root, va, write).is_none()
+            && !(crate::vm::fault(va, access) && arch::mmu::translate_user(root, va, write).is_some())
+        {
             return false;
         }
         va += 4096;
@@ -170,7 +248,10 @@ pub fn dispatch(frame: *mut Context) {
     match num {
         SYS_WRITE => ctx.set_ret(sys_write(a1, a2) as u64),
         SYS_YIELD => unsafe { process::schedule(frame) },
-        SYS_EXIT => unsafe { process::exit_current(frame) },
+        SYS_EXIT => unsafe {
+            process::set_status(process::exit_status(a1), false);
+            process::exit_current(frame)
+        },
         SYS_FB_INFO => {
             let (w, h) = crate::fb::size();
             ctx.set_ret(((w as u64) << 32) | h as u64);
@@ -303,7 +384,39 @@ pub fn dispatch(frame: *mut Context) {
             unsafe { process::futex_wait(frame, a1, a2 as u32, a3.min(600_000)) }
         }
         SYS_FUTEX_WAKE => ctx.set_ret(process::futex_wake(a1, a2)),
-        SYS_EXIT_GROUP => unsafe { process::exit_group(frame) },
+        SYS_EXIT_GROUP => unsafe {
+            process::set_status(process::exit_status(a1), true);
+            process::exit_group(frame)
+        },
+        SYS_MMAP => ctx.set_ret(crate::vm::mmap(a1, a2, a3 & 0xFF, a3 & !0xFF) as u64),
+        SYS_MUNMAP => ctx.set_ret(crate::vm::munmap(a1, a2) as u64),
+        SYS_MPROTECT => ctx.set_ret(crate::vm::mprotect(a1, a2, a3) as u64),
+        SYS_DEBUG_OOPS => ctx.set_ret(debug_oops(a1)),
+        // servicos compartilhados com a camada Linux: mesmo codigo, numeros do Pulsar
+        78..=89 => {
+            const SHARED: [u64; 12] = [198, 200, 201, 242, 203, 211, 212, 73, 222, 279, 199, 210];
+            crate::linux::dispatch_nr(frame, SHARED[(num - 78) as usize]);
+        }
+        SYS_SPAWN_EX => {
+            let a4 = ctx.arg(3);
+            ctx.set_ret(errno(sys_spawn_ex(a1, a2, a3, a4)));
+        }
+        SYS_WAIT => {
+            if a2 != 0 && !user_ok(a2, 4, true) { ctx.set_ret((-EFAULT) as u64); return; }
+            unsafe { process::wait_child(frame, a1 as i64, a2, a3 & 1 != 0) }
+        }
+        SYS_OPEN..=SYS_FSINFO | SYS_PIPE | SYS_FCNTL => {
+            let a4 = ctx.arg(3);
+            let r = file_syscall(num, a1, a2, a3, a4);
+            if r == Err(crate::file::EBLOCK) {
+                // pipe vazia/cheia: dorme e refaz a syscall quando houver novidade
+                let (key, seen, deadline) = crate::file::take_block();
+                crate::file::flush_wakes();
+                return unsafe { process::io_wait_until(frame, key, seen, deadline) };
+            }
+            ctx.set_ret(errno(r));
+            crate::file::flush_wakes();
+        }
         SYS_SLEEP => unsafe { process::sleep(frame, a1.min(60_000)) },
         SYS_TIME_MS => ctx.set_ret(crate::time::now_ms()),
         SYS_RTC => ctx.set_ret(arch::rtc_seconds()),
@@ -432,7 +545,7 @@ fn register_service(id: u64, pid: usize) {
     }
 }
 
-fn lookup_service(id: u64) -> i64 {
+pub fn lookup_service(id: u64) -> i64 {
     if (id as usize) < 8 {
         let pid = { let _g = SERVICES_LOCK.guard(); unsafe { SERVICES[id as usize] } };
         if pid != usize::MAX && process::is_alive(pid) {
@@ -546,5 +659,146 @@ fn sys_fs_create(name_ptr: u64, name_len: u64) -> i64 {
     match crate::fs::create(name, 2, 16) {
         Some(idx) => idx as i64,
         None => -2,
+    }
+}
+
+// ------------------------------------------------------------ arquivos (POSIX)
+
+const EFAULT: i64 = 14;
+const EINVAL: i64 = 22;
+const ENAMETOOLONG: i64 = 36;
+
+/// Ok(v) -> v; Err(e) -> -e.
+fn errno(r: Result<u64, i64>) -> u64 {
+    match r {
+        Ok(v) => v,
+        Err(e) => (-e) as u64,
+    }
+}
+
+/// Copia um caminho absoluto do usuario para `buf`.
+fn user_path<'a>(ptr: u64, len: u64, buf: &'a mut [u8; crate::ext2::PATH_MAX]) -> Result<&'a [u8], i64> {
+    if len == 0 { return Err(EINVAL); }
+    if len as usize > buf.len() { return Err(ENAMETOOLONG); }
+    if !user_ok(ptr, len, false) { return Err(EFAULT); }
+    unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len as usize) };
+    if buf[0] != b'/' { return Err(EINVAL); }
+    Ok(&buf[..len as usize])
+}
+
+fn user_buf(ptr: u64, len: u64, write: bool) -> Result<(), i64> {
+    if len > 0 && (ptr == 0 || !user_ok(ptr, len, write)) { Err(EFAULT) } else { Ok(()) }
+}
+
+fn put_stat(ptr: u64, st: crate::file::Stat) -> Result<u64, i64> {
+    user_buf(ptr, core::mem::size_of::<crate::file::Stat>() as u64, true)?;
+    unsafe { core::ptr::write_unaligned(ptr as *mut crate::file::Stat, st) };
+    Ok(0)
+}
+
+fn file_syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> Result<u64, i64> {
+    use crate::file;
+    let mut p1 = [0u8; crate::ext2::PATH_MAX];
+    match num {
+        SYS_OPEN => file::open(crate::ext2::ROOT_INO, user_path(a1, a2, &mut p1)?, a3 as u32, (a3 >> 32) as u16),
+        SYS_CLOSE => file::close(a1),
+        SYS_READ => { user_buf(a2, a3, true)?; file::read(a1, a2, a3, None) }
+        SYS_WRITE_FD => { user_buf(a2, a3, false)?; file::write(a1, a2, a3, None) }
+        SYS_PREAD => { user_buf(a2, a3, true)?; file::read(a1, a2, a3, Some(a4)) }
+        SYS_PWRITE => { user_buf(a2, a3, false)?; file::write(a1, a2, a3, Some(a4)) }
+        SYS_LSEEK => file::lseek(a1, a2 as i64, a3),
+        SYS_FSTAT => put_stat(a2, file::fstat(a1)?),
+        SYS_STAT => put_stat(a3, file::stat(crate::ext2::ROOT_INO, user_path(a1, a2, &mut p1)?, a4 & 1 == 0)?),
+        SYS_GETDENTS => { user_buf(a2, a3, true)?; file::getdents(a1, a2, a3) }
+        SYS_MKDIR => file::mkdir(crate::ext2::ROOT_INO, user_path(a1, a2, &mut p1)?, a3 as u16),
+        SYS_UNLINK => file::unlink(crate::ext2::ROOT_INO, user_path(a1, a2, &mut p1)?, a3 & 1 != 0),
+        SYS_RENAME => {
+            let mut p2 = [0u8; crate::ext2::PATH_MAX];
+            let from = user_path(a1, a2, &mut p1)?;
+            file::rename(crate::ext2::ROOT_INO, from, crate::ext2::ROOT_INO, user_path(a3, a4, &mut p2)?)
+        }
+        SYS_FTRUNCATE => file::ftruncate(a1, a2),
+        SYS_SYMLINK => {
+            // o alvo pode ser relativo: copia sem exigir a barra inicial
+            if a2 == 0 || a2 as usize > p1.len() { return Err(EINVAL); }
+            user_buf(a1, a2, false)?;
+            unsafe { core::ptr::copy_nonoverlapping(a1 as *const u8, p1.as_mut_ptr(), a2 as usize) };
+            let mut p2 = [0u8; crate::ext2::PATH_MAX];
+            file::symlink(&p1[..a2 as usize], crate::ext2::ROOT_INO, user_path(a3, a4, &mut p2)?)
+        }
+        SYS_READLINK => {
+            let path = user_path(a1, a2, &mut p1)?;
+            user_buf(a3, a4, true)?;
+            file::readlink(crate::ext2::ROOT_INO, path, a3, a4)
+        }
+        SYS_DUP => file::dup(a1, a2),
+        SYS_PIPE => {
+            user_buf(a1, 8, true)?;
+            let (rd, wr) = file::pipe(a2 as u32 & (file::O_CLOEXEC | file::O_NONBLOCK))?;
+            unsafe { core::ptr::write_unaligned(a1 as *mut [i32; 2], [rd as i32, wr as i32]) };
+            Ok(0)
+        }
+        SYS_FCNTL => match a2 {
+            1 => Ok(file::get_cloexec(a1)? as u64),
+            2 => file::set_cloexec(a1, a3 & 1 != 0),
+            3 => Ok(file::get_flags(a1)? as u64),
+            4 => file::set_flags(a1, a3 as u32),
+            _ => Err(EINVAL),
+        },
+        SYS_FSINFO => {
+            user_buf(a1, 40, true)?;
+            let v = file::fsinfo()?;
+            unsafe { core::ptr::write_unaligned(a1 as *mut [u64; 5], v) };
+            Ok(0)
+        }
+        _ => Err(EINVAL),
+    }
+}
+
+/// SPAWN_EX: copia caminho e argumentos para o kernel e executa.
+fn sys_spawn_ex(path: u64, plen: u64, args: u64, alen: u64) -> Result<u64, i64> {
+    let mut p = [0u8; crate::ext2::PATH_MAX];
+    let path = user_path(path, plen, &mut p)?;
+    const MAXA: usize = 64 * 1024;
+    if alen as usize > MAXA || (alen > 0 && alen < 8) { return Err(7); } // E2BIG
+    let pages = MAXA / 4096;
+    let buf = crate::frame_allocator::alloc_contig(pages).ok_or(12i64)?;
+    let block = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, alen as usize) };
+    let r = (|| {
+        if alen > 0 {
+            user_buf(args, alen, false)?;
+            unsafe { core::ptr::copy_nonoverlapping(args as *const u8, block.as_mut_ptr(), alen as usize) };
+        }
+        let (argc, envc) = if alen >= 8 {
+            (u32::from_le_bytes(block[0..4].try_into().unwrap()) as usize,
+             u32::from_le_bytes(block[4..8].try_into().unwrap()) as usize)
+        } else { (0, 0) };
+        let strings = if alen >= 8 { &block[8..] } else { &block[..0] };
+        // separa argv de envp: pula argc strings
+        let mut cut = 0;
+        for _ in 0..argc {
+            match strings[cut..].iter().position(|&c| c == 0) {
+                Some(i) => cut += i + 1,
+                None => return Err(EINVAL),
+            }
+        }
+        let a = crate::exec::Args { argv: &strings[..cut], argc, envp: &strings[cut..], envc };
+        crate::exec::spawn(crate::ext2::ROOT_INO, path, &a).map(|pid| pid as u64)
+    })();
+    crate::frame_allocator::free_contig(buf, pages);
+    r
+}
+
+/// DEBUG_OOPS: provoca uma falha do kernel na chamada (teste da
+/// recuperacao). Nao retorna, a nao ser com tipo invalido.
+pub fn debug_oops(kind: u64) -> u64 {
+    match kind {
+        0 => panic!("teste de oops pedido pelo processo"),
+        1 => unsafe { core::ptr::read_volatile(8 as *const u64) },
+        2 => {
+            let _g = crate::fs::FS.guard();
+            panic!("teste de oops com a trava FS presa");
+        }
+        _ => u64::MAX,
     }
 }

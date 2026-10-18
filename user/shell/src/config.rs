@@ -23,7 +23,7 @@ pub struct Config {
     pub seconds: bool,
     pub cpu_meter: bool,
     pub glass: bool,
-    pub abnt2: bool,
+    pub layout: Layout,
     /// clicar no icone do app em foco minimiza (como a barra do Windows)
     pub dock_minimize: bool,
 }
@@ -32,7 +32,7 @@ impl Config {
     pub const fn default() -> Config {
         Config {
             dark: false, accent: 0, wallpaper: 0, dock_size: 1, dock_magnify: true,
-            dock_left: false, clock24: true, seconds: false, cpu_meter: true, glass: true, abnt2: true, dock_minimize: false,
+            dock_left: false, clock24: true, seconds: false, cpu_meter: true, glass: true, layout: Layout::Abnt2, dock_minimize: false,
         }
     }
 
@@ -63,7 +63,7 @@ impl Config {
                 b"clock.seconds" => self.seconds = on,
                 b"menubar.cpu" => self.cpu_meter = on,
                 b"glass" => self.glass = on,
-                b"keyboard" => self.abnt2 = v != b"us",
+                b"keyboard" => { if let Some(l) = Layout::from_name(v) { self.layout = l; } }
                 _ => {}
             }
         }
@@ -76,7 +76,7 @@ impl Config {
             .s("# Edite aqui ou em Configurações; o desktop aplica ao salvar.\n")
             .s("# theme: light|dark  accent: azul|roxo|rosa|vermelho|laranja|amarelo|verde|grafite\n")
             .s("# wallpaper: aurora|ondas|oceano|por-do-sol|grafite|nebulosa\n")
-            .s("# dock.size: small|medium|large  dock.position: bottom|left  keyboard: abnt2|us\n")
+            .s("# dock.size: small|medium|large  dock.position: bottom|left  keyboard: abnt|abnt2|us|us-intl\n")
             .s("# dock.click_minimizes: on = clicar no app em foco minimiza (como no Windows)\n\n");
         out.s("theme=").s(if self.dark { "dark" } else { "light" }).s("\n");
         out.s("accent=").s(ACCENT_KEYS[self.accent as usize % 8]).s("\n");
@@ -89,7 +89,7 @@ impl Config {
         out.s("clock.seconds=").s(b(self.seconds)).s("\n");
         out.s("menubar.cpu=").s(b(self.cpu_meter)).s("\n");
         out.s("glass=").s(b(self.glass)).s("\n");
-        out.s("keyboard=").s(if self.abnt2 { "abnt2" } else { "us" }).s("\n");
+        out.s("keyboard=").s(self.layout.name()).s("\n");
     }
 }
 

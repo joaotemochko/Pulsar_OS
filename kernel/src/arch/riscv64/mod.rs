@@ -11,7 +11,7 @@ pub mod sbi;
 pub mod trap;
 pub mod uart;
 
-pub use context::Context;
+pub use context::{Context, FpState, fp_save, fp_restore};
 
 core::arch::global_asm!(include_str!("boot.S"));
 core::arch::global_asm!(include_str!("trap.S"));
@@ -29,7 +29,7 @@ pub mod platform {
     pub const KERNEL_BASE: u64 = 0x8020_0000;
     /// Janela do frame allocator: toda a RAM depois do kernel (a regiao
     /// grafica, dentro dela, fica reservada).
-    pub const HEAP_START: u64 = 0x8060_0000;
+    pub const HEAP_START: u64 = 0x8120_0000;   // 16 MiB para o kernel (imagem + .bss)
     pub const HEAP_SIZE: u64 = RAM_END - HEAP_START;
     pub const FB_PA: u64 = 0x8600_0000;
     /// Endereco da regiao grafica no espaco de usuario (igual ao AArch64,

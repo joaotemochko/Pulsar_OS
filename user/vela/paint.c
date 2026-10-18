@@ -60,6 +60,10 @@ void paint(Fb* fb, DList* dl, Rect view, Rect clip, i32 scroll, u32 page_bg){
         case DL_BORDER: border(&f, d, x, y); break;
         case DL_TEXT: font_draw(&f, d->font, x, y + font_ascent(d->font), d->s, d->n, d->color, d->ls); break;
         case DL_IMAGE: image_draw(&f, d->img, rect(x, y, d->w, d->h), d->alpha, d->radius == 1); break;
+        case DL_GRAD: grad_draw(&f, d->grad, rect(x, y, d->w, d->h), d->radius, d->alpha); break;
+        case DL_BGIMAGE: case DL_MASK:
+            image_draw_tiled(&f, d->img, rect(x, y, d->w, d->h), x + d->ix, y + d->iy, d->iw, d->ih, d->rep, d->alpha, d->kind == DL_MASK, d->color);
+            break;
         case DL_CARET: fb_fill(&f, rect(x, y, 1, d->h), d->color & 0xFFFFFF); break;
         }
     }

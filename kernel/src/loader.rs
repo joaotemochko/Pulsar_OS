@@ -15,7 +15,7 @@ pub struct Loaded {
 /// Alocador circular de ASIDs (1..=255; 0 e o kernel/ocioso).
 static NEXT_ASID: AtomicU32 = AtomicU32::new(0);
 
-fn alloc_asid() -> u16 {
+pub fn alloc_asid() -> u16 {
     let a = (NEXT_ASID.fetch_add(1, Ordering::Relaxed) % 255) as u16 + 1;
     // Em caso de reuso (wrap), garante que nao ha traducoes velhas.
     mmu::flush_asid(a);
@@ -115,7 +115,7 @@ pub unsafe fn load_pulse(file: *const u8, file_len: usize) -> Option<Loaded> {
     Some(Loaded { entry: header.entry, stack_top: header.stack_top, root })
 }
 
-fn sync_icache() {
+pub fn sync_icache() {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack, preserves_flags));
@@ -130,6 +130,18 @@ fn sync_icache() {
 /// Le um arquivo do sistema de arquivos e o carrega como processo.
 /// Retorna o pid, ou None em erro.
 pub fn spawn_from_fs(name: &str) -> Option<usize> {
+    // no ext2 o arquivo esta em /<nome>: o carregador geral entende tambem
+    // ELF e .pulse da personalidade Linux, e o filho herda os descritores
+    if crate::fs::is_ext2() && name.len() < 250 {
+        let mut path = [0u8; 256];
+        path[0] = b'/';
+        path[1..1 + name.len()].copy_from_slice(name.as_bytes());
+        let short = name.strip_suffix(".pulse").unwrap_or(name);
+        let mut argv = [0u8; 256];
+        argv[..short.len()].copy_from_slice(short.as_bytes());
+        let args = crate::exec::Args { argv: &argv[..short.len() + 1], argc: 1, envp: b"", envc: 0 };
+        return crate::exec::spawn(crate::ext2::ROOT_INO, &path[..1 + name.len()], &args).ok();
+    }
     let mut serial = Uart;
     let idx = crate::fs::find(name)?;
     let size = crate::fs::entry(idx).size_bytes as usize;

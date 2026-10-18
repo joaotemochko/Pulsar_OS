@@ -35,10 +35,12 @@ pub fn init() {
     }
 }
 
-/// Frames que nunca sao devolvidos (regiao grafica mapeada para os apps).
+/// Frames que nunca sao devolvidos nem copiados num fork: a regiao grafica
+/// mapeada para os apps e paginas da imagem do kernel expostas ao usuario
+/// (a pagina de retorno de sinal).
 #[inline]
-fn reserved(addr: u64) -> bool {
-    addr >= FB_PA && addr < FB_PA + FB_REGION_BYTES
+pub fn reserved(addr: u64) -> bool {
+    (addr >= FB_PA && addr < FB_PA + FB_REGION_BYTES) || addr < HEAP_START
 }
 
 #[inline]

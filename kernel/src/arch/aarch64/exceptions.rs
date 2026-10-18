@@ -12,7 +12,8 @@ pub fn install_vectors() {
     }
 }
 
-/// Excecao que o kernel nao sabe tratar (bug em EL1): reporta e para a CPU.
+/// Excecao que o kernel nao sabe tratar (bug em EL1): reporta e trata como
+/// oops (ver o panic handler).
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_exception_dispatch(index: u64, esr: u64, elr: u64) {
     let mut serial = crate::uart::RawUart;
@@ -21,7 +22,9 @@ pub extern "C" fn rust_exception_dispatch(index: u64, esr: u64, elr: u64) {
     let ec = (esr >> 26) & 0x3F;
     let _ = write!(
         serial,
-        "\n[EXCECAO NAO TRATADA] cpu={} indice={} EC={:#x} ESR={:#x} ELR={:#x} FAR={:#x}\n",
+        "\n[EXCECAO NO KERNEL] cpu={} indice={} EC={:#x} ESR={:#x} ELR={:#x} FAR={:#x}\n",
         super::cpu_id(), index, ec, esr, elr, far
     );
+    // vira um oops: o processo atendido morre, o sistema segue
+    panic!("excecao no kernel (EC {:#x}) em {:#x}, endereco {:#x}", ec, elr, far);
 }

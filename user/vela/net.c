@@ -253,13 +253,13 @@ static int chunked_done(const char* b, int n){
  * syscalls. Conexoes que terminam uma resposta bem delimitada voltam a um
  * pool (keep-alive) e servem a proxima requisicao ao mesmo host. */
 #define MAXPAR 8
-#define POOL 4
+#define POOL 12
 
 typedef struct { i64 sock; Tls* tls; int https, port; char host[256]; u64 since; } Conn;
 static Conn pool[POOL];
 static int npool = 0;
 
-enum { J_START, J_CONNECT, J_IO, J_DONE };
+enum { J_START, J_CONNECT, J_IO, J_DONE, J_WAIT };
 typedef struct {
     Req* rq; Fetch* f;
     char cur[URLMAX]; Url u;
@@ -270,6 +270,20 @@ typedef struct {
     Buf in; int hdr_end, clen, chunked, keep;
     u64 t0, t_act;
 } Job;
+static Job* g_jobs; static int g_active;      /* (so a thread de rede) */
+
+/* outra conexao a este host ainda esta no handshake TLS? Esperar por ela
+ * deixa a sessao pronta: as proximas conexoes so retomam (bem mais barato
+ * que uma troca de chaves completa) ou reaproveitam a conexao. */
+static int host_handshaking(const Url* u, const Job* self){
+    for(int i = 0; i < g_active; i++){
+        const Job* o = &g_jobs[i];
+        if(o == self || !o->c.https || strcmp(o->c.host, u->host)) continue;
+        if(o->state == J_CONNECT || (o->state == J_IO && o->c.tls && !tls_ready(o->c.tls))) return 1;
+    }
+    return 0;
+}
+static void job_connect(Job* j);
 
 volatile u32 net_gen = 1;
 static Mutex q_lock = MUTEX_INIT;
@@ -333,6 +347,11 @@ static void job_start(Job* j){
     if(j->body) buf_put(&j->out, j->body, j->blen);
     j->reused = pool_take(u, &j->c);
     if(j->reused){ j->state = J_IO; return; }
+    if(u->https && !tls_has_session(u->host) && host_handshaking(u, j)){ j->state = J_WAIT; return; }
+    job_connect(j);
+}
+static void job_connect(Job* j){
+    Url* u = &j->u;
     u32 ip;
     if(!dns_resolve(u->host, &ip)){ job_fail(j, "Não foi possível resolver %s (DNS).", u->host); return; }
     j->c.sock = sys_tcp_connect(ip, (u16)u->port);
@@ -415,6 +434,11 @@ static void job_finish(Job* j, int eof){
 static int job_step(Job* j){
     int prog = 0;
     u64 now = sys_time_ms();
+    if(j->state == J_WAIT){
+        if((j->reused = pool_take(&j->u, &j->c))){ j->state = J_IO; j->t_act = now; return 1; }
+        if(tls_has_session(j->u.host) || !host_handshaking(&j->u, j) || now - j->t0 > 3000){ job_connect(j); return 1; }
+        return 0;
+    }
     if(j->state == J_CONNECT){
         i64 st = sys_tcp_status(j->c.sock);
         if(st == 1){
@@ -508,10 +532,12 @@ static Req* q_pop(void){
 
 static void net_thread(void* arg){
     (void)arg;
-    Job jobs[MAXPAR];
+    static Job jobs[MAXPAR];
     int active = 0;
     memset(jobs, 0, sizeof jobs);
+    g_jobs = jobs;
     for(;;){
+        g_active = active;
         u32 seen = __atomic_load_n(&q_seq, __ATOMIC_ACQUIRE);
         /* novos pedidos ate encher as vagas */
         while(active < MAXPAR){
@@ -534,8 +560,10 @@ static void net_thread(void* arg){
             j->method = r->f.method ? r->f.method : "GET";
             j->body = r->f.body; j->blen = r->f.body_len; j->bctype = r->f.body_ctype;
             memset(&r->f.r, 0, sizeof r->f.r); r->f.ok = 0;
+            g_active = active;
             job_start(j);
         }
+        g_active = active;
         if(!active){ sys_futex_wait(&q_seq, seen, 0); continue; }
         int prog = 0;
         for(int i = 0; i < active; i++){

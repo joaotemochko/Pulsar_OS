@@ -8,7 +8,7 @@ pub mod mmu;
 pub mod timer;
 pub mod uart;
 
-pub use context::Context;
+pub use context::{Context, FpState, fp_save, fp_restore};
 
 core::arch::global_asm!(include_str!("boot.S"));
 core::arch::global_asm!(include_str!("vectors.S"));
@@ -28,7 +28,7 @@ pub mod platform {
     pub const KERNEL_BASE: u64 = 0x4000_0000;
     /// Janela do frame allocator: toda a RAM depois do kernel (a regiao
     /// grafica, dentro dela, fica reservada).
-    pub const HEAP_START: u64 = 0x4040_0000;
+    pub const HEAP_START: u64 = 0x4100_0000;   // 16 MiB para o kernel (imagem + .bss)
     pub const HEAP_SIZE: u64 = RAM_END - HEAP_START;
     /// Regiao grafica (back buffer, wallpaper, superficies): fisico...
     pub const FB_PA: u64 = 0x4600_0000;
@@ -79,6 +79,7 @@ pub fn console_putc(b: u8) {
 pub fn early_init() {
     unsafe { core::arch::asm!("msr tpidr_el1, xzr", options(nomem, nostack, preserves_flags)) };
     exceptions::install_vectors();
+    context::fp_enable();
 }
 
 /// Liga a MMU na CPU de boot com o mapa identidade do kernel.
@@ -95,6 +96,7 @@ pub fn irq_init_boot() {
 /// Inicializacao por CPU secundaria, ja com MMU ligada (feito no asm).
 pub fn secondary_init() {
     exceptions::install_vectors();
+    context::fp_enable();
     gic::init_cpu();
 }
 

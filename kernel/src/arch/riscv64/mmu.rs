@@ -22,6 +22,9 @@ const G: u64 = 1 << 5;
 const A: u64 = 1 << 6;
 const D: u64 = 1 << 7;
 const LEAF: u64 = R | W | X;
+/// Bit RSW (8, livre para o software): pagina de um objeto de memoria
+/// compartilhada (shm.rs). Nao e liberada com o espaco; o fork a compartilha.
+const RSW_SHARED: u64 = 1 << 8;
 
 const SATP_SV39: u64 = 8 << 60;
 /// Gigapaginas da RAM: indice da raiz de cada GiB de RAM_BASE ate RAM_END.
@@ -45,6 +48,18 @@ impl PageFlags {
     pub fn user_data() -> Self { Self { bits: R | W | U | A | D } }
     /// Regiao grafica no espaco do processo (mesmos bits; privada aqui).
     pub fn user_shared() -> Self { Self::user_data() }
+    /// Marca a pagina como de um objeto compartilhado (ver RSW_SHARED).
+    pub fn shared(self) -> Self { Self { bits: self.bits | RSW_SHARED } }
+    /// Pagina de mmap com protecao `prot` (bit0 R, bit1 W, bit2 X).
+    /// Sem nenhum bit: R sem U (so o kernel acessa: PROT_NONE). W sozinho
+    /// nao existe no Sv39, entao W implica R.
+    pub fn user_prot(prot: u64) -> Self {
+        if prot & 7 == 0 { return Self { bits: R | A }; }
+        let mut b = R | U | A;
+        if prot & 2 != 0 { b |= W | D; }
+        if prot & 4 != 0 { b |= X; }
+        Self { bits: b }
+    }
 }
 
 #[inline]
@@ -145,7 +160,7 @@ pub fn free_user_space(root: u64) {
                 let l0 = pte_pa(e1);
                 for i0 in 0..512 {
                     let e0 = entry(l0, i0);
-                    if e0 & V != 0 && e0 & LEAF != 0 {
+                    if e0 & V != 0 && e0 & LEAF != 0 && e0 & RSW_SHARED == 0 {
                         frame_allocator::free_frame(pte_pa(e0));
                     }
                 }
@@ -192,4 +207,95 @@ pub fn translate_user(root: u64, va: u64, write: bool) -> Option<u64> {
             level -= 1;
         }
     }
+}
+
+/// Visita as folhas de 4 KiB existentes de [start, end) sem criar tabelas;
+/// niveis ausentes sao pulados inteiros. Gigapaginas (kernel) sao ignoradas.
+unsafe fn walk_leaves(root: u64, start: u64, end: u64, mut f: impl FnMut(*mut u64)) {
+    let next = |va: u64, shift: u32| ((va >> shift) + 1) << shift;
+    let mut va = start & !0xFFF;
+    let end = end.min(1 << 38);
+    while va < end {
+        unsafe {
+            let e2 = entry(root, vpn(va, 2));
+            if e2 & V == 0 || e2 & LEAF != 0 { va = next(va, 30); continue; }
+            let e1 = entry(pte_pa(e2), vpn(va, 1));
+            if e1 & V == 0 || e1 & LEAF != 0 { va = next(va, 21); continue; }
+            f((pte_pa(e1) as *mut u64).add(vpn(va, 0)));
+        }
+        va += 4096;
+    }
+}
+
+/// Desmapeia [start, end) e devolve os frames. O chamador invalida a TLB.
+pub fn unmap_range(root: u64, start: u64, end: u64) {
+    let _g = crate::sync::MMU.guard();
+    unsafe {
+        walk_leaves(root, start, end, |p| {
+            let e = p.read_volatile();
+            if e & V != 0 {
+                p.write_volatile(0);
+                if e & RSW_SHARED == 0 { frame_allocator::free_frame(pte_pa(e)); }
+            }
+        });
+    }
+}
+
+/// Troca as permissoes das paginas presentes em [start, end).
+pub fn protect_range(root: u64, start: u64, end: u64, flags: PageFlags) {
+    let _g = crate::sync::MMU.guard();
+    unsafe {
+        walk_leaves(root, start, end, |p| {
+            let e = p.read_volatile();
+            if e & V != 0 {
+                p.write_volatile(pa_pte(pte_pa(e)) | flags.bits | V | (e & RSW_SHARED));
+            }
+        });
+    }
+}
+
+/// A pagina de `va` esta mapeada (com qualquer permissao)?
+pub fn is_mapped(root: u64, va: u64) -> bool {
+    let _g = crate::sync::MMU.guard();
+    let mut found = false;
+    unsafe { walk_leaves(root, va, va + 1, |p| found = p.read_volatile() & V != 0) };
+    found
+}
+
+/// fork(): espaco novo com uma COPIA de cada pagina privada de `src`.
+/// Paginas reservadas (regiao grafica) sao compartilhadas, nao copiadas.
+pub fn clone_user_space(src: u64) -> Option<u64> {
+    let dst = create_user_space()?;
+    unsafe {
+        for i2 in 0..512 {
+            if is_ram_idx(i2) || i2 == IDX_MMIO { continue; }
+            let e2 = entry(src, i2);
+            if e2 & V == 0 || e2 & LEAF != 0 { continue; }
+            let l1 = pte_pa(e2);
+            for i1 in 0..512 {
+                let e1 = entry(l1, i1);
+                if e1 & V == 0 || e1 & LEAF != 0 { continue; }
+                let l0 = pte_pa(e1);
+                for i0 in 0..512 {
+                    let e0 = entry(l0, i0);
+                    if e0 & V == 0 || e0 & LEAF == 0 { continue; }
+                    let va = ((i2 as u64) << 30) | ((i1 as u64) << 21) | ((i0 as u64) << 12);
+                    let pa = pte_pa(e0);
+                    let flags = PageFlags { bits: e0 & 0x3FE };
+                    let target = if frame_allocator::reserved(pa) || e0 & RSW_SHARED != 0 {
+                        pa
+                    } else {
+                        let Some(f) = frame_allocator::alloc_frame() else { free_user_space(dst); return None };
+                        core::ptr::copy_nonoverlapping(pa as *const u8, f as *mut u8, 4096);
+                        f
+                    };
+                    if !map_page_in(dst, va, target, flags) {
+                        free_user_space(dst);
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    Some(dst)
 }

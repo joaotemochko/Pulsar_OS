@@ -21,6 +21,15 @@ impl Uart {
     }
 }
 
+/// Bytes crus (descritores 1/2 do console): sem exigir UTF-8.
+pub fn write_bytes(bytes: &[u8]) {
+    let _g = CONSOLE.guard();
+    for &b in bytes {
+        if b == b'\n' { crate::arch::console_putc(b'\r'); }
+        crate::arch::console_putc(b);
+    }
+}
+
 impl fmt::Write for Uart {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.write_string(s);

@@ -1,5 +1,6 @@
 /* wm.c — cliente do WM: superficie propria, eventos e tema. */
 #include "pulsar.h"
+#include <string.h>
 
 static void pack_title(const char* t, u64* out){
     for(int i=0;i<3;i++){
@@ -23,7 +24,34 @@ static WmEvent decode(const Msg* m){
     return e;
 }
 
+/* Fala com o WM. Se ele caiu (o init o reinicia), espera o novo, registra
+ * a janela de novo e repete o pedido: o app sobrevive a queda do WM. */
+static void wm_call(App* a, Msg* m){
+    Msg orig=*m;
+    while(ipc_send(a->wm,m)<0){
+        u64 old=a->wm;
+        for(;;){
+            i64 p=sys_lookup(SVC_WM);
+            if(p>=0 && (u64)p!=old && sys_is_alive((u64)p)){ a->wm=(u64)p; break; }
+            sys_sleep(50);
+        }
+        Msg h; memset(&h,0,sizeof h);
+        h.tag=WM_OP_HELLO; h.data[0]=a->kind; h.data[1]=(u64)a->w; h.data[2]=(u64)a->h;
+        pack_title(a->title,&h.data[3]);
+        if(ipc_send(a->wm,&h)<0) continue;
+        a->slot=h.data[0];
+        a->w=(i32)h.data[1]<SURF_W?(i32)h.data[1]:SURF_W;
+        a->h=(i32)h.data[2]<SURF_H?(i32)h.data[2]:SURF_H;
+        a->fb.base=(u32*)sys_surf_map(a->slot);
+        a->fb.w=a->w; a->fb.h=a->h; a->fb.clip=rect(0,0,a->w,a->h);
+        a->redraw=1;
+        *m=orig;
+        if(m->tag==WM_OP_COMMIT){ m->data[0]=a->slot; m->data[1]=((u64)a->w<<16)|(u64)a->h; }
+    }
+}
+
 static void apply(App* a, WmEvent* e){
+    if(a->redraw){ a->redraw=0; e->changed=1; }
     if(e->w>0 && e->h>0 && (e->w!=a->w || e->h!=a->h)){
         a->w=e->w<SURF_W?e->w:SURF_W; a->h=e->h<SURF_H?e->h:SURF_H;
         a->fb.w=a->w; a->fb.h=a->h; a->fb.clip=rect(0,0,a->w,a->h);
@@ -42,6 +70,9 @@ void app_init(App* a, u64 kind, const char* title, i32 w, i32 h){
     m.tag=WM_OP_HELLO; m.data[0]=kind; m.data[1]=(u64)w; m.data[2]=(u64)h;
     pack_title(title,&m.data[3]);
     ipc_send(a->wm,&m);
+    a->kind=kind;
+    strncpy(a->title,title,24); a->title[24]=0;
+    a->redraw=0;
     a->slot=m.data[0];
     a->w=(i32)m.data[1]; a->h=(i32)m.data[2];
     a->open_file=m.data[3]?(i64)m.data[3]-1:-1;
@@ -54,26 +85,39 @@ void app_init(App* a, u64 kind, const char* title, i32 w, i32 h){
 
 WmEvent app_poll(App* a){
     Msg m; memset(&m,0,sizeof m); m.tag=WM_OP_POLL;
-    ipc_send(a->wm,&m);
+    wm_call(a,&m);
     WmEvent e=decode(&m); apply(a,&e); return e;
 }
 
 /* como app_poll, mas nao espera novidades (para quem tem trabalho em andamento) */
 WmEvent app_peek(App* a){
     Msg m; memset(&m,0,sizeof m); m.tag=WM_OP_POLL; m.data[0]=1;
-    ipc_send(a->wm,&m);
+    wm_call(a,&m);
     WmEvent e=decode(&m); apply(a,&e); return e;
 }
 
-WmEvent app_commit(App* a){
+WmEvent app_commit_rect(App* a, Rect d){
     Msg m; memset(&m,0,sizeof m); m.tag=WM_OP_COMMIT;
     m.data[0]=a->slot; m.data[1]=((u64)a->w<<16)|(u64)a->h;
-    ipc_send(a->wm,&m);
+    /* data[2]: retangulo alterado (bit 63 = presente; x 15 bits em 48..62,
+     * y em 32..47, w em 16..31, h em 0..15); vazio = tudo */
+    if(d.w > 0 && d.h > 0)
+        m.data[2]=1ull<<63 | ((u64)(d.x&0x7FFF))<<48 | ((u64)(d.y&0xFFFF))<<32
+                 | ((u64)(d.w&0xFFFF))<<16 | (u64)(d.h&0xFFFF);
+    wm_call(a,&m);
     WmEvent e=decode(&m); apply(a,&e); return e;
 }
+
+WmEvent app_commit(App* a){ return app_commit_rect(a, rect(0,0,0,0)); }
 
 void app_title(App* a, const char* t){
     Msg m; memset(&m,0,sizeof m); m.tag=WM_OP_TITLE;
     pack_title(t,&m.data[0]);
+    strncpy(a->title,t,24); a->title[24]=0;
+    wm_call(a,&m);
+}
+
+void app_bye(App* a){
+    Msg m; memset(&m,0,sizeof m); m.tag=WM_OP_BYE;
     ipc_send(a->wm,&m);
 }

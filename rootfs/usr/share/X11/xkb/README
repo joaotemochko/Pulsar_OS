@@ -1,0 +1,6 @@
+Diretorio de dados XKB (a libxkbcommon exige que exista).
+
+No Pulsar OS os programas graficos recebem o mapa de teclado pronto pelo
+Wayland (wl_keyboard.keymap), gerado a partir dos layouts do sistema
+(abnt, abnt2, us, us-intl) por tools/genkeymaps.py; os mapas ficam em
+/usr/share/pulsar/xkb. Nao ha regras do xkeyboard-config aqui.

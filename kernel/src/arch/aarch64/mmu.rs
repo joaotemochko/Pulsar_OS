@@ -17,6 +17,10 @@ const TABLE: u64 = 0b11;   // descritor de tabela (aponta p/ proximo nivel)
 const PAGE:  u64 = 0b11;   // descritor de pagina (L3)
 const VALID_MASK: u64 = 0b11;
 const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+/// Bit de software (55, ignorado pelo hardware): a pagina pertence a um
+/// objeto de memoria compartilhada (shm.rs), nao ao espaco. Desmapear ou
+/// destruir o espaco nao a libera, e o fork a compartilha em vez de copiar.
+const SW_SHARED: u64 = 1 << 55;
 
 /// Registradores de MMU publicados para as CPUs secundarias (boot.S).
 #[unsafe(no_mangle)] pub static mut MMU_MAIR: u64 = 0;
@@ -66,6 +70,16 @@ impl PageFlags {
     /// subarvore do kernel, igual para todos os processos).
     pub fn user_shared() -> Self {
         Self { bits: Self::IDX_NRM | Self::AP_USER | Self::AF | Self::SH_IS | Self::PXN | Self::UXN }
+    }
+    /// Marca a pagina como de um objeto compartilhado (ver SW_SHARED).
+    pub fn shared(self) -> Self { Self { bits: self.bits | SW_SHARED } }
+    /// Pagina de mmap com protecao `prot` (bit0 R, bit1 W, bit2 X).
+    /// Sem nenhum bit: presente, mas so o kernel acessa (PROT_NONE).
+    pub fn user_prot(prot: u64) -> Self {
+        let base = Self::IDX_NRM | Self::AF | Self::SH_IS | Self::PXN | Self::NG;
+        let ap = if prot & 2 != 0 { Self::AP_USER } else if prot & 5 != 0 { Self::AP_USER_RO } else { Self::AP_KERNEL };
+        let xn = if prot & 4 != 0 { 0 } else { Self::UXN };
+        Self { bits: base | ap | xn }
     }
 }
 
@@ -179,6 +193,9 @@ pub unsafe fn init() {
     let mut sctlr = SCTLR_EL1.get();
     sctlr &= !(1u64 << 19);                 // WXN off (W^X e feito por pagina)
     sctlr |= (1 << 0) | (1 << 2) | (1 << 12); // M, C, I
+    // UCT (15) e UCI (26): EL0 pode ler CTR_EL0 e limpar caches (DC CVAU,
+    // IC IVAU), como no Linux — JITs e a libffi sincronizam o proprio codigo
+    sctlr |= (1 << 15) | (1 << 26);
     unsafe {
         MMU_MAIR = MAIR_EL1.get();
         MMU_TCR = TCR_EL1.get();
@@ -267,7 +284,7 @@ pub fn free_user_space(l0: u64) {
                     let l3 = e2 & ADDR_MASK;
                     for i3 in 0..512 {
                         let e3 = table_entry(l3, i3);
-                        if e3 & VALID_MASK == PAGE {
+                        if e3 & VALID_MASK == PAGE && e3 & SW_SHARED == 0 {
                             frame_allocator::free_frame(e3 & ADDR_MASK);
                         }
                     }
@@ -318,4 +335,105 @@ pub fn translate_user(root_pa: u64, va: u64, write: bool) -> Option<u64> {
         if write && ap & 0b10 != 0 { return None; } // AP[2]=1: somente leitura
         Some((e3 & ADDR_MASK) | (va & 0xFFF))
     }
+}
+
+/// Visita as entradas L3 existentes de [start, end) sem criar tabelas:
+/// niveis ausentes sao pulados inteiros (reservas enormes custam pouco).
+unsafe fn walk_leaves(root_pa: u64, start: u64, end: u64, mut f: impl FnMut(*mut u64)) {
+    let next = |va: u64, shift: u32| ((va >> shift) + 1) << shift;
+    let mut va = start & !0xFFF;
+    while va < end {
+        let (i0, i1, i2, i3) = indices(va);
+        unsafe {
+            let e0 = table_entry(root_pa, i0);
+            if e0 & VALID_MASK != TABLE { va = next(va, 39); continue; }
+            let e1 = table_entry(e0 & ADDR_MASK, i1);
+            if e1 & VALID_MASK != TABLE { va = next(va, 30); continue; }
+            let e2 = table_entry(e1 & ADDR_MASK, i2);
+            if e2 & VALID_MASK != TABLE { va = next(va, 21); continue; }
+            f(((e2 & ADDR_MASK) as *mut u64).add(i3));
+        }
+        va += 4096;
+    }
+}
+
+/// Desmapeia [start, end) e devolve os frames. O chamador invalida a TLB.
+pub fn unmap_range(root_pa: u64, start: u64, end: u64) {
+    let _g = crate::sync::MMU.guard();
+    unsafe {
+        walk_leaves(root_pa, start, end, |p| {
+            let e = p.read_volatile();
+            if e & VALID_MASK == PAGE {
+                p.write_volatile(0);
+                if e & SW_SHARED == 0 { frame_allocator::free_frame(e & ADDR_MASK); }
+            }
+        });
+    }
+}
+
+/// Troca as permissoes das paginas presentes em [start, end).
+pub fn protect_range(root_pa: u64, start: u64, end: u64, flags: PageFlags) {
+    let _g = crate::sync::MMU.guard();
+    unsafe {
+        walk_leaves(root_pa, start, end, |p| {
+            let e = p.read_volatile();
+            if e & VALID_MASK == PAGE {
+                p.write_volatile((e & ADDR_MASK) | PAGE | flags.bits | (e & SW_SHARED));
+            }
+        });
+    }
+}
+
+/// A pagina de `va` esta mapeada (com qualquer permissao)?
+pub fn is_mapped(root_pa: u64, va: u64) -> bool {
+    let _g = crate::sync::MMU.guard();
+    let mut found = false;
+    unsafe { walk_leaves(root_pa, va, va + 1, |p| found = p.read_volatile() & VALID_MASK == PAGE) };
+    found
+}
+
+/// fork(): espaco novo com uma COPIA de cada pagina privada de `src`.
+/// Paginas reservadas (regiao grafica) sao compartilhadas, nao copiadas.
+pub fn clone_user_space(src: u64) -> Option<u64> {
+    let dst = create_user_space()?;
+    unsafe {
+        let k_l1 = table_entry(kernel_root(), 0) & ADDR_MASK;
+        let k_l2_gb0 = table_entry(k_l1, 0) & ADDR_MASK;
+        for i0 in 0..512 {
+            let e0 = table_entry(src, i0);
+            if e0 & VALID_MASK != TABLE { continue; }
+            let l1 = e0 & ADDR_MASK;
+            for i1 in 0..512 {
+                let e1 = table_entry(l1, i1);
+                if e1 & VALID_MASK != TABLE { continue; }
+                if i0 == 0 && e1 == table_entry(k_l1, i1) { continue; }
+                let l2 = e1 & ADDR_MASK;
+                for i2 in 0..512 {
+                    let e2 = table_entry(l2, i2);
+                    if e2 & VALID_MASK != TABLE { continue; }
+                    if i0 == 0 && i1 == 0 && e2 == table_entry(k_l2_gb0, i2) { continue; }
+                    let l3 = e2 & ADDR_MASK;
+                    for i3 in 0..512 {
+                        let e3 = table_entry(l3, i3);
+                        if e3 & VALID_MASK != PAGE { continue; }
+                        let va = ((i0 as u64) << 39) | ((i1 as u64) << 30) | ((i2 as u64) << 21) | ((i3 as u64) << 12);
+                        let pa = e3 & ADDR_MASK;
+                        let flags = PageFlags { bits: e3 & !ADDR_MASK & !VALID_MASK };
+                        let target = if frame_allocator::reserved(pa) || e3 & SW_SHARED != 0 {
+                            pa
+                        } else {
+                            let Some(f) = frame_allocator::alloc_frame() else { free_user_space(dst); return None };
+                            core::ptr::copy_nonoverlapping(pa as *const u8, f as *mut u8, 4096);
+                            f
+                        };
+                        if !map_page_in(dst, va, target, flags) {
+                            free_user_space(dst);
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(dst)
 }

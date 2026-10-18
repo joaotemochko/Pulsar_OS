@@ -310,7 +310,7 @@ pub fn udp_recv(port: u16, out: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
 
 // --------------------------------------------------------------------- TCP
 
-pub const MAX_TCP: usize = 12;   // o Vela abre varias conexoes ao mesmo tempo
+pub const MAX_TCP: usize = 24;   // o Vela abre varias conexoes e guarda outras ociosas (keep-alive)
 const RXCAP: usize = 64 * 1024;
 const TXCAP: usize = 16 * 1024;
 const RTO_MS: u64 = 400;
@@ -635,4 +635,39 @@ pub fn tcp_close(h: usize) {
         _ => {}
     }
     t.state = TcpState::Free;
+}
+
+// ------------------------------------------------------ prontidao (poll/epoll)
+
+/// (ha o que ler ou fim, cabe mais para enviar, erro/fechada) — sem consumir.
+pub fn tcp_ready(h: usize) -> (bool, bool, bool) {
+    poll();
+    let Some(t) = conn(h) else { return (true, false, true) };
+    match t.state {
+        TcpState::SynSent => (false, false, false),
+        TcpState::Established => (t.rx_len > 0, t.tx_len < TXCAP, false),
+        TcpState::PeerClosed => (true, false, true),
+        _ => (true, false, true),
+    }
+}
+
+/// Ha datagrama esperando na porta `port`?
+pub fn udp_pending(port: u16) -> bool {
+    poll();
+    let q = unsafe { &*core::ptr::addr_of!(UDPQ) };
+    q.iter().any(|d| d.used && d.dst_port == port)
+}
+
+/// Porta UDP local livre para um socket novo.
+pub fn udp_alloc_port() -> u16 {
+    unsafe {
+        let p = NEXT_PORT;
+        NEXT_PORT = if NEXT_PORT >= 60999 { 49152 } else { NEXT_PORT + 1 };
+        p
+    }
+}
+
+/// Porta local de uma conexao TCP (getsockname).
+pub fn tcp_local_port(h: usize) -> u16 {
+    conn(h).map_or(0, |t| t.lport)
 }

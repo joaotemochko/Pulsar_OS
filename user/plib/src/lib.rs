@@ -7,6 +7,7 @@
 //! * `App`: esqueleto de cliente do WM (superficie, eventos, tema)
 #![no_std]
 
+pub mod keymaps;
 pub mod fonts;
 pub mod gfx;
 pub mod icons;
@@ -332,6 +333,9 @@ pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
 pub const MOD_ALT: u8 = 4;
 pub const MOD_META: u8 = 8;
+/// AltGr (Alt da direita nos layouts que tem 3o/4o nivel) e Caps Lock ligado.
+pub const MOD_ALTGR: u8 = 16;
+pub const MOD_CAPS: u8 = 32;
 
 #[derive(Clone, Copy, Default)]
 pub struct Event {
@@ -368,8 +372,23 @@ impl Key {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Layout { Us, Abnt2 }
+/// Layouts de teclado (tabelas geradas por tools/genkeymaps.py, as mesmas
+/// que os programas Wayland recebem como mapa XKB).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Layout { Abnt, Abnt2, Us, UsIntl }
+
+impl Layout {
+    /// Nome usado no pulsar.cfg (keyboard=...).
+    pub fn name(self) -> &'static str { self.def().name }
+    pub fn from_name(n: &[u8]) -> Option<Layout> {
+        Some(match n { b"abnt" => Layout::Abnt, b"abnt2" => Layout::Abnt2, b"us" => Layout::Us,
+                       b"us-intl" => Layout::UsIntl, _ => return None })
+    }
+    fn def(self) -> &'static keymaps::LayoutDef {
+        match self { Layout::Abnt => &keymaps::ABNT, Layout::Abnt2 => &keymaps::ABNT2,
+                     Layout::Us => &keymaps::US, Layout::UsIntl => &keymaps::US_INTL }
+    }
+}
 
 /// Estado do teclado: modificadores, caps lock e tecla morta pendente.
 pub struct Keyboard {
@@ -379,8 +398,7 @@ pub struct Keyboard {
     pub layout: Layout,
 }
 
-const US_LO: &[u8; 58] = b"\x00\x001234567890-=\x00\x00qwertyuiop[]\x00\x00asdfghjkl;'`\x00\\zxcvbnm,./\x00*\x00 ";
-const US_HI: &[u8; 58] = b"\x00\x00!@#$%^&*()_+\x00\x00QWERTYUIOP{}\x00\x00ASDFGHJKL:\"~\x00|ZXCVBNM<>?\x00*\x00 ";
+const DEAD_BIT: u32 = 0x8000_0000;
 
 impl Keyboard {
     pub const fn new() -> Keyboard {
@@ -391,96 +409,85 @@ impl Keyboard {
     /// Retorna a tecla traduzida nos pressionamentos.
     pub fn feed(&mut self, code: u16, value: u32) -> Option<Key> {
         let down = value != 0;
+        let altgr = self.layout.def().altgr;
         let bit = match code {
             key::LSHIFT | key::RSHIFT => MOD_SHIFT,
             key::LCTRL | key::RCTRL => MOD_CTRL,
-            key::LALT | key::RALT => MOD_ALT,
+            key::LALT => MOD_ALT,
+            key::RALT => if altgr { MOD_ALTGR } else { MOD_ALT },
             key::LMETA | key::RMETA => MOD_META,
             _ => 0,
         };
         if bit != 0 {
             if down { self.mods |= bit } else { self.mods &= !bit }
-            return if down { Some(Key { code, ch: 0, mods: self.mods }) } else { None };
+            return if down { Some(Key { code, ch: 0, mods: self.mods_now() }) } else { None };
         }
         if !down { return None; }
         if code == key::CAPS {
             self.caps = !self.caps;
             return None;
         }
-        // atalhos (Ctrl/Super): so o codigo
-        if self.mods & (MOD_CTRL | MOD_META) != 0 {
-            return Some(Key { code, ch: 0, mods: self.mods });
+        // atalhos (Ctrl/Alt/Super): so o codigo
+        if self.mods & (MOD_CTRL | MOD_META | MOD_ALT) != 0 {
+            return Some(Key { code, ch: 0, mods: self.mods_now() });
         }
-        let shift = self.mods & MOD_SHIFT != 0;
-        // teclas mortas (ABNT2): ´ ` ~ ^ ¨
-        if let Some(d) = self.dead_for(code, shift) {
+        let v = self.translate(code);
+        if v & DEAD_BIT != 0 {
+            let d = v & !DEAD_BIT;
             if self.dead != 0 {
+                // segunda tecla morta: a mesma escreve o acento; outra troca
                 let prev = self.dead;
                 self.dead = if prev == d { 0 } else { d };
-                return Some(Key { code, ch: prev, mods: self.mods });
+                return Some(Key { code, ch: prev, mods: self.mods_now() });
             }
             self.dead = d;
-            return None;
+            // a tecla vai para o app sem caractere: apps nativos a ignoram;
+            // os programas Wayland (XKB) fazem a propria composicao com ela
+            return Some(Key { code, ch: 0, mods: self.mods_now() });
         }
-        let mut ch = self.translate(code, shift);
+        let mut ch = v;
         if self.dead != 0 && ch != 0 {
             let d = self.dead;
             self.dead = 0;
             if ch == ' ' as u32 { ch = d; } else if let Some(c) = compose(d, ch) { ch = c; }
         }
-        Some(Key { code, ch, mods: self.mods })
+        Some(Key { code, ch, mods: self.mods_now() })
     }
 
-    fn dead_for(&self, code: u16, shift: bool) -> Option<u32> {
-        if self.layout != Layout::Abnt2 { return None; }
-        match (code, shift) {
-            (26, false) => Some(0xB4),     // ´
-            (26, true) => Some('`' as u32),
-            (40, false) => Some('~' as u32),
-            (40, true) => Some('^' as u32),
-            (7, true) => Some(0xA8),       // ¨
-            _ => None,
-        }
-    }
+    fn mods_now(&self) -> u8 { self.mods | if self.caps { MOD_CAPS } else { 0 } }
 
-    fn translate(&self, code: u16, shift: bool) -> u32 {
-        let letter = matches!(code, 16..=25 | 30..=38 | 44..=50);
-        let up = if letter { shift ^ self.caps } else { shift };
-        if self.layout == Layout::Abnt2 {
-            let c = match (code, up) {
-                (39, false) => 0xE7, (39, true) => 0xC7,   // ç Ç
-                (41, false) => '\'' as u32, (41, true) => '"' as u32,
-                (27, false) => '[' as u32, (27, true) => '{' as u32,
-                (43, false) => ']' as u32, (43, true) => '}' as u32,
-                (53, false) => ';' as u32, (53, true) => ':' as u32,
-                (89, false) => '/' as u32, (89, true) => '?' as u32,
-                (86, false) => '\\' as u32, (86, true) => '|' as u32,
-                _ => 0,
-            };
-            if c != 0 { return c; }
+    fn translate(&self, code: u16) -> u32 {
+        let def = self.layout.def();
+        if (code as usize) < 128 {
+            let lv = def.keys[code as usize];
+            if lv != [0; 4] {
+                let shift = self.mods & MOD_SHIFT != 0;
+                let alpha = keymaps::ALPHA.contains(&(code as u8));
+                let up = if alpha { shift ^ self.caps } else { shift };
+                let ag = self.mods & MOD_ALTGR != 0;
+                return match (ag, up) {
+                    (false, false) => lv[0],
+                    (false, true) => lv[1],
+                    (true, false) => lv[2],
+                    (true, true) => if lv[3] != 0 { lv[3] } else { lv[2] },
+                };
+            }
         }
         match code {
-            0..=57 => (if up { US_HI } else { US_LO })[code as usize] as u32,
+            57 => ' ' as u32, 55 => '*' as u32,
             71 => '7' as u32, 72 => '8' as u32, 73 => '9' as u32, 74 => '-' as u32,
             75 => '4' as u32, 76 => '5' as u32, 77 => '6' as u32, 78 => '+' as u32,
             79 => '1' as u32, 80 => '2' as u32, 81 => '3' as u32, 82 => '0' as u32,
-            83 => '.' as u32, 98 => '/' as u32,
+            83 => if matches!(self.layout, Layout::Abnt | Layout::Abnt2) { ',' as u32 } else { '.' as u32 },
+            98 => '/' as u32,
             _ => 0,
         }
     }
 }
 
-/// Combina tecla morta + letra (á à â ã ä, maiusculas, ñ).
+/// Combina tecla morta + caractere (tabela gerada: á à â ã ä ç ñ ...).
 fn compose(dead: u32, c: u32) -> Option<u32> {
-    const BASE: &[u8] = b"aeiouAEIOUnN";
-    const ACUTE: [u32; 12] = [0xE1, 0xE9, 0xED, 0xF3, 0xFA, 0xC1, 0xC9, 0xCD, 0xD3, 0xDA, 0, 0];
-    const GRAVE: [u32; 12] = [0xE0, 0xE8, 0xEC, 0xF2, 0xF9, 0xC0, 0xC8, 0xCC, 0xD2, 0xD9, 0, 0];
-    const CIRC: [u32; 12] = [0xE2, 0xEA, 0xEE, 0xF4, 0xFB, 0xC2, 0xCA, 0xCE, 0xD4, 0xDB, 0, 0];
-    const TILDE: [u32; 12] = [0xE3, 0, 0, 0xF5, 0, 0xC3, 0, 0, 0xD5, 0, 0xF1, 0xD1];
-    const UML: [u32; 12] = [0xE4, 0xEB, 0xEF, 0xF6, 0xFC, 0xC4, 0xCB, 0xCF, 0xD6, 0xDC, 0, 0];
-    let i = BASE.iter().position(|&b| b as u32 == c)?;
-    let t = match dead { 0xB4 => &ACUTE, 0x60 => &GRAVE, 0x5E => &CIRC, 0x7E => &TILDE, 0xA8 => &UML, _ => return None };
-    Some(t[i]).filter(|&v| v != 0)
+    keymaps::COMPOSE.iter().find(|&&(d, b, _)| d == dead && b == c).map(|&(_, _, r)| r)
 }
 
 /// Codifica um codepoint em UTF-8. Retorna o numero de bytes.
@@ -540,6 +547,23 @@ pub const WM_OP_HELLO: u64 = 1;
 pub const WM_OP_COMMIT: u64 = 2;
 pub const WM_OP_POLL: u64 = 3;
 pub const WM_OP_TITLE: u64 = 4;
+/// O app fecha a propria janela (vai terminar): sem aviso de encerramento.
+pub const WM_OP_BYE: u64 = 5;
+
+/// data[2] opcional do COMMIT: retangulo alterado da superficie. Bit 63 =
+/// presente; x nos bits 48..62 (15 bits), y em 32..47, w em 16..31 e h em
+/// 0..15. Ausente = tudo mudou.
+pub fn pack_damage(r: Rect) -> u64 {
+    1 << 63 | (r.x as u64 & 0x7FFF) << 48 | (r.y as u64 & 0xFFFF) << 32
+        | (r.w as u64 & 0xFFFF) << 16 | (r.h as u64 & 0xFFFF)
+}
+
+pub fn commit_damage(v: u64) -> Option<Rect> {
+    if v >> 63 == 0 { return None; }
+    let r = Rect::new((v >> 48 & 0x7FFF) as i32, (v >> 32 & 0xFFFF) as i32,
+        (v >> 16 & 0xFFFF) as i32, (v & 0xFFFF) as i32);
+    if r.is_empty() { None } else { Some(r) }
+}
 
 pub const WM_FLAG_CLOSE: u64 = 1;
 pub const WM_FLAG_FOCUS: u64 = 2;
@@ -653,6 +677,9 @@ pub struct App {
     pub focused: bool,
     /// indice do arquivo a abrir (duplo clique no Finder), se houver
     pub open_file: Option<usize>,
+    kind: u64,
+    title: [u8; 24],
+    redraw: bool,
 }
 
 impl App {
@@ -670,13 +697,48 @@ impl App {
         let open_file = if m.data[3] > 0 { Some(m.data[3] as usize - 1) } else { None };
         let base = surface_map(slot) as *mut u32;
         let fb = Fb::new(base, w, h, SURF_W);
-        let mut app = App { wm, slot, fb, w, h, theme: Theme::new(false, 0x0A84FF), focused: true, open_file };
+        let mut t = [0u8; 24];
+        let n = title.len().min(24);
+        t[..n].copy_from_slice(&title[..n]);
+        let mut app = App { wm, slot, fb, w, h, theme: Theme::new(false, 0x0A84FF), focused: true, open_file,
+                            kind, title: t, redraw: false };
         app.poll();
         app
     }
 
+    /// Fala com o WM. Se ele caiu (o init o reinicia), espera o novo,
+    /// registra a janela de novo e repete o pedido: o app sobrevive.
+    fn call(&mut self, m: &mut Msg) {
+        let orig = *m;
+        while send(self.wm, m) < 0 {
+            let old = self.wm;
+            loop {
+                let p = lookup_service(SVC_WM);
+                if p >= 0 && p as usize != old && is_alive(p as usize) { self.wm = p as usize; break; }
+                sleep_ms(50);
+            }
+            let mut h = Msg::new(WM_OP_HELLO);
+            h.data[0] = self.kind;
+            h.data[1] = self.w as u64;
+            h.data[2] = self.h as u64;
+            pack_title(&self.title, &mut h.data[3..6]);
+            if send(self.wm, &mut h) < 0 { continue; }
+            self.slot = h.data[0];
+            self.w = (h.data[1] as i32).min(SURF_W);
+            self.h = (h.data[2] as i32).min(SURF_H);
+            self.fb = Fb::new(surface_map(self.slot) as *mut u32, self.w, self.h, SURF_W);
+            self.redraw = true;
+            *m = orig;
+            if m.tag == WM_OP_COMMIT {
+                m.data[0] = self.slot;
+                m.data[1] = ((self.w as u64) << 16) | self.h as u64;
+            }
+        }
+    }
+
     /// Aplica tamanho/tema do evento; marca `changed` se algo mudou.
     fn apply(&mut self, ev: &mut WmEvent) {
+        if self.redraw { self.redraw = false; ev.changed = true; }
         if ev.w > 0 && ev.h > 0 && (ev.w != self.w || ev.h != self.h) {
             self.w = ev.w.min(SURF_W);
             self.h = ev.h.min(SURF_H);
@@ -696,7 +758,7 @@ impl App {
     /// Busca o proximo evento (bloqueia ate o WM atender, ~1 quadro).
     pub fn poll(&mut self) -> WmEvent {
         let mut m = Msg::new(WM_OP_POLL);
-        send(self.wm, &mut m);
+        self.call(&mut m);
         let mut ev = WmEvent::decode(&m);
         self.apply(&mut ev);
         ev
@@ -704,19 +766,28 @@ impl App {
 
     /// "Desenhei": o WM compoe a superficie. Retorna eventos como o poll.
     pub fn commit(&mut self) -> WmEvent {
+        self.commit_rect(None)
+    }
+
+    /// COMMIT informando que so `dmg` (coordenadas da superficie) mudou.
+    pub fn commit_rect(&mut self, dmg: Option<Rect>) -> WmEvent {
         let mut m = Msg::new(WM_OP_COMMIT);
         m.data[0] = self.slot;
         m.data[1] = ((self.w as u64) << 16) | self.h as u64;
-        send(self.wm, &mut m);
+        m.data[2] = dmg.map(pack_damage).unwrap_or(0);
+        self.call(&mut m);
         let mut ev = WmEvent::decode(&m);
         self.apply(&mut ev);
         ev
     }
 
-    pub fn set_title(&self, t: &[u8]) {
+    pub fn set_title(&mut self, t: &[u8]) {
+        let n = t.len().min(24);
+        self.title = [0; 24];
+        self.title[..n].copy_from_slice(&t[..n]);
         let mut m = Msg::new(WM_OP_TITLE);
         pack_title(t, &mut m.data[0..3]);
-        send(self.wm, &mut m);
+        self.call(&mut m);
     }
 }
 

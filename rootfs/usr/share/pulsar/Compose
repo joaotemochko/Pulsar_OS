@@ -1,0 +1,64 @@
+# Compose do Pulsar OS (GERADO por tools/genkeymaps.py): teclas mortas.
+# Como no Brasil, acento agudo + c = c cedilha.
+
+<dead_acute> <a> : "á" aacute
+<dead_acute> <e> : "é" eacute
+<dead_acute> <i> : "í" iacute
+<dead_acute> <o> : "ó" oacute
+<dead_acute> <u> : "ú" uacute
+<dead_acute> <A> : "Á" Aacute
+<dead_acute> <E> : "É" Eacute
+<dead_acute> <I> : "Í" Iacute
+<dead_acute> <O> : "Ó" Oacute
+<dead_acute> <U> : "Ú" Uacute
+<dead_acute> <y> : "ý"
+<dead_acute> <Y> : "Ý"
+<dead_acute> <c> : "ç" ccedilla
+<dead_acute> <C> : "Ç" Ccedilla
+<dead_acute> <space> : "´" acute
+<dead_acute> <dead_acute> : "´" acute
+<dead_grave> <a> : "à"
+<dead_grave> <e> : "è"
+<dead_grave> <i> : "ì"
+<dead_grave> <o> : "ò"
+<dead_grave> <u> : "ù"
+<dead_grave> <A> : "À"
+<dead_grave> <E> : "È"
+<dead_grave> <I> : "Ì"
+<dead_grave> <O> : "Ò"
+<dead_grave> <U> : "Ù"
+<dead_grave> <space> : "`" grave
+<dead_grave> <dead_grave> : "`" grave
+<dead_circumflex> <a> : "â"
+<dead_circumflex> <e> : "ê"
+<dead_circumflex> <i> : "î"
+<dead_circumflex> <o> : "ô"
+<dead_circumflex> <u> : "û"
+<dead_circumflex> <A> : "Â"
+<dead_circumflex> <E> : "Ê"
+<dead_circumflex> <I> : "Î"
+<dead_circumflex> <O> : "Ô"
+<dead_circumflex> <U> : "Û"
+<dead_circumflex> <space> : "^" asciicircum
+<dead_circumflex> <dead_circumflex> : "^" asciicircum
+<dead_tilde> <a> : "ã"
+<dead_tilde> <o> : "õ"
+<dead_tilde> <n> : "ñ" ntilde
+<dead_tilde> <A> : "Ã"
+<dead_tilde> <O> : "Õ"
+<dead_tilde> <N> : "Ñ" Ntilde
+<dead_tilde> <space> : "~" asciitilde
+<dead_tilde> <dead_tilde> : "~" asciitilde
+<dead_diaeresis> <a> : "ä" adiaeresis
+<dead_diaeresis> <e> : "ë"
+<dead_diaeresis> <i> : "ï"
+<dead_diaeresis> <o> : "ö" odiaeresis
+<dead_diaeresis> <u> : "ü" udiaeresis
+<dead_diaeresis> <A> : "Ä" Adiaeresis
+<dead_diaeresis> <E> : "Ë"
+<dead_diaeresis> <I> : "Ï"
+<dead_diaeresis> <O> : "Ö" Odiaeresis
+<dead_diaeresis> <U> : "Ü" Udiaeresis
+<dead_diaeresis> <y> : "ÿ"
+<dead_diaeresis> <space> : "¨" diaeresis
+<dead_diaeresis> <dead_diaeresis> : "¨" diaeresis

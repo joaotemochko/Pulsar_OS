@@ -73,6 +73,149 @@ pub fn mix(bg: u32, fg: u32, a: u32) -> u32 {
     (rb & 0xFF00FF) | (g & 0x00FF00)
 }
 
+/// Copia `n` pixels de `s` para `d` (sem sobreposicao) so com acessos
+/// alinhados de 64 bits. O memcpy do compiler_builtins cai num laco byte a
+/// byte quando origem e destino diferem no alinhamento de 8 (todo x impar),
+/// e no RISC-V um acesso desalinhado vira trap emulado: aqui o caso
+/// desalinhado junta duas palavras alinhadas com deslocamentos.
+#[inline]
+pub unsafe fn copy_px(mut d: *mut u32, mut s: *const u32, mut n: usize) {
+    unsafe {
+        // AArch64 (alinhamento nao verificado, SCTLR.A=0): NEON, 64 bytes
+        // por iteracao, sem se importar com o alinhamento
+        #[cfg(target_arch = "aarch64")]
+        {
+            let blocks = n / 16;
+            if blocks > 0 {
+                core::arch::asm!(
+                    "2:",
+                    "ldp q0, q1, [{s}]",
+                    "ldp q2, q3, [{s}, #32]",
+                    "add {s}, {s}, #64",
+                    "stp q0, q1, [{d}]",
+                    "stp q2, q3, [{d}, #32]",
+                    "add {d}, {d}, #64",
+                    "subs {k}, {k}, #1",
+                    "b.ne 2b",
+                    s = inout(reg) s, d = inout(reg) d, k = inout(reg) blocks => _,
+                    out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+                    options(nostack),
+                );
+                n -= blocks * 16;
+            }
+        }
+        if n == 0 { return; }
+        if d as usize & 7 != 0 {
+            *d = *s;
+            d = d.add(1); s = s.add(1); n -= 1;
+        }
+        let mut d8 = d as *mut u64;
+        if s as usize & 7 == 0 {
+            let mut s8 = s as *const u64;
+            let mut k = n / 2;
+            while k >= 4 {
+                let (a, b, c, e) = (*s8, *s8.add(1), *s8.add(2), *s8.add(3));
+                *d8 = a; *d8.add(1) = b; *d8.add(2) = c; *d8.add(3) = e;
+                d8 = d8.add(4); s8 = s8.add(4); k -= 4;
+            }
+            while k > 0 { *d8 = *s8; d8 = d8.add(1); s8 = s8.add(1); k -= 1; }
+        } else if n >= 3 {
+            // s = 4 mod 8: o par k e a metade alta de s8[k] + a baixa de s8[k+1]
+            let mut s8 = s.sub(1) as *const u64;
+            let mut prev = *s8;
+            let pairs = (n - 1) / 2; // nunca le alem de s[n-1]
+            for _ in 0..pairs {
+                let next = *s8.add(1);
+                *d8 = (prev >> 32) | (next << 32);
+                prev = next;
+                d8 = d8.add(1); s8 = s8.add(1);
+            }
+        }
+        let done = if s as usize & 7 == 0 { n & !1 } else if n >= 3 { (n - 1) & !1 } else { 0 };
+        for i in done..n { *d.add(i) = *s.add(i); }
+    }
+}
+
+/// Preenche `n` pixels com `c` usando escritas alinhadas de 64 bits.
+#[inline]
+pub unsafe fn fill_px(mut d: *mut u32, mut n: usize, c: u32) {
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let blocks = n / 16;
+            if blocks > 0 {
+                core::arch::asm!(
+                    "dup v0.4s, {c:w}",
+                    "mov v1.16b, v0.16b",
+                    "2:",
+                    "stp q0, q1, [{d}]",
+                    "stp q0, q1, [{d}, #32]",
+                    "add {d}, {d}, #64",
+                    "subs {k}, {k}, #1",
+                    "b.ne 2b",
+                    c = in(reg) c, d = inout(reg) d, k = inout(reg) blocks => _,
+                    out("v0") _, out("v1") _,
+                    options(nostack),
+                );
+                n -= blocks * 16;
+            }
+        }
+        if n == 0 { return; }
+        if d as usize & 7 != 0 { *d = c; d = d.add(1); n -= 1; }
+        let c2 = c as u64 | (c as u64) << 32;
+        let mut d8 = d as *mut u64;
+        let mut k = n / 2;
+        while k >= 4 {
+            *d8 = c2; *d8.add(1) = c2; *d8.add(2) = c2; *d8.add(3) = c2;
+            d8 = d8.add(4); k -= 4;
+        }
+        while k > 0 { *d8 = c2; d8 = d8.add(1); k -= 1; }
+        if n & 1 != 0 { *d.add(n - 1) = c; }
+    }
+}
+
+/// Mistura `n` pixels com a cor constante `c` (alpha 1..=254), dois pixels
+/// por palavra de 64 bits: cada canal ocupa uma faixa de 16 bits, entao
+/// basta uma multiplicacao por par de canais (R|B e G).
+#[inline]
+pub unsafe fn blend_px(mut d: *mut u32, mut n: usize, c: u32, a: u32) {
+    unsafe {
+        if n == 0 { return; }
+        let a = (a + (a >> 7)) as u64; // 0..=256
+        let ia = 256 - a;
+        const M: u64 = 0x00FF_00FF_00FF_00FF;
+        const G: u64 = 0x0000_00FF_0000_00FF;
+        let c2 = c as u64 | (c as u64) << 32;
+        let frb = (c2 & M) * a;
+        let fg = ((c2 >> 8) & G) * a;
+        let one = |p: u32| -> u32 {
+            let p = p as u64;
+            let rb = (((p & M) * ia + frb) >> 8) & M;
+            let g = ((((p >> 8) & G) * ia + fg) & (G << 8)) as u64;
+            (rb | g) as u32
+        };
+        if d as usize & 7 != 0 { *d = one(*d); d = d.add(1); n -= 1; }
+        let mut d8 = d as *mut u64;
+        for _ in 0..n / 2 {
+            let p = *d8;
+            let rb = (((p & M) * ia + frb) >> 8) & M;
+            let g = (((p >> 8) & G) * ia + fg) & (G << 8);
+            *d8 = rb | g;
+            d8 = d8.add(1);
+        }
+        if n & 1 != 0 { *d.add(n - 1) = one(*d.add(n - 1)); }
+    }
+}
+
+/// Escurece `bg` (mistura com preto) com alpha 0..=255.
+#[inline(always)]
+pub fn darken(bg: u32, a: u32) -> u32 {
+    let ia = 256 - (a + (a >> 7)).min(256);
+    let rb = ((bg & 0xFF00FF) * ia) >> 8;
+    let g = ((bg & 0x00FF00) * ia) >> 8;
+    (rb & 0xFF00FF) | (g & 0x00FF00)
+}
+
 /// Interpola duas cores (t: 0..=255).
 #[inline]
 pub fn lerp(c0: u32, c1: u32, t: u32) -> u32 {
@@ -241,9 +384,9 @@ impl Fb {
         unsafe {
             let s = core::slice::from_raw_parts_mut(row.add(x0 as usize), (x1 - x0) as usize);
             if a >= 255 {
-                s.fill(c);
+                fill_px(s.as_mut_ptr(), s.len(), c);
             } else {
-                for p in s.iter_mut() { *p = mix(*p, c, a); }
+                blend_px(s.as_mut_ptr(), s.len(), c, a);
             }
         }
     }
@@ -374,44 +517,74 @@ impl Fb {
     /// da distancia ate `blur` px. `dy` desloca a sombra para baixo.
     pub fn shadow(&self, r: Rect, rad: i32, blur: i32, dy: i32, alpha: u32) {
         if blur <= 0 || alpha == 0 { return; }
+        let blur = blur.min(63);
         let s = r.offset(0, dy);
         let outer = s.inset(-blur);
         let cr = outer.intersect(&self.clip);
         if cr.is_empty() { return; }
         let inner = r.inset(rad.max(2)); // coberto pela propria janela
         let b16 = blur * 16;
+        // alpha em funcao da distancia (1/16 px) alem do raio: sem divisoes
+        // no laco
+        let mut lut = [0u8; 1024];
+        for d in 0..b16 {
+            let t = (256 - d * 256 / b16) as u32; // 256..0
+            lut[d as usize] = (alpha * ((t * t) >> 8) >> 8).min(255) as u8;
+        }
+        let at = |qx: i32, qy: i32| -> u32 {
+            let d = if qx == 0 { qy } else if qy == 0 { qx } else {
+                isqrt((qx * qx + qy * qy) as u32) as i32
+            } - rad * 16;
+            if d <= 0 { alpha } else if d < b16 { lut[d as usize] as u32 } else { 0 }
+        };
         let (sx0, sx1) = ((s.x + rad) * 16, (s.right() - rad) * 16);
         let (sy0, sy1) = ((s.y + rad) * 16, (s.bottom() - rad) * 16);
+        let qx_of = |x: i32| { let px = x * 16 + 8; if px < sx0 { sx0 - px } else if px > sx1 { px - sx1 } else { 0 } };
+        // faixa de x onde qx == 0 (alpha so depende da linha): vira span
+        let xa = (sx0 - 8 + 15).div_euclid(16).clamp(cr.x, cr.right());
+        let xb = ((sx1 - 8).div_euclid(16) + 1).clamp(xa, cr.right());
+        // bordas laterais: o perfil horizontal e o mesmo nas linhas do meio
+        let mut mid = [0u8; 160];
+        let lw = (xa - cr.x).min(80);
+        let rw = (cr.right() - xb).min(80);
+        let mut mid_ok = false;
         for y in cr.y..cr.bottom() {
             let py = y * 16 + 8;
             let qy = if py < sy0 { sy0 - py } else if py > sy1 { py - sy1 } else { 0 };
-            let in_inner_rows = y >= inner.y && y < inner.bottom();
             let row = self.row(y);
-            let mut x = cr.x;
-            while x < cr.right() {
-                if in_inner_rows && x >= inner.x && x < inner.right() {
-                    x = inner.right();
-                    continue;
+            let px1 = |x: i32, a: u32| unsafe {
+                if a > 0 { let p = row.add(x as usize); *p = darken(*p, a); }
+            };
+            if qy == 0 {
+                if !mid_ok {
+                    for i in 0..lw { mid[i as usize] = at(qx_of(cr.x + i), 0) as u8; }
+                    for i in 0..rw { mid[80 + i as usize] = at(qx_of(xb + i), 0) as u8; }
+                    mid_ok = true;
                 }
-                let px = x * 16 + 8;
-                let qx = if px < sx0 { sx0 - px } else if px > sx1 { px - sx1 } else { 0 };
-                let d = if qx == 0 { qy } else if qy == 0 { qx } else {
-                    isqrt((qx * qx + qy * qy) as u32) as i32
-                } - rad * 16;
-                if d < b16 {
-                    let a = if d <= 0 { alpha } else {
-                        let t = (256 - d * 256 / b16) as u32; // 256..0
-                        alpha * ((t * t) >> 8) >> 8
-                    };
-                    if a > 0 {
-                        unsafe {
-                            let p = row.add(x as usize);
-                            *p = mix(*p, 0, a);
-                        }
-                    }
+                for x in cr.x..xa {
+                    let i = x - cr.x;
+                    px1(x, if i < lw { mid[i as usize] as u32 } else { at(qx_of(x), 0) });
                 }
-                x += 1;
+                for x in xb..cr.right() {
+                    let i = x - xb;
+                    px1(x, if i < rw { mid[80 + i as usize] as u32 } else { at(qx_of(x), 0) });
+                }
+            } else {
+                for x in cr.x..xa { px1(x, at(qx_of(x), qy)); }
+                for x in xb..cr.right() { px1(x, at(qx_of(x), qy)); }
             }
+            // meio: alpha constante; pula o que a propria janela cobre
+            let a = at(0, qy).min(255);
+            if a == 0 || xa >= xb { continue; }
+            let (mut x0, x1) = (xa, xb);
+            if y >= inner.y && y < inner.bottom() {
+                let (i0, i1) = (inner.x.max(x0), inner.right().min(x1));
+                if i0 < i1 {
+                    if x0 < i0 { unsafe { blend_px(row.add(x0 as usize), (i0 - x0) as usize, 0, a) }; }
+                    x0 = i1;
+                }
+            }
+            if x0 < x1 { unsafe { blend_px(row.add(x0 as usize), (x1 - x0) as usize, 0, a) }; }
         }
     }
 
@@ -571,11 +744,8 @@ impl Fb {
             let x1 = dst.right().min(src.w - ox);
             if x0 >= x1 { continue; }
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src.row(syy).add((x0 + ox) as usize),
-                    self.row(y).add(x0 as usize),
-                    (x1 - x0) as usize,
-                );
+                copy_px(self.row(y).add(x0 as usize), src.row(syy).add((x0 + ox) as usize),
+                    (x1 - x0) as usize);
             }
         }
     }
@@ -602,26 +772,31 @@ impl Fb {
                 let x1 = dst.right().min(src.w + dx - sx);
                 if x0 < x1 {
                     unsafe {
-                        core::ptr::copy_nonoverlapping(srow.add((x0 - dx + sx) as usize),
-                            drow.add(x0 as usize), (x1 - x0) as usize);
+                        copy_px(drow.add(x0 as usize), srow.add((x0 - dx + sx) as usize),
+                            (x1 - x0) as usize);
                     }
                 }
                 continue;
             }
             let mrow = &mask[(cdy * rad) as usize..(cdy * rad + rad) as usize];
-            for x in dst.x..dst.right() {
-                let rx = x - dx;
-                let sxx = sx + rx;
-                if sxx < 0 || sxx >= src.w { continue; }
-                let cov = if rx < rad { mrow[rx as usize] as u32 }
-                    else if rx >= w - rad { mrow[(w - 1 - rx) as usize] as u32 }
-                    else { 255 };
-                if cov == 0 { continue; }
-                unsafe {
+            // limites validos na origem e no destino
+            let x0 = dst.x.max(dx - sx);
+            let x1 = dst.right().min(src.w + dx - sx);
+            if x0 >= x1 { continue; }
+            let corner = |x: i32, cov: u32| unsafe {
+                if cov != 0 {
                     let p = drow.add(x as usize);
-                    *p = mix(*p, *srow.add(sxx as usize), cov);
+                    *p = mix(*p, *srow.add((sx + x - dx) as usize), cov);
                 }
+            };
+            // canto esquerdo, meio copiado, canto direito
+            let lend = (dx + rad).clamp(x0, x1);
+            let rbeg = (dx + w - rad).clamp(lend, x1);
+            for x in x0..lend { corner(x, mrow[(x - dx) as usize] as u32); }
+            if lend < rbeg {
+                unsafe { copy_px(drow.add(lend as usize), srow.add((lend - dx + sx) as usize), (rbeg - lend) as usize) };
             }
+            for x in rbeg..x1 { corner(x, mrow[(dx + w - 1 - x) as usize] as u32); }
         }
     }
 

@@ -21,16 +21,18 @@
     mrs     x9,  elr_el1
     mrs     x10, sp_el0
     mrs     x11, spsr_el1
+    mrs     x12, tpidr_el0
     stp     x9,  x10, [sp, #16 * 16]
-    str     x11,      [sp, #16 * 17]
+    stp     x11, x12, [sp, #16 * 17]
 .endm
 
 .macro RESTORE_CONTEXT
     ldp     x9,  x10, [sp, #16 * 16]
-    ldr     x11,      [sp, #16 * 17]
+    ldp     x11, x12, [sp, #16 * 17]
     msr     elr_el1,  x9
     msr     sp_el0,   x10
     msr     spsr_el1, x11
+    msr     tpidr_el0, x12
     ldp     x0,  x1,  [sp, #16 * 0]
     ldp     x2,  x3,  [sp, #16 * 1]
     ldp     x4,  x5,  [sp, #16 * 2]
