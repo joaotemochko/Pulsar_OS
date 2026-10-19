@@ -56,7 +56,7 @@ fn map_user(off: u64, len: u64) {
         }
         o += 4096;
     }
-    crate::arch::mmu::flush_tlb();
+    crate::arch::mmu::sync_new_pages();
 }
 
 /// SYS_FB_MAP: mapeia toda a regiao grafica no processo corrente (o

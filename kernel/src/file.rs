@@ -18,7 +18,7 @@ use crate::process::{self, MAX_PROCS};
 use crate::unix;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-pub const MAX_FDS: usize = 64;
+pub const MAX_FDS: usize = 512;   // por processo (o Firefox abre centenas)
 
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
@@ -29,6 +29,7 @@ const EPIPE: i64 = 32;
 const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
 const ENOSYS: i64 = 38;
+const ENOTTY: i64 = 25;
 
 /// Erro interno: a operacao precisa esperar (pipe vazia/cheia). A camada de
 /// syscall chama `take_block()` e poe o processo em process::io_wait; a
@@ -89,6 +90,7 @@ fn table(l: usize) -> &'static mut [OpenFile; MAX_FDS] {
 
 fn is_open(ino: u32) -> bool {
     (0..MAX_PROCS).any(|l| table(l).iter().any(|f| (f.kind == Kind::File || f.kind == Kind::Dir) && f.ino == ino))
+        || crate::vm::is_mapped_ino(ino)
 }
 
 fn add_orphan(ino: u32) {
@@ -109,7 +111,7 @@ fn after_close(ino: u32) {
 
 // ------------------------------------------------------------ pipes
 
-const MAX_PIPES: usize = 64;
+const MAX_PIPES: usize = 256;
 const PIPE_PAGES: usize = 16;
 const PIPE_CAP: u64 = (PIPE_PAGES * 4096) as u64;
 
@@ -140,6 +142,7 @@ static mut PENDING_N: usize = 0;
 static PENDING_ANY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn push_wake(key: u64) {
+    process::bump_io_seq(key);
     PENDING_ANY.store(true, Ordering::Release);
     unsafe {
         let p = &mut *(&raw mut PENDING);
@@ -206,8 +209,8 @@ pub(crate) fn drop_ref(f: OpenFile) {
             let m = &mut mems()[f.ino as usize];
             m.refs -= 1;
             if m.refs == 0 {
-                crate::frame_allocator::free_contig(m.buf, MEM_PAGES);
-                *m = MemFile { buf: 0, len: 0, refs: 0 };
+                crate::frame_allocator::free_contig(m.buf, m.pages as usize);
+                *m = MemFile { buf: 0, len: 0, refs: 0, pages: 0 };
             }
         }
         Kind::Event => {
@@ -246,11 +249,13 @@ pub(crate) fn drop_ref(f: OpenFile) {
 // ------------------------------------------------------------ /dev e /proc
 
 /// Texto gerado na abertura (arquivos de /proc): somente leitura.
-const MEM_PAGES: usize = 4;
+/// Paginas do texto: /proc/self/maps de um programa grande (o Firefox tem
+/// centenas de bibliotecas) passa de 100 KB; a glibc acha a pilha nele.
+fn mem_pages(which: &str) -> usize { if which == "maps" { 64 } else { 4 } }
 #[derive(Clone, Copy)]
-struct MemFile { buf: u64, len: u64, refs: u32 }
-static mut MEMS: [MemFile; 16] = [MemFile { buf: 0, len: 0, refs: 0 }; 16];
-fn mems() -> &'static mut [MemFile; 16] { unsafe { &mut *(&raw mut MEMS) } }
+struct MemFile { buf: u64, len: u64, refs: u32, pages: u32 }
+static mut MEMS: [MemFile; 128] = [MemFile { buf: 0, len: 0, refs: 0, pages: 0 }; 128];
+fn mems() -> &'static mut [MemFile; 128] { unsafe { &mut *(&raw mut MEMS) } }
 
 /// Escritor de texto num buffer fixo.
 pub struct Text<'a> { pub buf: &'a mut [u8], pub len: usize }
@@ -283,7 +288,10 @@ fn special(path: &[u8]) -> Option<Special> {
         b"/proc/cpuinfo" => Special::Proc("cpuinfo"),
         b"/proc/meminfo" => Special::Proc("meminfo"),
         b"/proc/version" => Special::Proc("version"),
+        b"/proc/mounts" => Special::Proc("mounts"),
         _ => match proc_self(path)? {
+            b"mounts" => Special::Proc("mounts"),
+            b"mountinfo" => Special::Proc("mountinfo"),
             b"maps" => Special::Proc("maps"),
             b"comm" => Special::Proc("comm"),
             b"cmdline" => Special::Proc("cmdline"),
@@ -316,6 +324,16 @@ fn proc_text(which: &str, out: &mut [u8]) -> usize {
                 total, free, free);
         }
         "version" => { let _ = write!(t, "Linux version 6.1.0-pulsar (Pulsar OS, personalidade Linux)\n"); }
+        // pontos de montagem como o Linux os descreve (a glib/GIO e a libmount
+        // leem para saber os volumes): o disco ext2 na raiz, /proc e /dev
+        "mounts" => {
+            let _ = t.write_str("/dev/vda / ext2 rw,relatime 0 0\nproc /proc proc rw,nosuid,nodev,noexec 0 0\n\
+                devtmpfs /dev devtmpfs rw,nosuid 0 0\n");
+        }
+        "mountinfo" => {
+            let _ = t.write_str("1 0 254:0 / / rw,relatime - ext2 /dev/vda rw\n\
+                2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n3 1 0:3 / /dev rw,nosuid - devtmpfs devtmpfs rw\n");
+        }
         "maps" => { t.len = crate::vm::maps_text(t.buf); }
         "cmdline" => { t.len = process::cmdline(t.buf); }
         "status" | "stat" => {
@@ -327,7 +345,7 @@ fn proc_text(which: &str, out: &mut [u8]) -> usize {
             let clk = crate::time::ticks_to_ms(ticks) / 10;              // em 1/100 s (CLK_TCK)
             if which == "status" {
                 let _ = write!(t, "Name:\t{}\nUmask:\t0022\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n\
-                    Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t{}\nVmRSS:\t0 kB\n\
+                    Uid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nThreads:\t{}\nVmRSS:\t0 kB\n\
                     SigQ:\t0/64\nCpus_allowed_list:\t0-{}\n", name, pid, tid, ppid, threads,
                     process::online_cpus().saturating_sub(1));
             } else {
@@ -489,6 +507,9 @@ fn need_ext2() -> Res<()> {
 }
 
 fn get(l: usize, fd: u64) -> Res<OpenFile> {
+    // descritor e `int` no Linux: a libc nao garante os 32 bits altos do
+    // registrador (a glibc passou AT_FDCWD como 0xffffff9c)
+    let fd = fd as u32 as u64;
     let f = *table(l).get(fd as usize).ok_or(EBADF)?;
     if f.kind == Kind::Free { Err(EBADF) } else { Ok(f) }
 }
@@ -519,6 +540,23 @@ pub fn open(at: u32, path: &[u8], flags: u32, mode: u16) -> Res<u64> {
         crate::shm::fd_ref(id, -1);            // a referencia agora e do descritor
         return r;
     }
+    // /proc/self/fd/N: abre de novo o que o descritor N tem, como no Linux
+    // (uma descricao nova, com os flags pedidos). O Firefox faz assim a
+    // copia somente leitura de um memfd.
+    if let Some(n) = proc_self(path).and_then(|r| r.strip_prefix(b"fd/"))
+        .and_then(|d| core::str::from_utf8(d).ok()?.parse::<u32>().ok())
+    {
+        let _g = FS.guard();
+        let f = get(l, n as u64)?;
+        let cloexec = flags & O_CLOEXEC != 0;
+        let nf = match f.kind {
+            Kind::File | Kind::Dir | Kind::Shm => OpenFile { kind: f.kind, ino: f.ino, cloexec, off: 0,
+                flags: flags & (O_ACCMODE | O_NONBLOCK | O_APPEND) },
+            _ => OpenFile { cloexec, ..f },
+        };
+        add_ref(&nf);
+        return install(l, nf, 0).inspect_err(|_| drop_ref(nf));
+    }
     let mut exe = [0u8; 256];
     if let Some(n) = special_link(path, &mut exe) {
         // /proc/self/exe: abre o proprio executavel
@@ -530,15 +568,16 @@ pub fn open(at: u32, path: &[u8], flags: u32, mode: u16) -> Res<u64> {
         let f = match sp {
             Special::Dev(kind) => OpenFile { kind, ino: 0, flags: fl, cloexec, off: 0 },
             Special::Proc(which) => {
-                let buf = crate::frame_allocator::alloc_contig(MEM_PAGES).ok_or(ext2::ENOSPC)?;
-                let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, MEM_PAGES * 4096) };
+                let pages = mem_pages(which);
+                let buf = crate::frame_allocator::alloc_contig(pages).ok_or(ext2::ENOSPC)?;
+                let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, pages * 4096) };
                 let len = proc_text(which, out) as u64;
                 let _g = FS.guard();
                 let Some(i) = mems().iter().position(|m| m.buf == 0) else {
-                    crate::frame_allocator::free_contig(buf, MEM_PAGES);
+                    crate::frame_allocator::free_contig(buf, pages);
                     return Err(ENFILE);
                 };
-                mems()[i] = MemFile { buf, len, refs: 1 };
+                mems()[i] = MemFile { buf, len, refs: 1, pages: pages as u32 };
                 let f = OpenFile { kind: Kind::Mem, ino: i as u32, flags: fl & !O_ACCMODE, cloexec, off: 0 };
                 return install(l, f, 0).inspect_err(|_| drop_ref(f));
             }
@@ -574,7 +613,7 @@ pub fn close(fd: u64) -> Res<u64> {
     let l = leader()?;
     let _g = FS.guard();
     let f = get(l, fd)?;
-    table(l)[fd as usize] = FREE;
+    table(l)[fd as u32 as usize] = FREE;
     drop_ref(f);
     Ok(0)
 }
@@ -637,7 +676,7 @@ pub fn read(fd: u64, dst: u64, len: u64, at: Option<u64>) -> Res<u64> {
             if off >= m.len { return Ok(0); }
             let n = len.min(m.len - off);
             unsafe { core::ptr::copy_nonoverlapping((m.buf + off) as *const u8, dst as *mut u8, n as usize) };
-            if at.is_none() { table(l)[fd as usize].off = off + n; }
+            if at.is_none() { table(l)[fd as u32 as usize].off = off + n; }
             Ok(n)
         }
         Kind::Dir => Err(EISDIR),
@@ -645,7 +684,7 @@ pub fn read(fd: u64, dst: u64, len: u64, at: Option<u64>) -> Res<u64> {
             if f.flags & O_ACCMODE == O_WRONLY { return Err(EBADF); }
             let off = at.unwrap_or(f.off);
             let n = ext2::read(f.ino, off, dst as *mut u8, len as usize)? as u64;
-            if at.is_none() { table(l)[fd as usize].off = off + n; }
+            if at.is_none() { table(l)[fd as u32 as usize].off = off + n; }
             Ok(n)
         }
         Kind::PipeR => if at.is_some() { Err(ESPIPE) } else { pipe_read(f.flags, f.ino, dst, len) },
@@ -653,7 +692,7 @@ pub fn read(fd: u64, dst: u64, len: u64, at: Option<u64>) -> Res<u64> {
         Kind::Shm => {
             let off = at.unwrap_or(f.off);
             let n = crate::shm::rw(f.ino, off, dst, len, false)?;
-            if at.is_none() { table(l)[fd as usize].off = off + n; }
+            if at.is_none() { table(l)[fd as u32 as usize].off = off + n; }
             Ok(n)
         }
         Kind::USock | Kind::Listen => Err(ENOTCONN),
@@ -685,7 +724,7 @@ pub fn write(fd: u64, src: u64, len: u64, at: Option<u64>) -> Res<u64> {
                 None => f.off,
             };
             let n = ext2::write(f.ino, off, src as *const u8, len as usize)? as u64;
-            if at.is_none() { table(l)[fd as usize].off = off + n; }
+            if at.is_none() { table(l)[fd as u32 as usize].off = off + n; }
             Ok(n)
         }
         Kind::PipeW => if at.is_some() { Err(ESPIPE) } else { pipe_write(f.flags, f.ino, src, len) },
@@ -693,7 +732,7 @@ pub fn write(fd: u64, src: u64, len: u64, at: Option<u64>) -> Res<u64> {
         Kind::Shm => {
             let off = at.unwrap_or(f.off);
             let n = crate::shm::rw(f.ino, off, src, len, true)?;
-            if at.is_none() { table(l)[fd as usize].off = off + n; }
+            if at.is_none() { table(l)[fd as u32 as usize].off = off + n; }
             Ok(n)
         }
         Kind::USock | Kind::Listen => Err(ENOTCONN),
@@ -718,7 +757,7 @@ pub fn lseek(fd: u64, off: i64, whence: u64) -> Res<u64> {
         _ => return Err(EINVAL),
     };
     let new = base.checked_add(off).filter(|&v| v >= 0).ok_or(EINVAL)?;
-    table(l)[fd as usize].off = new as u64;
+    table(l)[fd as u32 as usize].off = new as u64;
     Ok(new as u64)
 }
 
@@ -733,7 +772,7 @@ pub fn set_cloexec(fd: u64, on: bool) -> Res<u64> {
     let l = leader()?;
     let _g = FS.guard();
     get(l, fd)?;
-    table(l)[fd as usize].cloexec = on;
+    table(l)[fd as u32 as usize].cloexec = on;
     Ok(0)
 }
 
@@ -757,6 +796,10 @@ pub fn fallocate(fd: u64, mode: u64, off: u64, len: u64) -> Res<u64> {
     let l = leader()?;
     let _g = FS.guard();
     let f = get(l, fd)?;
+    if f.kind == Kind::Shm {                        // memfd / shm_open (wayland-cursor, cairo...)
+        if end > crate::shm::size(f.ino) { crate::shm::truncate(f.ino, end)?; }
+        return Ok(0);
+    }
     if f.kind != Kind::File || f.flags & O_ACCMODE == 0 { return Err(EBADF); }
     if end > ext2::read_inode(f.ino)?.size() { ext2::truncate(f.ino, end)?; }
     Ok(0)
@@ -789,6 +832,33 @@ pub fn fd_obj(fd: u64) -> Res<Option<u32>> {
     let _g = FS.guard();
     let f = get(l, fd)?;
     Ok(if f.kind == Kind::Shm { Some(f.ino) } else { None })
+}
+
+/// Inode de arquivo regular aberto para leitura (mmap sob demanda).
+pub fn fd_file_ino(fd: u64) -> Res<Option<(u32, u64)>> {
+    let l = leader()?;
+    let _g = FS.guard();
+    let f = get(l, fd)?;
+    if f.kind != Kind::File || f.flags & O_ACCMODE == O_WRONLY { return Ok(None); }
+    let size = ext2::read_inode(f.ino)?.size();
+    Ok(Some((f.ino, size)))
+}
+
+/// Le paginas de um inode diretamente para `frames` (usado pelo page fault de VMA).
+pub fn read_ino_pages(ino: u32, off: u64, frames: &[u64]) -> Res<()> {
+    let _g = FS.guard();
+    for (i, &f) in frames.iter().enumerate() {
+        ext2::read(ino, off + (i as u64) * 4096, f as *mut u8, 4096)?;
+    }
+    Ok(())
+}
+
+/// Grava no disco todos os blocos modificados do ext2.
+pub fn sync() {
+    if crate::fs::is_ext2() {
+        let _g = FS.guard();
+        ext2::sync();
+    }
 }
 
 /// `struct stat` generico do Linux (aarch64 e riscv64), 128 bytes.
@@ -903,7 +973,7 @@ pub fn getdents(fd: u64, buf: u64, len: u64) -> Res<u64> {
         out += reclen;
         pos = d.next;
     }
-    table(l)[fd as usize].off = pos;
+    table(l)[fd as u32 as usize].off = pos;
     Ok(out)
 }
 
@@ -971,6 +1041,13 @@ pub fn fsinfo() -> Res<[u64; 5]> {
 /// Le um arquivo regular inteiro para memoria fisica contigua (loader).
 /// Retorna (endereco, frames alocados, tamanho); o chamador libera com
 /// free_contig.
+/// Caminho canonico de um caminho absoluto (ext2::realpath, com a trava FS).
+pub fn realpath(path: &[u8], out: &mut [u8; ext2::PATH_MAX]) -> Res<usize> {
+    need_ext2()?;
+    let _g = FS.guard();
+    ext2::realpath(path, out)
+}
+
 pub fn read_whole(at: u32, path: &[u8], max: u64) -> Res<(u64, usize, u64)> {
     need_ext2()?;
     let _g = FS.guard();
@@ -1034,6 +1111,35 @@ pub fn is_console(fd: u64) -> Res<bool> {
     Ok(get(l, fd)?.kind == Kind::Console)
 }
 
+/// O descritor existe? (EBADF se nao)
+pub fn fstat_ok(fd: u64) -> Res<()> {
+    let l = leader()?;
+    let _g = FS.guard();
+    get(l, fd).map(|_| ())
+}
+
+/// ioctl FIONREAD: quantos bytes da para ler agora sem bloquear.
+pub fn fionread(fd: u64) -> Res<u64> {
+    let l = leader()?;
+    let _g = FS.guard();
+    let f = get(l, fd)?;
+    Ok(match f.kind {
+        Kind::PipeR => pipes()[f.ino as usize].len,
+        Kind::Unix => unix::avail(f.ino as usize >> 1, f.ino as usize & 1),
+        Kind::Sock => {
+            let k = &socks()[f.ino as usize];
+            let _n = crate::net::NET_LOCK.guard();
+            if k.udp { crate::net::udp_next_len(k.lport) as u64 }
+            else { k.tcp.map_or(0, |h| crate::net::tcp_avail(h) as u64) }
+        }
+        Kind::File => ext2::read_inode(f.ino)?.size().saturating_sub(f.off),
+        Kind::Mem => mems()[f.ino as usize].len.saturating_sub(f.off),
+        Kind::Event => 8,
+        Kind::Console | Kind::DevNull | Kind::DevZero | Kind::DevRandom => 0,
+        _ => return Err(ENOTTY),
+    })
+}
+
 /// Flags de status do descritor (F_GETFL / F_SETFL: so O_APPEND muda).
 pub fn get_flags(fd: u64) -> Res<u32> {
     let l = leader()?;
@@ -1045,7 +1151,7 @@ pub fn set_flags(fd: u64, flags: u32) -> Res<u64> {
     let l = leader()?;
     let _g = FS.guard();
     get(l, fd)?;
-    let f = &mut table(l)[fd as usize];
+    let f = &mut table(l)[fd as u32 as usize];
     f.flags = (f.flags & !(O_APPEND | O_NONBLOCK)) | (flags & (O_APPEND | O_NONBLOCK));
     Ok(0)
 }
@@ -1054,8 +1160,8 @@ pub fn set_flags(fd: u64, flags: u32) -> Res<u64> {
 
 #[derive(Clone, Copy)]
 struct EventFd { used: bool, refs: u32, count: u64, sem: bool }
-static mut EVENTS: [EventFd; 64] = [EventFd { used: false, refs: 0, count: 0, sem: false }; 64];
-fn events() -> &'static mut [EventFd; 64] { unsafe { &mut *(&raw mut EVENTS) } }
+static mut EVENTS: [EventFd; 256] = [EventFd { used: false, refs: 0, count: 0, sem: false }; 256];
+fn events() -> &'static mut [EventFd; 256] { unsafe { &mut *(&raw mut EVENTS) } }
 fn key_ev(i: u32) -> u64 { 0x4556_0000_0000 | i as u64 }
 
 /// eventfd2(valor, flags): EFD_SEMAPHORE 1, EFD_NONBLOCK, EFD_CLOEXEC.
@@ -1131,8 +1237,8 @@ impl Sock {
                                state: SockState::New, err: 0 };
 }
 
-static mut SOCKS: [Sock; 64] = [Sock::EMPTY; 64];
-fn socks() -> &'static mut [Sock; 64] { unsafe { &mut *(&raw mut SOCKS) } }
+static mut SOCKS: [Sock; 128] = [Sock::EMPTY; 128];
+fn socks() -> &'static mut [Sock; 128] { unsafe { &mut *(&raw mut SOCKS) } }
 
 /// Endereco IPv4 (sockaddr_in ja decodificado).
 #[derive(Clone, Copy)]
@@ -1185,8 +1291,8 @@ pub fn socketpair(domain: u64, ty: u64) -> Res<(u64, u64)> {
 #[derive(Clone, Copy)]
 struct USock { used: bool, refs: u32, packet: bool, key: unix::Key }
 impl USock { const EMPTY: USock = USock { used: false, refs: 0, packet: false, key: unix::Key::None }; }
-static mut USOCKS: [USock; 32] = [USock::EMPTY; 32];
-fn usocks() -> &'static mut [USock; 32] { unsafe { &mut *(&raw mut USOCKS) } }
+static mut USOCKS: [USock; 128] = [USock::EMPTY; 128];
+fn usocks() -> &'static mut [USock; 128] { unsafe { &mut *(&raw mut USOCKS) } }
 
 /// Endereco de socket ja decodificado.
 #[derive(Clone, Copy)]
@@ -1324,7 +1430,7 @@ pub fn connect(fd: u64, sa: SockAddr) -> Res<u64> {
         let u = usocks()[f.ino as usize];
         let key = unix_key(l, &sa, false)?;
         let c = unix::connect(&key, u.packet)?;
-        table(l)[fd as usize] = OpenFile { kind: Kind::Unix, ino: (c * 2) as u32, ..f };
+        table(l)[fd as u32 as usize] = OpenFile { kind: Kind::Unix, ino: (c * 2) as u32, ..f };
         drop_ref(f);
         return Ok(0);
     }
@@ -1334,7 +1440,7 @@ pub fn connect(fd: u64, sa: SockAddr) -> Res<u64> {
         let c = unix::connect(&unix::Key::Port(a.port), false)?;
         let lport = { let _n = crate::net::NET_LOCK.guard(); crate::net::udp_alloc_port() };
         unix::set_ports(c, lport, a.port);
-        table(l)[fd as usize] = OpenFile { kind: Kind::Unix, ino: (c * 2) as u32, ..f };
+        table(l)[fd as u32 as usize] = OpenFile { kind: Kind::Unix, ino: (c * 2) as u32, ..f };
         drop_ref(f);
         return Ok(0);
     }
@@ -1532,7 +1638,7 @@ pub fn listen(fd: u64) -> Res<u64> {
         }
         _ => return Err(EOPNOTSUPP),
     };
-    table(l)[fd as usize] = OpenFile { kind: Kind::Listen, ino: li as u32, ..f };
+    table(l)[fd as u32 as usize] = OpenFile { kind: Kind::Listen, ino: li as u32, ..f };
     drop_ref(f);
     Ok(0)
 }
@@ -1590,34 +1696,66 @@ fn ready_locked(l: usize, fd: i64, net: &mut bool) -> u32 {
     }
 }
 
+/// Descritor cujo estado de prontidao nunca muda (ready_locked constante).
+fn always_ready(l: usize, fd: i64) -> bool {
+    get(l, fd as u64).is_ok_and(|f| matches!(f.kind, Kind::File | Kind::Dir | Kind::Mem | Kind::Shm
+        | Kind::DevNull | Kind::DevZero | Kind::DevRandom | Kind::Console))
+}
+
+/// Mascara de buckets (0..63) de IO_SEQ que podem acordar este descritor.
+fn wait_keys_locked(l: usize, fd: i64) -> u64 {
+    let Ok(f) = get(l, fd as u64) else { return 0 };
+    match f.kind {
+        Kind::PipeR => process::key_bit(key_r(f.ino)),
+        Kind::PipeW => process::key_bit(key_w(f.ino)),
+        Kind::Unix => {
+            let c = f.ino as usize >> 1;
+            let e = f.ino as usize & 1;
+            process::key_bit(unix::key_r(c, e)) | process::key_bit(unix::key_r(c, 1 - e))
+        }
+        Kind::Listen => process::key_bit(unix::key_l(f.ino as usize)),
+        Kind::Event => process::key_bit(key_ev(f.ino)),
+        Kind::Sock => process::key_bit(SOCK_KEY),
+        Kind::Epoll => u64::MAX,
+        _ => 0,
+    }
+}
+
 /// poll(): preenche `revents` de cada (fd, events). Retorna (quantos
-/// prontos, depende da rede).
-pub fn poll_fds(items: &mut [(i64, u32, u32)]) -> Res<(usize, bool)> {
+/// prontos, depende da rede, mascara de buckets, soma dos contadores).
+pub fn poll_fds(items: &mut [(i64, u32, u32)]) -> Res<(usize, bool, u64, u64)> {
     let l = leader()?;
     let _g = FS.guard();
     let mut net = false;
     let mut n = 0;
+    let mut mask = 0u64;
     for it in items.iter_mut() {
         if it.0 < 0 { it.2 = 0; continue; }
         let r = ready_locked(l, it.0, &mut net);
         it.2 = r & (it.1 | POLLERR | POLLHUP | POLLNVAL);
-        if it.2 != 0 { n += 1; }
+        if it.2 != 0 {
+            n += 1;
+        } else if n == 0 {
+            mask |= wait_keys_locked(l, it.0);
+        }
     }
-    Ok((n, net))
+    let seen = if n == 0 { process::io_seq_mask(mask) } else { 0 };
+    Ok((n, net, mask, seen))
 }
 
 // ------------------------------------------------------------ epoll
 
-const EPOLL_MAX: usize = 128;
+const EPOLL_MAX: usize = 256;
 pub const EPOLLONESHOT: u32 = 1 << 30;
+pub const EPOLLET: u32 = 1 << 31;
 
 #[derive(Clone, Copy)]
-struct EpItem { fd: i64, events: u32, data: u64, off: bool }
+struct EpItem { fd: i64, events: u32, data: u64, off: bool, fired: bool }
 #[derive(Clone, Copy)]
 struct Epoll { used: bool, refs: u32, n: usize, items: [EpItem; EPOLL_MAX] }
-const EP_EMPTY: Epoll = Epoll { used: false, refs: 0, n: 0, items: [EpItem { fd: -1, events: 0, data: 0, off: false }; EPOLL_MAX] };
-static mut EPOLLS: [Epoll; 16] = [EP_EMPTY; 16];
-fn epolls() -> &'static mut [Epoll; 16] { unsafe { &mut *(&raw mut EPOLLS) } }
+const EP_EMPTY: Epoll = Epoll { used: false, refs: 0, n: 0, items: [EpItem { fd: -1, events: 0, data: 0, off: false, fired: false }; EPOLL_MAX] };
+static mut EPOLLS: [Epoll; 128] = [EP_EMPTY; 128];
+fn epolls() -> &'static mut [Epoll; 128] { unsafe { &mut *(&raw mut EPOLLS) } }
 
 pub fn epoll_create(flags: u32) -> Res<u64> {
     let l = leader()?;
@@ -1642,12 +1780,12 @@ pub fn epoll_ctl(ep: u64, op: u64, fd: i64, events: u32, data: u64) -> Res<u64> 
         (1, Some(_)) => Err(ext2::EEXIST),
         (1, None) => {
             if ex.n == EPOLL_MAX { return Err(ext2::ENOSPC); }
-            ex.items[ex.n] = EpItem { fd, events, data, off: false };
+            ex.items[ex.n] = EpItem { fd, events, data, off: false, fired: false };
             ex.n += 1;
             Ok(0)
         }
         (2, Some(p)) => { ex.items[p] = ex.items[ex.n - 1]; ex.n -= 1; Ok(0) }
-        (3, Some(p)) => { ex.items[p] = EpItem { fd, events, data, off: false }; Ok(0) }
+        (3, Some(p)) => { ex.items[p] = EpItem { fd, events, data, off: false, fired: false }; Ok(0) }
         (2 | 3, None) => Err(ext2::ENOENT),
         _ => Err(EINVAL),
     }
@@ -1655,14 +1793,15 @@ pub fn epoll_ctl(ep: u64, op: u64, fd: i64, events: u32, data: u64) -> Res<u64> 
 
 /// Varre o epoll e grava ate `max` eventos (struct epoll_event: u32
 /// events, u64 data; 16 bytes no aarch64/riscv64). Retorna (quantos,
-/// depende da rede).
-pub fn epoll_scan(ep: u64, out: u64, max: usize) -> Res<(usize, bool)> {
+/// depende da rede, mascara de buckets, soma dos contadores).
+pub fn epoll_scan(ep: u64, out: u64, max: usize) -> Res<(usize, bool, u64, u64)> {
     let l = leader()?;
     let _g = FS.guard();
     let e = get(l, ep)?;
     if e.kind != Kind::Epoll { return Err(EINVAL); }
     let mut net = false;
     let mut n = 0;
+    let mut mask = 0u64;
     let idx = e.ino as usize;
     for k in 0..epolls()[idx].n {
         if n >= max { break; }
@@ -1670,7 +1809,19 @@ pub fn epoll_scan(ep: u64, out: u64, max: usize) -> Res<(usize, bool)> {
         if it.off { continue; }
         let r = ready_locked(l, it.fd, &mut net);
         let hit = r & (it.events | POLLERR | POLLHUP);
-        if r & POLLNVAL != 0 || hit == 0 { continue; }
+        if r & POLLNVAL != 0 || hit == 0 {
+            if n == 0 { mask |= wait_keys_locked(l, it.fd); }
+            continue;
+        }
+        // EPOLLET: o evento vem so quando o estado muda. Para pipes, sockets
+        // etc. o nivel serve (acordar a mais e inofensivo: o programa le ate
+        // EAGAIN); ja um descritor sempre pronto (arquivo, /proc, /dev)
+        // avisaria para sempre -- ex.: o monitor de montagens da libmount
+        // drena o epoll ate ele voltar vazio. Esses avisam uma vez so.
+        if it.events & EPOLLET != 0 && always_ready(l, it.fd) {
+            if it.fired { continue; }
+            epolls()[idx].items[k].fired = true;
+        }
         unsafe {
             core::ptr::write_unaligned((out + n as u64 * 16) as *mut u32, hit);
             core::ptr::write_unaligned((out + n as u64 * 16 + 8) as *mut u64, it.data);
@@ -1678,5 +1829,6 @@ pub fn epoll_scan(ep: u64, out: u64, max: usize) -> Res<(usize, bool)> {
         if it.events & EPOLLONESHOT != 0 { epolls()[idx].items[k].off = true; }
         n += 1;
     }
-    Ok((n, net))
+    let seen = if n == 0 { process::io_seq_mask(mask) } else { 0 };
+    Ok((n, net, mask, seen))
 }

@@ -112,9 +112,8 @@ pub fn kernel_root() -> u64 {
     (&raw const L0) as u64
 }
 
-/// Mapeia uma pagina de 4KB no espaco cuja raiz e `root_pa`.
-pub unsafe fn map_page_in(root_pa: u64, va: u64, pa: u64, flags: PageFlags) -> bool {
-    let _g = crate::sync::MMU.guard();
+/// Mapeia uma pagina de 4KB com a trava MMU ja presa.
+unsafe fn map_page_locked(root_pa: u64, va: u64, pa: u64, flags: PageFlags) -> bool {
     let (i0, i1, i2, i3) = indices(va);
     unsafe {
         let Some(l1) = next_table(root_pa, i0) else { return false };
@@ -123,6 +122,12 @@ pub unsafe fn map_page_in(root_pa: u64, va: u64, pa: u64, flags: PageFlags) -> b
         (l3 as *mut u64).add(i3).write_volatile((pa & ADDR_MASK) | PAGE | flags.bits);
     }
     true
+}
+
+/// Mapeia uma pagina de 4KB no espaco cuja raiz e `root_pa`.
+pub unsafe fn map_page_in(root_pa: u64, va: u64, pa: u64, flags: PageFlags) -> bool {
+    let _g = crate::sync::MMU.guard();
+    unsafe { map_page_locked(root_pa, va, pa, flags) }
 }
 
 const BLOCK: u64 = 0b01;   // descritor de bloco (L2: 2 MiB)
@@ -140,9 +145,10 @@ unsafe fn map_block_2m(va: u64, flags: PageFlags) -> bool {
 }
 
 unsafe fn map_range_identity(start: u64, size: u64, flags: PageFlags) {
+    let _g = crate::sync::MMU.guard();
     let mut off = 0u64;
     while off < size {
-        unsafe { map_page_in(kernel_root(), start + off, start + off, flags); }
+        unsafe { map_page_locked(kernel_root(), start + off, start + off, flags); }
         off += 4096;
     }
 }
@@ -214,6 +220,37 @@ pub fn is_enabled() -> bool {
 /// Invalida o TLB em todos os nucleos (inner shareable).
 pub fn flush_tlb() {
     unsafe { asm!("dsb ish", "tlbi vmalle1is", "dsb ish", "isb", options(nostack, preserves_flags)); }
+}
+
+/// Torna visiveis PTEs que passaram de invalidas a validas (descritores
+/// invalidos nunca ficam em cache na TLB do ARMv8).
+#[inline]
+pub fn sync_new_pages() {
+    unsafe { asm!("dsb ishst", "isb", options(nostack, preserves_flags)); }
+}
+
+/// Invalida as entradas de TLB de [start, end) no ASID dado. Para faixas
+/// pequenas invalida por pagina (vae1is); para grandes invalida o ASID.
+pub fn flush_range(asid: u16, start: u64, end: u64) {
+    let start = start & !0xFFF;
+    let end = (end + 4095) & !0xFFF;
+    if start >= end { return; }
+    let pages = (end - start) / 4096;
+    if pages > 64 {
+        flush_asid(asid);
+        return;
+    }
+    unsafe {
+        asm!("dsb ishst", options(nostack, preserves_flags));
+        let base = (asid as u64) << 48;
+        let mut va = start;
+        while va < end {
+            let v = base | ((va >> 12) & 0x0FFF_FFFF_FFFF);
+            asm!("tlbi vae1is, {v}", v = in(reg) v, options(nostack, preserves_flags));
+            va += 4096;
+        }
+        asm!("dsb ish", "isb", options(nostack, preserves_flags));
+    }
 }
 
 unsafe fn table_entry(table_pa: u64, idx: usize) -> u64 {
@@ -339,7 +376,7 @@ pub fn translate_user(root_pa: u64, va: u64, write: bool) -> Option<u64> {
 
 /// Visita as entradas L3 existentes de [start, end) sem criar tabelas:
 /// niveis ausentes sao pulados inteiros (reservas enormes custam pouco).
-unsafe fn walk_leaves(root_pa: u64, start: u64, end: u64, mut f: impl FnMut(*mut u64)) {
+unsafe fn walk_leaves(root_pa: u64, start: u64, end: u64, mut f: impl FnMut(u64, *mut u64)) {
     let next = |va: u64, shift: u32| ((va >> shift) + 1) << shift;
     let mut va = start & !0xFFF;
     while va < end {
@@ -351,51 +388,84 @@ unsafe fn walk_leaves(root_pa: u64, start: u64, end: u64, mut f: impl FnMut(*mut
             if e1 & VALID_MASK != TABLE { va = next(va, 30); continue; }
             let e2 = table_entry(e1 & ADDR_MASK, i2);
             if e2 & VALID_MASK != TABLE { va = next(va, 21); continue; }
-            f(((e2 & ADDR_MASK) as *mut u64).add(i3));
+            f(va, ((e2 & ADDR_MASK) as *mut u64).add(i3));
         }
         va += 4096;
     }
 }
 
-/// Desmapeia [start, end) e devolve os frames. O chamador invalida a TLB.
-pub fn unmap_range(root_pa: u64, start: u64, end: u64) {
+/// Desmapeia [start, end) e devolve os frames. Retorna quantas PTEs validas
+/// foram removidas.
+pub fn unmap_range(root_pa: u64, start: u64, end: u64) -> usize {
     let _g = crate::sync::MMU.guard();
+    let mut count = 0;
     unsafe {
-        walk_leaves(root_pa, start, end, |p| {
+        walk_leaves(root_pa, start, end, |_, p| {
             let e = p.read_volatile();
             if e & VALID_MASK == PAGE {
                 p.write_volatile(0);
                 if e & SW_SHARED == 0 { frame_allocator::free_frame(e & ADDR_MASK); }
+                count += 1;
             }
         });
     }
+    count
 }
 
-/// Troca as permissoes das paginas presentes em [start, end).
-pub fn protect_range(root_pa: u64, start: u64, end: u64, flags: PageFlags) {
+/// Troca as permissoes das paginas presentes em [start, end). Retorna quantas
+/// PTEs validas foram alteradas.
+pub fn protect_range(root_pa: u64, start: u64, end: u64, flags: PageFlags) -> usize {
     let _g = crate::sync::MMU.guard();
+    let mut count = 0;
     unsafe {
-        walk_leaves(root_pa, start, end, |p| {
+        walk_leaves(root_pa, start, end, |_, p| {
             let e = p.read_volatile();
             if e & VALID_MASK == PAGE {
-                p.write_volatile((e & ADDR_MASK) | PAGE | flags.bits | (e & SW_SHARED));
+                let new_e = (e & ADDR_MASK) | PAGE | flags.bits | (e & SW_SHARED);
+                if new_e != e {
+                    p.write_volatile(new_e);
+                    count += 1;
+                }
             }
         });
     }
+    count
+}
+
+/// Move as PTEs presentes de [old_start, old_end) para `new_start` (mremap).
+pub fn move_range(root_pa: u64, old_start: u64, old_end: u64, new_start: u64) -> usize {
+    let _g = crate::sync::MMU.guard();
+    let mut count = 0;
+    unsafe {
+        walk_leaves(root_pa, old_start, old_end, |va, p| {
+            let e = p.read_volatile();
+            if e & VALID_MASK == PAGE {
+                let dst_va = new_start + (va - old_start);
+                let flags = PageFlags { bits: e & !ADDR_MASK & !VALID_MASK };
+                if map_page_locked(root_pa, dst_va, e & ADDR_MASK, flags) {
+                    p.write_volatile(0);
+                    count += 1;
+                }
+            }
+        });
+    }
+    count
 }
 
 /// A pagina de `va` esta mapeada (com qualquer permissao)?
 pub fn is_mapped(root_pa: u64, va: u64) -> bool {
     let _g = crate::sync::MMU.guard();
     let mut found = false;
-    unsafe { walk_leaves(root_pa, va, va + 1, |p| found = p.read_volatile() & VALID_MASK == PAGE) };
+    unsafe { walk_leaves(root_pa, va, va + 1, |_, p| found = p.read_volatile() & VALID_MASK == PAGE) };
     found
 }
 
-/// fork(): espaco novo com uma COPIA de cada pagina privada de `src`.
+/// fork(): espaco novo com uma COPIA de cada pagina privada gravavel de `src`
+/// e compartilhamento por contagem de referencia das paginas somente-leitura.
 /// Paginas reservadas (regiao grafica) sao compartilhadas, nao copiadas.
 pub fn clone_user_space(src: u64) -> Option<u64> {
     let dst = create_user_space()?;
+    let _g = crate::sync::MMU.guard();
     unsafe {
         let k_l1 = table_entry(kernel_root(), 0) & ADDR_MASK;
         let k_l2_gb0 = table_entry(k_l1, 0) & ADDR_MASK;
@@ -419,14 +489,26 @@ pub fn clone_user_space(src: u64) -> Option<u64> {
                         let va = ((i0 as u64) << 39) | ((i1 as u64) << 30) | ((i2 as u64) << 21) | ((i3 as u64) << 12);
                         let pa = e3 & ADDR_MASK;
                         let flags = PageFlags { bits: e3 & !ADDR_MASK & !VALID_MASK };
+                        let read_only = (e3 & (1 << 7)) != 0; // AP[2]=1: somente leitura
                         let target = if frame_allocator::reserved(pa) || e3 & SW_SHARED != 0 {
                             pa
+                        } else if read_only {
+                            frame_allocator::inc_ref(pa);
+                            pa
                         } else {
-                            let Some(f) = frame_allocator::alloc_frame() else { free_user_space(dst); return None };
+                            let Some(f) = frame_allocator::alloc_frame() else {
+                                drop(_g);
+                                free_user_space(dst);
+                                return None;
+                            };
                             core::ptr::copy_nonoverlapping(pa as *const u8, f as *mut u8, 4096);
                             f
                         };
-                        if !map_page_in(dst, va, target, flags) {
+                        if !map_page_locked(dst, va, target, flags) {
+                            if !frame_allocator::reserved(pa) && e3 & SW_SHARED == 0 {
+                                frame_allocator::free_frame(target);
+                            }
+                            drop(_g);
                             free_user_space(dst);
                             return None;
                         }

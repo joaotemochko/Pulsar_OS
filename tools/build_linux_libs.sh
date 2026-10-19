@@ -73,13 +73,18 @@ cat > "$F/fficonfig.h" <<'EOF'
 #define FFI_HIDDEN __attribute__ ((visibility ("hidden")))
 #endif
 EOF
-FCC="$CC -I$F -I$TP/libffi/include -I$TP/libffi/src/$FD -DFFI_STATIC_BUILD -w"
+FCC="$CC -fPIC -I$F -I$TP/libffi/include -I$TP/libffi/src/$FD -DFFI_STATIC_BUILD -w"
 for s in prep_cif types raw_api java_raw_api closures tramp; do
     $FCC -c "$TP/libffi/src/$s.c" -o "$F/obj/$s.o"
 done
 $FCC -c "$TP/libffi/src/$FD/ffi.c" -o "$F/obj/arch_ffi.o"
 $FCC -c "$TP/libffi/src/$FD/sysv.S" -o "$F/obj/arch_sysv.o"
 rm -f "$SYSROOT/lib/libffi.a"; $AR rcs "$SYSROOT/lib/libffi.a" "$F"/obj/*.o
+# e a compartilhada (glib/gobject dinamicos), pelo driver do clang: libc.so
+# da musl e o compiler-rt do sysroot (__clear_cache dos trampolins)
+clang --target=$ARCH-linux-musl --sysroot="$SYSROOT" -shared -fuse-ld=lld -Wl,-soname,libffi.so.8 \
+    -o "$SYSROOT/lib/libffi.so.8" "$F"/obj/*.o
+ln -sf libffi.so.8 "$SYSROOT/lib/libffi.so"
 cp "$F/ffi.h" "$F/ffitarget.h" "$SYSROOT/include/"
 
 # ---------------------------------------------------------------- libwayland-client

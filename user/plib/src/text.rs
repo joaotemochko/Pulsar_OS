@@ -1,6 +1,7 @@
 //! Texto anti-aliased: atlas de alpha gerados por tools/genfonts.py.
 //! As strings sao UTF-8; o renderizador cobre ASCII + Latin-1 (acentos do
-//! portugues). Outros caracteres viram '?'.
+//! portugues), com pontuacao tipografica trocada pela mais proxima; o resto
+//! vira '?'.
 use crate::gfx::Fb;
 
 #[derive(Clone, Copy)]
@@ -51,6 +52,12 @@ impl Font {
         match cp {
             32..=126 => (cp - 32) as usize,
             160..=255 => (cp - 160 + 95) as usize,
+            // pontuacao tipografica comum em titulos (ex.: "Pagina — Mozilla
+            // Firefox"): o equivalente mais proximo do Latin-1
+            0x2010..=0x2015 | 0x2212 => ('-' as u32 - 32) as usize,
+            0x2018..=0x201B => ('\'' as u32 - 32) as usize,
+            0x201C..=0x201F => ('"' as u32 - 32) as usize,
+            0x2022 | 0x2026 => (0xB7 - 160 + 95) as usize,       // bullet / reticencias: ponto medio
             _ => ('?' as u32 - 32) as usize,
         }
     }

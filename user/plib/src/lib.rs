@@ -46,6 +46,28 @@ pub fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     ret
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!("svc #0", in("x8") num, inout("x0") a0 => ret, in("x1") a1, in("x2") a2, in("x3") a3,
+             options(nostack));
+    }
+    ret
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+pub fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!("ecall", in("a7") num, inlateout("a0") a0 => ret, in("a1") a1, in("a2") a2, in("a3") a3,
+             options(nostack));
+    }
+    ret
+}
+
 #[inline]
 fn syscall2(num: u64, a0: u64, a1: u64) -> u64 { syscall3(num, a0, a1, 0) }
 #[inline]
@@ -79,6 +101,49 @@ pub fn spawn(name: &str) -> i64 {
     syscall2(10, name.as_ptr() as u64, name.len() as u64) as i64
 }
 pub fn getpid() -> usize { syscall0(14) as usize }
+
+/// Ambiente dos programas abertos pelo sistema (o mesmo do Terminal): os
+/// programas Linux acham por ele o servico Wayland, a pasta pessoal e a lingua.
+pub const APP_ENV: &[&str] = &[
+    "HOME=/home/user", "PATH=/bin:/usr/bin", "USER=usuario", "LANG=C.UTF-8",
+    "XDG_RUNTIME_DIR=/run", "WAYLAND_DISPLAY=wayland-0", "XCOMPOSEFILE=/usr/share/pulsar/Compose",
+    "GDK_BACKEND=wayland", "MOZ_ENABLE_WAYLAND=1", "NO_AT_BRIDGE=1", "GSETTINGS_BACKEND=memory",
+    "MOZ_CRASHREPORTER_DISABLE=1", "MOZ_DISABLE_CONTENT_SANDBOX=1", "MOZ_DISABLE_GMP_SANDBOX=1",
+    "MOZ_DISABLE_RDD_SANDBOX=1", "MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1", "LIBGL_ALWAYS_SOFTWARE=1",
+];
+
+/// Executa o programa do caminho absoluto `path` (ELF Linux ou .pulse), sem
+/// argumentos e com APP_ENV (SPAWN_EX). Ret pid ou <0.
+pub fn spawn_path(path: &str) -> i64 {
+    let mut b = [0u8; 1024];
+    let mut n = 8;
+    let mut put = |s: &str| {
+        if n + s.len() + 1 > b.len() { return false; }
+        b[n..n + s.len()].copy_from_slice(s.as_bytes());
+        n += s.len() + 1;
+        true
+    };
+    put(path);
+    let envc = APP_ENV.iter().take_while(|e| put(e)).count();
+    b[0..4].copy_from_slice(&1u32.to_le_bytes());
+    b[4..8].copy_from_slice(&(envc as u32).to_le_bytes());
+    syscall4(74, path.as_ptr() as u64, path.len() as u64, b.as_ptr() as u64, n as u64) as i64
+}
+
+/// Le o arquivo do caminho absoluto `path` para `buf` (ate encher). Ret
+/// bytes lidos ou <0 (-errno).
+pub fn read_path(path: &str, buf: &mut [u8]) -> i64 {
+    let fd = syscall3(56, path.as_ptr() as u64, path.len() as u64, 0) as i64;   // OPEN, O_RDONLY
+    if fd < 0 { return fd; }
+    let mut n = 0;
+    while n < buf.len() {
+        let r = syscall3(58, fd as u64, buf[n..].as_mut_ptr() as u64, (buf.len() - n) as u64) as i64;
+        if r <= 0 { break; }
+        n += r as usize;
+    }
+    syscall1(57, fd as u64);                                                   // CLOSE
+    n as i64
+}
 pub fn fs_read(idx: usize, buf: &mut [u8]) -> i64 {
     syscall3(15, idx as u64, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
 }
@@ -547,6 +612,8 @@ pub const WM_OP_HELLO: u64 = 1;
 pub const WM_OP_COMMIT: u64 = 2;
 pub const WM_OP_POLL: u64 = 3;
 pub const WM_OP_TITLE: u64 = 4;
+/// `kind` do HELLO das janelas de programas Linux (o wlclient as abre).
+pub const KIND_LINUX: usize = 99;
 /// O app fecha a propria janela (vai terminar): sem aviso de encerramento.
 pub const WM_OP_BYE: u64 = 5;
 
@@ -592,11 +659,14 @@ pub const APP_MENU_RELOAD: u16 = 12;
 pub const APP_MENU_ADD: u16 = 13;
 
 pub fn pack_title(t: &[u8], out: &mut [u64]) {
+    // corta num limite de caractere UTF-8 (nao no meio de um "—")
+    let mut n = t.len().min(out.len() * 8);
+    while n < t.len() && n > 0 && t[n] & 0xC0 == 0x80 { n -= 1; }
     for (i, w) in out.iter_mut().enumerate() {
         let mut v = 0u64;
         for b in 0..8 {
             let k = i * 8 + b;
-            if k < t.len() { v |= (t[k] as u64) << (b * 8); }
+            if k < n { v |= (t[k] as u64) << (b * 8); }
         }
         *w = v;
     }

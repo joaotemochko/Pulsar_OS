@@ -18,6 +18,8 @@ pub enum Icon {
     Config,
     Program,
     Help,
+    /// Firefox (programa Linux): a imagem do proprio app, ver `app_image`.
+    Firefox,
 }
 
 /// Base "squircle" com gradiente, brilho no topo e borda sutil.
@@ -178,7 +180,64 @@ pub fn draw(fb: &Fb, icon: Icon, x: i32, y: i32, s: i32) {
             base(fb, x, y, s, 0x4B4B55, 0x1B1B20);
             logo(fb, p.x(50), p.y(50), p.l(28), 0xFFFFFF);
         }
+        Icon::Firefox => {
+            if !app_image(fb, 0, "/usr/share/pulsar/icons/firefox.icn", x, y, s) {
+                draw(fb, Icon::Program, x, y, s);
+            }
+        }
     }
+}
+
+// ------------------------------------------------- icones de outros apps
+// Programas que nao sao do Pulsar (os da camada Linux) trazem o proprio
+// icone. O build converte o PNG do app (tools/png2icn.py) para
+// /usr/share/pulsar/icons/<app>.icn: "PICN", u32 largura, u32 altura e os
+// pixels ARGB (alfa direto). Carregado na primeira vez que e desenhado.
+
+const IMG_SLOTS: usize = 2;
+const IMG_SIDE: usize = 128;
+const IMG_WORDS: usize = 3 + IMG_SIDE * IMG_SIDE;
+static mut IMG: [[u32; IMG_WORDS]; IMG_SLOTS] = [[0; IMG_WORDS]; IMG_SLOTS];
+static mut IMG_STATE: [i8; IMG_SLOTS] = [0; IMG_SLOTS];     // 0 a carregar, 1 ok, -1 sem arquivo
+
+/// Desenha a imagem do slot `slot` (lida de `path`) em s x s, com media por
+/// area ao reduzir. false se o arquivo nao existe ou e invalido.
+fn app_image(fb: &Fb, slot: usize, path: &str, x: i32, y: i32, s: i32) -> bool {
+    let (img, state) = unsafe { (&mut (*(&raw mut IMG))[slot], &mut (*(&raw mut IMG_STATE))[slot]) };
+    if *state == 0 {
+        let bytes = unsafe { core::slice::from_raw_parts_mut(img.as_mut_ptr() as *mut u8, IMG_WORDS * 4) };
+        let n = crate::read_path(path, bytes);
+        let (w, h) = (img[1] as usize, img[2] as usize);
+        let ok = n >= 12 && &bytes[..4] == b"PICN" && w > 0 && w <= IMG_SIDE && h == w
+            && n as usize >= 12 + w * h * 4;
+        *state = if ok { 1 } else { -1 };
+    }
+    if *state != 1 || s <= 0 { return false; }
+    let side = img[1] as i32;
+    let px = &img[3..];
+    for j in 0..s {
+        let (y0, y1) = (j * side / s, ((j + 1) * side / s).max(j * side / s + 1));
+        for i in 0..s {
+            let (x0, x1) = (i * side / s, ((i + 1) * side / s).max(i * side / s + 1));
+            // media pre-multiplicada da area da fonte que cai neste pixel
+            let (mut r, mut g, mut b, mut a, mut cnt) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let c = px[(sy * side + sx) as usize];
+                    let ca = c >> 24;
+                    r += (c >> 16 & 255) * ca;
+                    g += (c >> 8 & 255) * ca;
+                    b += (c & 255) * ca;
+                    a += ca;
+                    cnt += 1;
+                }
+            }
+            if a == 0 { continue; }
+            let c = (r / a) << 16 | (g / a) << 8 | (b / a);
+            fb.blend(x + i, y + j, c, a / cnt);
+        }
+    }
+    true
 }
 
 /// Engrenagem centrada em (cx,cy), raio externo r (1/16 px).

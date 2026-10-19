@@ -15,6 +15,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -154,6 +155,17 @@ int main(int argc, char** argv, char** envp) {
     check("TLS por thread", ra == (void*)11 && rb == (void*)22 && tls_value == 7);
 
     check("getpid/gettid", getpid() > 0 && getppid() >= 0);
+
+    /* waitid: WNOWAIT so espia (o Firefox vigia os processos filhos assim);
+       depois o waitpid ainda colhe o mesmo filho */
+    pid_t wc = fork();
+    if (wc == 0) _exit(7);
+    siginfo_t si = {0};
+    int wr = waitid(P_PID, wc, &si, WEXITED | WNOWAIT);
+    check("waitid WNOWAIT ve o filho", wr == 0 && si.si_pid == wc && si.si_code == CLD_EXITED && si.si_status == 7);
+    int wst = 0;
+    check("waitpid colhe depois do WNOWAIT", waitpid(wc, &wst, 0) == wc && WIFEXITED(wst) && WEXITSTATUS(wst) == 7);
+    check("getuid = usuario (1000)", getuid() == 1000 && geteuid() == 1000);
     printf("[posixtest] fim: %d falha(s)\n", fails);
     return fails;
 }

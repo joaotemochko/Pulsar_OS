@@ -651,6 +651,19 @@ pub fn tcp_ready(h: usize) -> (bool, bool, bool) {
     }
 }
 
+/// Bytes recebidos e ainda nao lidos (FIONREAD).
+pub fn tcp_avail(h: usize) -> usize {
+    poll();
+    conn(h).map_or(0, |t| t.rx_len)
+}
+
+/// Tamanho do proximo datagrama na porta `port` (FIONREAD), 0 se nenhum.
+pub fn udp_next_len(port: u16) -> usize {
+    poll();
+    let q = unsafe { &*core::ptr::addr_of!(UDPQ) };
+    q.iter().find(|d| d.used && d.dst_port == port).map_or(0, |d| d.len)
+}
+
 /// Ha datagrama esperando na porta `port`?
 pub fn udp_pending(port: u16) -> bool {
     poll();

@@ -177,7 +177,6 @@ int main(int argc, char** argv) {
     close(c); close(srv);
 
     /* 6. memfd + MAP_SHARED entre processos */
-    long free0 = freeram();
     int mf = memfd_create("teste", MFD_CLOEXEC);
     check("memfd_create + ftruncate(8 MiB)", mf >= 0 && ftruncate(mf, 8 << 20) == 0);
     char* sh = mmap(NULL, 8 << 20, PROT_READ | PROT_WRITE, MAP_SHARED, mf, 0);
@@ -190,10 +189,14 @@ int main(int argc, char** argv) {
     char via_read[19] = {0};
     pread(mf, via_read, 18, 4 << 20);
     check("read() do memfd ve o mesmo conteudo", strcmp(via_read, "escrito pelo filho") == 0);
+    /* mede logo antes e logo depois de soltar: os ~8 MiB voltam (comparar
+     * com o inicio do teste falharia por causa dos outros programas que
+     * rodam ao mesmo tempo e alocam memoria) */
+    long before = freeram();
     munmap(sh, 8 << 20);
     close(mf);
     long free1 = freeram();
-    check("memoria devolvida ao fechar e desmapear", free0 - free1 < 1024);
+    check("memoria devolvida ao fechar e desmapear", free1 - before > 6 * 1024);
 
     /* 7. MAP_SHARED | MAP_ANONYMOUS */
     atomic_int* cnt = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);

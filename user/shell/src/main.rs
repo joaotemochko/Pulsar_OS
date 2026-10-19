@@ -83,6 +83,8 @@ struct Win {
     commit_h: i32,
     want_close: bool,
     close_at: u64,
+    /// janela de um programa Linux (vinda do servico Wayland)
+    linux: bool,
     keys: [u64; KQ],
     kh: usize,
     kn: usize,
@@ -105,7 +107,7 @@ impl Win {
             used: false, app: 0, internal: false, r: Rect::empty(), restore: Rect::empty(),
             state: WState::Normal, minimized: false, z: 0, pid: -1, slot: -1,
             title: [0; 32], tlen: 0, hello: false, committed: false, commit_w: 0, commit_h: 0,
-            want_close: false, close_at: 0, keys: [0; KQ], kh: 0, kn: 0,
+            want_close: false, close_at: 0, linux: false, keys: [0; KQ], kh: 0, kn: 0,
             click: false, rclick: false, dbl: false, wheel: 0, menu: 0, open_file: -1,
             rep_f: u64::MAX, rep_mx: i32::MIN, rep_my: i32::MIN,
         }
@@ -241,7 +243,7 @@ struct Wm {
     toasts: [Toast; 3],
     // estado das janelas internas
     panels: Panels,
-    phits: [Hits; 12],
+    phits: [Hits; NAPPS],
     hover_hit: Rect,
     hover_light: Option<usize>,
     // dock
@@ -249,7 +251,7 @@ struct Wm {
     dock_rects: [(Rect, u8); 16],
     dock_n: usize,
     dock_area: Rect,
-    bounce: [u64; 12],
+    bounce: [u64; NAPPS],
     // dados do sistema
     files: [FileInfo; MAX_FILES],
     nfiles: usize,
@@ -280,9 +282,8 @@ fn thumbs() -> &'static mut [u32] {
     unsafe { &mut *(&raw mut THUMBS) }
 }
 
-const fn hits_array() -> [Hits; 12] {
-    [Hits::new(), Hits::new(), Hits::new(), Hits::new(), Hits::new(), Hits::new(),
-     Hits::new(), Hits::new(), Hits::new(), Hits::new(), Hits::new(), Hits::new()]
+const fn hits_array() -> [Hits; NAPPS] {
+    [const { Hits::new() }; NAPPS]
 }
 
 impl Wm {
@@ -307,7 +308,7 @@ impl Wm {
             toasts: [Toast::empty(); 3],
             panels: Panels::new(), phits: hits_array(), hover_hit: Rect::empty(), hover_light: None,
             dock_hover: -1, dock_rects: [(Rect::empty(), 0); 16], dock_n: 0, dock_area: Rect::empty(),
-            bounce: [0; 12],
+            bounce: [0; NAPPS],
             files: [FileInfo::zero(); MAX_FILES], nfiles: 0,
             sys: SysInfo { arch_id: 0, ncpus: 0, mem_total_kb: 0, mem_free_kb: 0, fb_w: 0, fb_h: 0, uptime_ms: 0, arch_name: [0; 16] },
             loads: [0; 8], clock: Buf::new(), net_up: false,
@@ -373,11 +374,9 @@ impl Wm {
                 if now >= deadline { break; }
                 let Some(from) = recv_timeout(&mut m, deadline - now) else { break };
                 let commit = m.tag == WM_OP_COMMIT;
+                self.handle_input();
                 self.handle_msg(from, &m);
                 if commit {
-                    // no maximo ~125 quadros/s
-                    let since = uptime_ms().saturating_sub(t0);
-                    if since < 8 { sleep_ms(8 - since); }
                     break;
                 }
             }
@@ -683,14 +682,23 @@ impl Wm {
                             let mut t = [0u8; 24];
                             let n = unpack_title(&m.data[3..6], &mut t);
                             let kind = m.data[0] as usize;
+                            // o wlclient manda o app_id Wayland no primeiro HELLO
                             let app = APPS.iter().find(|a| a.kind == Kind::Process && a.name.as_bytes() == &t[..n])
+                                .or_else(|| catalog::app_by_wl_id(&t[..n]))
                                 .map(|a| a.id)
                                 .unwrap_or(if kind < APPS.len() && APPS[kind].kind == Kind::Process && kind != APP_GENERIC as usize
                                     { kind as u8 } else { APP_GENERIC });
-                            self.new_window(app, from as i64, -1)
+                            let i = self.new_window(app, from as i64, -1);
+                            if let Some(i) = i { self.wins[i].linux = kind == KIND_LINUX; }
+                            i
                         }
                     };
                     if let Some(i) = wi {
+                        let app_id = self.wins[i].app as usize;
+                        if app_id < self.bounce.len() && self.bounce[app_id] != 0 {
+                            self.bounce[app_id] = 0;
+                            self.damage(self.dock_area.inset(-4));
+                        }
                         let want_w = (m.data[1] as i32).clamp(200, SURF_W);
                         let want_h = (m.data[2] as i32).clamp(120, SURF_H);
                         let mut t = [0u8; 24];
@@ -919,6 +927,17 @@ impl Wm {
                 self.toast(def.icon, "Janelas demais", "Feche uma janela para abrir outra.");
                 return;
             }
+            if catalog::is_linux(def) {
+                // programa Linux: a janela vem depois, pelo servico Wayland
+                if spawn_path(def.bin) < 0 {
+                    let mut b = Buf::<72>::new();
+                    b.s(def.bin).s(" não foi encontrado no disco.");
+                    self.toast_b(def.icon, "Não foi possível abrir".as_bytes(), b.get());
+                    return;
+                }
+                self.bounce[app as usize] = uptime_ms() + 800;
+                return;
+            }
             let pid = spawn(def.bin);
             if pid < 0 {
                 let mut b = Buf::<72>::new();
@@ -941,8 +960,11 @@ impl Wm {
             self.damage(Rect::new(0, 0, self.w, MENU_H));
             self.damage(self.dock_area);
         } else if !w.want_close {
+            // programas Linux (Firefox...) salvam sessao e perfil ao fechar:
+            // mais tempo antes do "nao respondia"
+            let linux = w.linux || catalog::is_linux(catalog::app(w.app));
             w.want_close = true;
-            w.close_at = uptime_ms() + 3000;
+            w.close_at = uptime_ms() + if linux { 10_000 } else { 3000 };
         }
     }
 
@@ -1288,14 +1310,19 @@ impl Wm {
                 self.damage(m.rect.inset(-2));
             }
         }
-        if self.cc_open { self.damage(self.cc_rect()); }
-        if self.spot { self.damage(self.spot_rect().inset(-64)); }
+        if self.cc_open && (self.cc_rect().contains(mx, my) || self.cc_rect().contains(self.last_cx, self.last_cy)) {
+            self.damage(self.cc_rect());
+        }
         // dock (ampliacao e rotulo)
         let dz = self.dock_zone();
         if dz.contains(mx, my) || self.dock_hover >= 0 {
-            self.damage(self.dock_area.inset(-4));
+            let prev_hover = self.dock_hover;
+            let prev_area = self.dock_area;
             self.layout_dock();
-            self.damage(self.dock_area.inset(-4));
+            if self.cfg.dock_magnify || self.dock_hover != prev_hover || self.dock_area != prev_area {
+                self.damage(prev_area.inset(-4));
+                self.damage(self.dock_area.inset(-4));
+            }
         }
         // semaforos e realces das janelas internas
         let lights = self.win_at(mx, my).filter(|&i| self.wins[i].lights().contains(mx, my));
@@ -1973,10 +2000,16 @@ impl Wm {
         }
         // animacao do dock (pulo ao abrir um app)
         if self.bounce.iter().any(|&b| b != 0) {
+            for k in 0..self.dock_n {
+                let (r, app) = self.dock_rects[k];
+                if self.bounce[app as usize] != 0 { self.damage(r.inset(-6)); }
+            }
             for b in self.bounce.iter_mut() { if *b != 0 && *b <= now { *b = 0; } }
-            self.damage(self.dock_area.inset(-4));
             self.layout_dock();
-            self.damage(self.dock_area.inset(-4));
+            for k in 0..self.dock_n {
+                let (r, app) = self.dock_rects[k];
+                if self.bounce[app as usize] != 0 { self.damage(r.inset(-6)); }
+            }
         }
         // avisos que expiraram
         for k in 0..3 {

@@ -74,6 +74,7 @@ pub struct Process {
     pub members: usize,  // no dono do espaco: slots vivos que o usam (threads, filho de vfork)
     pub vfork_parent: usize, // slot do pai suspenso por vfork (IDLE = nenhum)
     pub io_key: u64,     // em IoWait: o objeto esperado
+    pub io_mask: u64,    // em IoWait (POLL_KEY): mascara de buckets monitorados
     pub futex_addr: u64, // VA esperada em FutexWait
     pub abi: u8,         // ABI_PULSAR ou ABI_LINUX (numeros de syscall)
     pub parent: usize,   // pid de quem criou o processo (usize::MAX: o kernel)
@@ -95,14 +96,14 @@ impl Process {
             pid: 0, state: State::Unused, ctx: Context::zeroed(), fp: FpState::zeroed(), root: 0, asid: 0,
             inbox: Message::zero(), reply: Message::zero(), peer: 0, send_to: 0,
             msg_ptr: 0, wake_at: 0, cpu: 0, cpu_time: 0, killed: false, brk: HEAP_BASE,
-            leader: 0, mm: 0, members: 0, vfork_parent: IDLE, io_key: 0, futex_addr: 0, abi: ABI_PULSAR, parent: usize::MAX,
+            leader: 0, mm: 0, members: 0, vfork_parent: IDLE, io_key: 0, io_mask: 0, futex_addr: 0, abi: ABI_PULSAR, parent: usize::MAX,
             status: 0, wait_pid: 0, wait_ptr: 0, clear_tid: 0, io_deadline: 0, in_poll: false, alarm_at: 0, alarm_every: 0, sig: crate::signal::SigThread::new(),
             name: [0; NAME_LEN],
         }
     }
 }
 
-pub const MAX_PROCS: usize = 32;   // processos + threads
+pub const MAX_PROCS: usize = 256;  // processos + threads (o Firefox sozinho usa ~100)
 
 /// Conjunto de syscalls do processo: apps .pulse usam a do Pulsar; binarios
 /// ELF usam os numeros do Linux (asm-generic, iguais em aarch64 e riscv64).
@@ -291,8 +292,8 @@ pub unsafe fn clone_thread(frame: *mut Context, stack: u64, tls: Option<u64>, cl
 // ------------------------------------------------------------- consultas
 
 /// (tid, pid, ppid) do corrente: tid = pid da thread, pid = do lider.
+#[inline]
 pub fn current_ids() -> (usize, usize, usize) {
-    let _g = SCHED.guard();
     let s = cur_slot();
     if s == IDLE { return (0, 0, 0); }
     let l = procs()[s].leader;
@@ -331,17 +332,16 @@ pub fn current_pid() -> usize {
 }
 
 /// (slot dono, raiz, ASID) do espaco de enderecamento corrente.
+#[inline]
 pub fn current_space() -> Option<(usize, u64, u16)> {
-    let _g = SCHED.guard();
     let s = cur_slot();
     if s == IDLE { return None; }
-    let m = procs()[s].mm;
-    Some((m, procs()[m].root, procs()[m].asid))
+    Some((procs()[s].mm, procs()[s].root, procs()[s].asid))
 }
 
 /// Slot do processo corrente (identidade: descritores, cwd).
+#[inline]
 pub fn current_leader() -> Option<usize> {
-    let _g = SCHED.guard();
     let s = cur_slot();
     if s == IDLE { None } else { Some(procs()[s].leader) }
 }
@@ -417,15 +417,22 @@ pub fn online_cpus() -> usize {
 
 // ------------------------------------------------------------- escalonador
 
-/// Acorda uma CPU ociosa (outra que nao esta) para pegar trabalho novo.
-fn kick_idle_cpu() {
+/// Acorda ate `max` CPUs ociosas (outras que nao esta) para pegar trabalho novo.
+fn kick_idle_cpus(mut max: usize) {
+    if max == 0 { return; }
     let me = cpu();
     for c in 0..MAX_CPUS {
         if c != me && ONLINE[c].load(Ordering::Relaxed) && unsafe { CURRENT[c] } == IDLE {
             arch::send_ipi(c);
-            return;
+            max -= 1;
+            if max == 0 { return; }
         }
     }
+}
+
+#[inline]
+fn kick_idle_cpu() {
+    kick_idle_cpus(1);
 }
 
 fn account(c: usize, now: u64) {
@@ -598,10 +605,15 @@ pub unsafe fn enter_scheduler(c: usize) -> Context {
 
 /// SYS_SLEEP: dorme `ms` milissegundos.
 pub unsafe fn sleep(frame: *mut Context, ms: u64) {
+    unsafe { sleep_ticks(frame, time::ms_to_ticks(ms)) };
+}
+
+/// Dorme por `ticks` do contador de tempo (resolucao de nanosleep).
+pub unsafe fn sleep_ticks(frame: *mut Context, ticks: u64) {
     let _g = SCHED.guard();
     let s = cur_slot();
     let p = &mut procs()[s];
-    p.wake_at = arch::now() + time::ms_to_ticks(ms);
+    p.wake_at = arch::now() + ticks;
     p.state = State::Sleeping;
     unsafe {
         (*frame).set_ret(0);
@@ -661,10 +673,18 @@ fn record_exit(s: usize) {
             if status & 0x7F != 0 { "sinal" } else { "saida" });
         let _ = write!(crate::uart::Uart, "[linux]   codigo {}\n", if status & 0x7F != 0 { status & 0x7F } else { status >> 8 });
     }
+    let mut redo = false;
     for p in ps.iter_mut() {
         if p.state == State::WaitChild && p.pid != pid && procs_pid_of_leader(p) == parent
             && (p.wait_pid == -1 || p.wait_pid == pid as i64)
         {
+            if p.wait_ptr == WAIT_REDO {
+                // waitid: roda de novo e acha o registro abaixo (talvez sem colher)
+                p.ctx.rewind_syscall();
+                p.state = State::Ready;
+                redo = true;
+                continue;
+            }
             if p.wait_ptr != 0 {
                 if let Some(pa) = arch::mmu::translate_user(p.root, p.wait_ptr, true) {
                     unsafe { core::ptr::write_unaligned(pa as *mut u32, status) };
@@ -678,6 +698,7 @@ fn record_exit(s: usize) {
             return;
         }
     }
+    if redo { kick_idle_cpu(); }
     unsafe {
         EXITS[EXITS_NEXT] = (pid, parent, status);
         EXITS_NEXT = (EXITS_NEXT + 1) % EXITS_MAX;
@@ -741,6 +762,43 @@ pub unsafe fn wait_child(frame: *mut Context, pid: i64, status_ptr: u64, nohang:
     p.wait_ptr = status_ptr;
     unsafe { block(frame) };
 }
+
+/// Resultado de waitid_child.
+pub enum Waited { Found(usize, u32), Nothing, NoChild, Blocked }
+
+/// waitid(): como wait_child, mas devolve (pid, status) a quem chama (que
+/// preenche o siginfo) e, com `nowait` (WNOWAIT), so espia: o filho continua
+/// por colher. Quem bloqueia fica em WaitChild com wait_ptr = WAIT_REDO e,
+/// quando um filho termina, a syscall roda de novo e acha o registro.
+pub unsafe fn waitid_child(frame: *mut Context, pid: i64, nohang: bool, nowait: bool) -> Waited {
+    let _g = SCHED.guard();
+    let s = cur_slot();
+    let me = procs()[procs()[s].leader].pid;
+    unsafe {
+        for e in (*(&raw mut EXITS)).iter_mut() {
+            if e.0 != usize::MAX && e.1 == me && (pid == -1 || e.0 as i64 == pid) {
+                let r = Waited::Found(e.0, e.2);
+                if !nowait { e.0 = usize::MAX; }
+                return r;
+            }
+        }
+    }
+    let alive = procs().iter().any(|p| {
+        p.state != State::Unused && p.state != State::Zombie && p.leader == slot_index(p) && p.parent == me
+            && (pid == -1 || p.pid as i64 == pid)
+    });
+    if !alive { return Waited::NoChild; }
+    if nohang { return Waited::Nothing; }
+    let p = &mut procs()[s];
+    p.state = State::WaitChild;
+    p.wait_pid = pid;
+    p.wait_ptr = WAIT_REDO;
+    unsafe { block(frame) };
+    Waited::Blocked
+}
+
+/// wait_ptr de quem espera em waitid (refaz a syscall em vez de colher).
+const WAIT_REDO: u64 = u64::MAX;
 
 fn slot_index(p: &Process) -> usize {
     p.pid % MAX_PROCS
@@ -817,6 +875,12 @@ pub unsafe fn exit_group(frame: *mut Context) {
 /// a trava, entao um WAKE nao se perde). Retorna 0 (acordado), -1 (valor
 /// mudou) ou -2 (tempo esgotado). `timeout_ms` = 0: sem limite.
 pub unsafe fn futex_wait(frame: *mut Context, addr: u64, val: u32, timeout_ms: u64) {
+    let ticks = if timeout_ms > 0 { time::ms_to_ticks(timeout_ms) } else { 0 };
+    unsafe { futex_wait_ticks(frame, addr, val, ticks) };
+}
+
+/// FUTEX_WAIT com timeout em ticks do contador (0 = sem limite).
+pub unsafe fn futex_wait_ticks(frame: *mut Context, addr: u64, val: u32, timeout_ticks: u64) {
     let _g = SCHED.guard();
     let s = cur_slot();
     let cur = unsafe { core::ptr::read_volatile(addr as *const u32) };
@@ -829,7 +893,7 @@ pub unsafe fn futex_wait(frame: *mut Context, addr: u64, val: u32, timeout_ms: u
     let p = &mut procs()[s];
     p.state = State::FutexWait;
     p.futex_addr = addr;
-    p.wake_at = if timeout_ms > 0 { arch::now() + time::ms_to_ticks(timeout_ms) } else { 0 };
+    p.wake_at = if timeout_ticks > 0 { arch::now() + timeout_ticks } else { 0 };
     unsafe {
         (*frame).set_ret(0);
         block(frame);
@@ -856,7 +920,7 @@ fn futex_wake_locked(root: u64, addr: u64, n: u64) -> u64 {
             woken += 1;
         }
     }
-    if woken > 0 { kick_idle_cpu(); }
+    if woken > 0 { kick_idle_cpus(woken as usize); }
     woken
 }
 
@@ -1089,7 +1153,7 @@ pub fn sbrk(inc: u64) -> Option<u64> {
         }
         page += 4096;
     }
-    arch::mmu::flush_tlb();
+    arch::mmu::sync_new_pages();
     Some(old)
 }
 
@@ -1120,7 +1184,8 @@ pub fn brk(addr: u64) -> u64 {
 /// No fork o espaco e copiado (`new_root`, ja pronto); no vfork o filho usa
 /// o espaco do pai, que fica suspenso ate o filho fazer execve ou sair.
 /// `stack` != 0 troca a pilha do filho. Retorna o pid do filho.
-pub unsafe fn fork(frame: *mut Context, new_root: Option<(u64, u16)>, stack: u64) -> Option<usize> {
+pub unsafe fn fork(frame: *mut Context, new_root: Option<(u64, u16)>, stack: u64,
+                   tls: Option<u64>, clear_tid: u64) -> Option<usize> {
     let _g = SCHED.guard();
     let s = cur_slot();
     if s == IDLE { return None; }
@@ -1134,12 +1199,14 @@ pub unsafe fn fork(frame: *mut Context, new_root: Option<(u64, u16)>, stack: u64
     c.ctx = unsafe { *frame };
     c.ctx.set_ret(0);
     if stack != 0 { c.ctx.set_sp(stack); }
+    if let Some(v) = tls { c.ctx.set_tls(v); }
     unsafe { arch::fp_save(&mut c.fp) };
     c.leader = i;
     c.abi = ps[s].abi;
     c.parent = ps[l].pid;
     c.name = ps[l].name;
     c.brk = ps[m].brk;
+    c.clear_tid = clear_tid;
     match new_root {
         Some((root, asid)) => {
             c.root = root;
@@ -1239,11 +1306,40 @@ pub unsafe fn exec_replace(frame: *mut Context, root: u64, asid: u16, entry: u64
 /// contador com a trava do objeto e so dorme se ninguem sinalizou depois.
 static IO_SEQ: [core::sync::atomic::AtomicU64; 64] = [const { core::sync::atomic::AtomicU64::new(0) }; 64];
 
-pub fn io_seq(key: u64) -> u64 {
-    IO_SEQ[(key % 64) as usize].load(Ordering::Acquire)
+#[inline]
+pub fn key_bucket(key: u64) -> usize {
+    ((key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize) & 63
 }
 
-/// Chave especial: qualquer evento de E/S acorda quem espera nela (poll,
+#[inline]
+pub fn key_bit(key: u64) -> u64 {
+    1u64 << key_bucket(key)
+}
+
+#[inline]
+pub fn bump_io_seq(key: u64) {
+    IO_SEQ[key_bucket(key)].fetch_add(1, Ordering::AcqRel);
+    IO_SEQ[key_bucket(POLL_KEY)].fetch_add(1, Ordering::AcqRel);
+}
+
+#[inline]
+pub fn io_seq(key: u64) -> u64 {
+    IO_SEQ[key_bucket(key)].load(Ordering::Acquire)
+}
+
+pub fn io_seq_mask(mask: u64) -> u64 {
+    if mask == 0 { return io_seq(POLL_KEY); }
+    let mut sum = 0u64;
+    let mut m = mask;
+    while m != 0 {
+        let b = m.trailing_zeros() as usize;
+        sum = sum.wrapping_add(IO_SEQ[b].load(Ordering::Acquire));
+        m &= m - 1;
+    }
+    sum
+}
+
+/// Chave especial: qualquer evento nos buckets de `io_mask` acorda quem espera nela (poll,
 /// select, epoll refazem a varredura).
 pub const POLL_KEY: u64 = 0x504F_4C4C;
 
@@ -1260,6 +1356,23 @@ pub unsafe fn io_wait_until(frame: *mut Context, key: u64, seen: u64, deadline: 
     let p = &mut procs()[s];
     p.state = State::IoWait;
     p.io_key = key;
+    p.io_mask = if key == POLL_KEY { u64::MAX } else { key_bit(key) };
+    p.wake_at = deadline;
+    unsafe { block(frame) };
+}
+
+/// Dorme em poll/select/epoll filtrando acordares apenas para os buckets de `mask`.
+pub unsafe fn io_wait_mask(frame: *mut Context, mask: u64, seen: u64, deadline: u64) {
+    let _g = SCHED.guard();
+    let s = cur_slot();
+    unsafe { (*frame).rewind_syscall() };
+    procs()[s].in_poll = true;
+    if mask != 0 && io_seq_mask(mask) != seen { return; }
+    if procs()[s].sig.pending & !procs()[s].sig.mask != 0 { return; }
+    let p = &mut procs()[s];
+    p.state = State::IoWait;
+    p.io_key = POLL_KEY;
+    p.io_mask = mask;
     p.wake_at = deadline;
     unsafe { block(frame) };
 }
@@ -1273,16 +1386,15 @@ pub fn io_wake(key: u64) {
 
 /// io_wake com SCHED ja presa.
 fn io_wake_locked(key: u64) {
-    IO_SEQ[(key % 64) as usize].fetch_add(1, Ordering::AcqRel);
-    IO_SEQ[(POLL_KEY % 64) as usize].fetch_add(1, Ordering::AcqRel);
-    let mut any = false;
+    let bit = key_bit(key);
+    let mut woken = 0;
     for p in procs().iter_mut() {
-        if p.state == State::IoWait && (p.io_key == key || p.io_key == POLL_KEY) {
+        if p.state == State::IoWait && (p.io_key == key || (p.io_key == POLL_KEY && (p.io_mask & bit) != 0)) {
             p.state = State::Ready;
-            any = true;
+            woken += 1;
         }
     }
-    if any { kick_idle_cpu(); }
+    if woken > 0 { kick_idle_cpus(woken); }
 }
 
 // ------------------------------------------------------------- caminho do executavel

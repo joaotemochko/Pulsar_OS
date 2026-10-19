@@ -41,12 +41,15 @@ struct Vma {
     start: u64,
     end: u64,
     prot: u64,
-    obj: u32,     // objeto de memoria compartilhada (shm.rs); 0 = anonima privada
-    pgoff: u64,   // pagina do objeto correspondente a `start`
+    obj: u32,     // objeto de memoria compartilhada (shm.rs); 0 = privado
+    ino: u32,     // inode ext2 (mmap de arquivo sob demanda); 0 = anonima/shm
+    pgoff: u64,   // pagina do objeto/arquivo correspondente a `start`
 }
 
 impl Vma {
-    const fn anon(start: u64, end: u64, prot: u64) -> Vma { Vma { start, end, prot, obj: 0, pgoff: 0 } }
+    const fn anon(start: u64, end: u64, prot: u64) -> Vma {
+        Vma { start, end, prot, obj: 0, ino: 0, pgoff: 0 }
+    }
 }
 
 /// Cada VMA que aponta para um objeto e uma referencia a ele.
@@ -156,7 +159,7 @@ impl Space {
                 // a faixa esta no meio: divide em duas
                 self.vmas()[i].end = start;
                 let pgoff = v.pgoff + (end - v.start) / 4096;
-                self.insert_at(i + 1, Vma { start: end, end: v.end, prot: v.prot, obj: v.obj, pgoff });
+                self.insert_at(i + 1, Vma { start: end, end: v.end, prot: v.prot, obj: v.obj, ino: v.ino, pgoff });
                 obj_ref(v.obj, 1);
                 return;
             }
@@ -203,8 +206,8 @@ impl Space {
     /// `a` e `b` (vizinhas) podem virar uma so VMA?
     fn mergeable(&mut self, a: usize, b: usize) -> bool {
         let (x, y) = (self.vmas()[a], self.vmas()[b]);
-        x.end == y.start && x.prot == y.prot && x.obj == y.obj
-            && (x.obj == 0 || x.pgoff + (x.end - x.start) / 4096 == y.pgoff)
+        x.end == y.start && x.prot == y.prot && x.obj == y.obj && x.ino == y.ino
+            && ((x.obj == 0 && x.ino == 0) || x.pgoff + (x.end - x.start) / 4096 == y.pgoff)
     }
 
     /// Divide a VMA que contem `addr` (estritamente dentro) em duas.
@@ -216,7 +219,7 @@ impl Space {
         if v.start >= addr || v.end <= addr { return; }
         self.vmas()[i].end = addr;
         let pgoff = v.pgoff + (addr - v.start) / 4096;
-        self.insert_at(i + 1, Vma { start: addr, end: v.end, prot: v.prot, obj: v.obj, pgoff });
+        self.insert_at(i + 1, Vma { start: addr, end: v.end, prot: v.prot, obj: v.obj, ino: v.ino, pgoff });
         obj_ref(v.obj, 1);
     }
 
@@ -251,12 +254,22 @@ fn page_up(x: u64) -> Option<u64> { x.checked_add(4095).map(|v| v & !4095) }
 
 /// SYS_MMAP: memoria anonima zerada. Retorna o endereco ou -errno.
 pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64) -> i64 {
-    mmap_obj(addr, len, prot, flags, 0, 0)
+    mmap_full(addr, len, prot, flags, 0, 0, 0)
 }
 
 /// mmap de um objeto compartilhado (`obj` != 0, a partir da pagina
 /// `pgoff`). A VMA nova leva uma referencia ao objeto (somada aqui).
 pub fn mmap_obj(addr: u64, len: u64, prot: u64, flags: u64, obj: u32, pgoff: u64) -> i64 {
+    mmap_full(addr, len, prot, flags, obj, 0, pgoff)
+}
+
+/// mmap de um arquivo ext2 (`ino` != 0, a partir da pagina `pgoff`),
+/// carregado sob demanda no page fault.
+pub fn mmap_file(addr: u64, len: u64, prot: u64, flags: u64, ino: u32, pgoff: u64) -> i64 {
+    mmap_full(addr, len, prot, flags, 0, ino, pgoff)
+}
+
+fn mmap_full(addr: u64, len: u64, prot: u64, flags: u64, obj: u32, ino: u32, pgoff: u64) -> i64 {
     let Some(len) = page_up(len) else { return -ENOMEM };
     if len == 0 || prot & !7 != 0 { return -EINVAL; }
     let Some((l, root, asid)) = process::current_space() else { return -EINVAL };
@@ -270,8 +283,9 @@ pub fn mmap_obj(addr: u64, len: u64, prot: u64, flags: u64, obj: u32, pgoff: u64
         if sp.overlaps(addr, end) {
             if flags & MAP_NOREPLACE != 0 { return -EEXIST; }
             sp.carve(addr, end);
-            mmu::unmap_range(root, addr, end);
-            mmu::flush_asid(asid);
+            if mmu::unmap_range(root, addr, end) > 0 {
+                mmu::flush_range(asid, addr, end);
+            }
         }
         addr
     } else {
@@ -286,7 +300,7 @@ pub fn mmap_obj(addr: u64, len: u64, prot: u64, flags: u64, obj: u32, pgoff: u64
         }
     };
     obj_ref(obj, 1);
-    sp.add_vma(Vma { start, end: start + len, prot, obj, pgoff });
+    sp.add_vma(Vma { start, end: start + len, prot, obj, ino, pgoff });
     start as i64
 }
 
@@ -301,8 +315,9 @@ pub fn munmap(addr: u64, len: u64) -> i64 {
     let sp = space(l);
     if !sp.reserve(1) { return -ENOMEM; }
     sp.carve(addr, end);
-    mmu::unmap_range(root, addr, end);
-    mmu::flush_asid(asid);
+    if mmu::unmap_range(root, addr, end) > 0 {
+        mmu::flush_range(asid, addr, end);
+    }
     0
 }
 
@@ -327,46 +342,163 @@ pub fn mprotect(addr: u64, len: u64, prot: u64) -> i64 {
         sp.vmas()[i].prot = prot;
         i += 1;
     }
-    mmu::protect_range(root, addr, end, PageFlags::user_prot(prot));
-    mmu::flush_asid(asid);
+    if mmu::protect_range(root, addr, end, PageFlags::user_prot(prot)) > 0 {
+        mmu::flush_range(asid, addr, end);
+    }
     0
+}
+
+/// mremap(old_addr, old_len, new_len, flags): encolhe ou estica uma VMA
+/// anonima no lugar ou (com MREMAP_MAYMOVE = 1) move as PTEs para uma faixa
+/// nova sem realocar nem copiar os frames fisicos.
+pub fn mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u64) -> i64 {
+    const MREMAP_MAYMOVE: u64 = 1;
+    if old_addr & 4095 != 0 || old_addr < MMAP_BASE || old_len == 0 || new_len == 0 || flags & !MREMAP_MAYMOVE != 0 {
+        return -EINVAL;
+    }
+    let Some(old_len) = page_up(old_len) else { return -ENOMEM };
+    let Some(new_len) = page_up(new_len) else { return -ENOMEM };
+    let Some(old_end) = old_addr.checked_add(old_len) else { return -EINVAL };
+    if old_end > MMAP_END { return -EINVAL; }
+    if new_len == old_len { return old_addr as i64; }
+    if new_len < old_len {
+        let r = munmap(old_addr + new_len, old_len - new_len);
+        return if r < 0 { r } else { old_addr as i64 };
+    }
+    let Some((l, root, asid)) = process::current_space() else { return -EINVAL };
+    let _g = VM.guard();
+    let sp = space(l);
+    let Some(v) = sp.find(old_addr) else { return -EINVAL };
+    if v.start > old_addr || v.end < old_end || v.obj != 0 || v.ino != 0 {
+        return -ENOMEM;
+    }
+    if !sp.reserve(2) { return -ENOMEM; }
+    let new_end = old_addr.saturating_add(new_len);
+    if new_end <= MMAP_END && !sp.overlaps(old_end, new_end) {
+        sp.add(old_end, new_end, v.prot);
+        return old_addr as i64;
+    }
+    if flags & MREMAP_MAYMOVE == 0 {
+        return -ENOMEM;
+    }
+    let Some(new_addr) = sp.gap(new_len) else { return -ENOMEM };
+    sp.hint = new_addr + new_len;
+    sp.carve(old_addr, old_end);
+    sp.add(new_addr, new_addr + new_len, v.prot);
+    if mmu::move_range(root, old_addr, old_end, new_addr) > 0 {
+        mmu::flush_range(asid, old_addr, old_end);
+    }
+    new_addr as i64
 }
 
 /// Page fault (ou buffer de syscall) em `addr`: se cai numa VMA que permite
 /// o acesso, aloca a pagina e retorna true. False = acesso invalido.
 pub fn fault(addr: u64, access: Access) -> bool {
-    let Some((l, root, _)) = process::current_space() else { return false };
-    let _g = VM.guard();
-    let Some(v) = space(l).find(addr) else { return false };
-    let ok = match access {
-        Access::Read => v.prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0,
-        Access::Write => v.prot & PROT_WRITE != 0,
-        Access::Exec => v.prot & PROT_EXEC != 0,
-    };
-    if !ok { return false; }
+    let Some((l, root, asid)) = process::current_space() else { return false };
     let page = addr & !4095;
-    let flags = PageFlags::user_prot(v.prot);
-    if mmu::is_mapped(root, page) {
-        // outra thread chegou antes: so garante as permissoes
-        mmu::protect_range(root, page, page + 4096, flags);
-    } else if v.obj != 0 {
-        // pagina de um objeto compartilhado: a mesma em todo processo
-        let pg = v.pgoff + (page - v.start) / 4096;
-        let Some(frame) = crate::shm::page(v.obj, pg as usize, true) else { return false };
-        if !unsafe { mmu::map_page_in(root, page, frame, flags.shared()) } { return false; }
-    } else {
+    let (v, fault_pages) = {
+        let _g = VM.guard();
+        let Some(v) = space(l).find(addr) else { return false };
+        let ok = match access {
+            Access::Read => v.prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0,
+            Access::Write => v.prot & PROT_WRITE != 0,
+            Access::Exec => v.prot & PROT_EXEC != 0,
+        };
+        if !ok { return false; }
+        let flags = PageFlags::user_prot(v.prot);
+        if mmu::is_mapped(root, page) {
+            // outra thread chegou antes: so garante as permissoes
+            if mmu::protect_range(root, page, page + 4096, flags) > 0 {
+                mmu::flush_range(asid, page, page + 4096);
+            }
+            return true;
+        }
+        if v.obj != 0 {
+            // pagina de um objeto compartilhado: a mesma em todo processo
+            let pg = v.pgoff + (page - v.start) / 4096;
+            let Some(frame) = crate::shm::page(v.obj, pg as usize, true) else { return false };
+            if !unsafe { mmu::map_page_in(root, page, frame, flags.shared()) } { return false; }
+            mmu::sync_new_pages();
+            return true;
+        }
         if page < MMAP_BASE || page >= MMAP_END { return false; }
-        let Some(frame) = frame_allocator::alloc_frame() else { return false };
-        unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, 4096);
-            if !mmu::map_page_in(root, page, frame, flags) {
-                frame_allocator::free_frame(frame);
-                return false;
+        if v.ino == 0 {
+            let Some(frame) = frame_allocator::alloc_frame() else { return false };
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, 4096);
+                if !mmu::map_page_in(root, page, frame, flags) {
+                    frame_allocator::free_frame(frame);
+                    return false;
+                }
+            }
+            mmu::sync_new_pages();
+            return true;
+        }
+        // VMA de arquivo: fault-around de ate 8 paginas contiguas nao mapeadas
+        let max_n = ((v.end - page) / 4096).min(8) as usize;
+        let mut n = 1usize;
+        while n < max_n && !mmu::is_mapped(root, page + (n as u64) * 4096) {
+            n += 1;
+        }
+        (v, n)
+    };
+
+    // Fora da trava VM: aloca frames e le do ext2 (FS -> FRAME, sem inversao com VM)
+    let mut frames = [0u64; 8];
+    let mut n_alloc = 0usize;
+    for i in 0..fault_pages {
+        let Some(f) = frame_allocator::alloc_frame() else { break };
+        unsafe { core::ptr::write_bytes(f as *mut u8, 0, 4096) };
+        frames[i] = f;
+        n_alloc += 1;
+    }
+    if n_alloc == 0 { return false; }
+
+    let base_off = (v.pgoff + (page - v.start) / 4096) * 4096;
+    if crate::file::read_ino_pages(v.ino, base_off, &frames[..n_alloc]).is_err() {
+        for &f in &frames[..n_alloc] { frame_allocator::free_frame(f); }
+        return false;
+    }
+
+    let _g = VM.guard();
+    let Some(cur_v) = space(l).find(addr) else {
+        for &f in &frames[..n_alloc] { frame_allocator::free_frame(f); }
+        return false;
+    };
+    let flags = PageFlags::user_prot(cur_v.prot);
+    for i in 0..n_alloc {
+        let pva = page + (i as u64) * 4096;
+        if pva < cur_v.end && cur_v.ino == v.ino && !mmu::is_mapped(root, pva) {
+            let ok = unsafe { mmu::map_page_in(root, pva, frames[i], flags) };
+            if !ok {
+                frame_allocator::free_frame(frames[i]);
+                if i == 0 { return false; }
+            }
+        } else {
+            frame_allocator::free_frame(frames[i]);
+            if i == 0 {
+                if mmu::protect_range(root, page, page + 4096, flags) > 0 {
+                    mmu::flush_range(asid, page, page + 4096);
+                }
             }
         }
     }
-    mmu::flush_tlb();
+    mmu::sync_new_pages();
     true
+}
+
+/// Ha alguma VMA mapeando o inode `ino`? (Usado em unlink/rename para nao
+/// liberar inodes de arquivos ainda mapeados.)
+pub fn is_mapped_ino(ino: u32) -> bool {
+    if ino == 0 { return false; }
+    let _g = VM.guard();
+    for l in 0..MAX_PROCS {
+        let sp = space(l);
+        if sp.table != 0 && sp.vmas().iter().any(|v| v.ino == ino) {
+            return true;
+        }
+    }
+    false
 }
 
 /// madvise(DONTNEED): devolve as paginas de [addr, addr+len); a faixa
@@ -379,8 +511,9 @@ pub fn discard(addr: u64, len: u64) -> i64 {
     if start >= end { return 0; }
     let Some((_, root, asid)) = process::current_space() else { return -EINVAL };
     let _g = VM.guard();
-    mmu::unmap_range(root, start, end);
-    mmu::flush_asid(asid);
+    if mmu::unmap_range(root, start, end) > 0 {
+        mmu::flush_range(asid, start, end);
+    }
     0
 }
 
@@ -393,9 +526,9 @@ pub fn maps_text(out: &mut [u8]) -> usize {
     for v in space(l).vmas().iter() {
         let p = |b: u64, c: char| if v.prot & b != 0 { c } else { '-' };
         let name = if v.end == MMAP_END { "[stack]" } else if v.obj != 0 { "/memfd (deleted)" } else { "" };
-        let _ = write!(t, "{:x}-{:x} {}{}{}{} {:08x} 00:00 0          {}\n",
+        let _ = write!(t, "{:x}-{:x} {}{}{}{} {:08x} 00:00 {}          {}\n",
             v.start, v.end, p(PROT_READ, 'r'), p(PROT_WRITE, 'w'), p(PROT_EXEC, 'x'),
-            if v.obj != 0 { 's' } else { 'p' }, v.pgoff * 4096, name);
+            if v.obj != 0 { 's' } else { 'p' }, v.pgoff * 4096, v.ino, name);
     }
     t.len
 }

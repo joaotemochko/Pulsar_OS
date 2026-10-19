@@ -25,8 +25,8 @@ const MSGQ: usize = 128;
 const ATTQ: usize = 8;
 /// Maximo de descritores numa mensagem.
 pub const MAX_FDS: usize = 16;
-const MAX_CONNS: usize = 64;
-const MAX_LISTEN: usize = 16;
+const MAX_CONNS: usize = 512;  // IPC do Firefox: um socketpair por canal
+const MAX_LISTEN: usize = 64;
 const BACKLOG: usize = 16;
 
 #[derive(Clone, Copy)]
@@ -74,8 +74,8 @@ const LEMPTY: Listener = Listener { used: false, refs: 0, packet: false, key: Ke
 static mut LISTENERS: [Listener; MAX_LISTEN] = [LEMPTY; MAX_LISTEN];
 fn listeners() -> &'static mut [Listener; MAX_LISTEN] { unsafe { &mut *(&raw mut LISTENERS) } }
 
-fn key_r(c: usize, e: usize) -> u64 { 0x554E_0000_0000 | (c as u64) << 2 | e as u64 }
-fn key_l(i: usize) -> u64 { 0x554C_0000_0000 | i as u64 }
+pub(crate) fn key_r(c: usize, e: usize) -> u64 { 0x554E_0000_0000 | (c as u64) << 2 | e as u64 }
+pub(crate) fn key_l(i: usize) -> u64 { 0x554C_0000_0000 | i as u64 }
 
 // ------------------------------------------------------------ conexoes
 
@@ -215,6 +215,14 @@ pub fn shutdown(c: usize, e: usize, how: u64) {
     let k = &mut conns()[c];
     if how != 0 { k.q[1 - e].eof = true; file::push_wake(key_r(c, 1 - e)); }
     if how != 1 { k.q[e].eof = true; file::push_wake(key_r(c, e)); }
+}
+
+/// Bytes prontos para ler na ponta `e` (FIONREAD): no modo pacote, o
+/// tamanho da proxima mensagem, como no Linux.
+pub fn avail(c: usize, e: usize) -> u64 {
+    let k = &conns()[c];
+    let q = &k.q[e];
+    if k.packet { if q.mcount > 0 { q.msgs[q.mhead] as u64 } else { 0 } } else { q.len }
 }
 
 /// (ha o que ler ou fim, cabe mais, outro lado fechou)

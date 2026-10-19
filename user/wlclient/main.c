@@ -27,7 +27,7 @@
 
 enum { T_FREE, T_DISPLAY, T_REGISTRY, T_CALLBACK, T_COMPOSITOR, T_SURFACE, T_REGION, T_SHM, T_POOL,
        T_BUFFER, T_WMBASE, T_XDGSURF, T_TOPLEVEL, T_SEAT, T_POINTER, T_KEYBOARD, T_OUTPUT, T_POSITIONER,
-       T_SUBCOMP, T_SUBSURF, T_POPUP };
+       T_SUBCOMP, T_SUBSURF, T_POPUP, T_DDM, T_DSOURCE, T_DDEVICE, T_DECOMGR, T_DECO };
 
 /* papel de uma wl_surface */
 enum { R_NONE, R_TOPLEVEL, R_SUB, R_POPUP };
@@ -47,7 +47,7 @@ typedef struct {
     /* ---- surface ---- */
     int attached;              /* attach desde o ultimo commit */
     i32 dx0, dy0, dx1, dy1;    /* dano acumulado (caixa; dx1 <= dx0 = nenhum) */
-    u8 role, mapped, alpha, grab;
+    u8 role, mapped, alpha, grab, opaque, no_input;
     u32 parent;                /* surface pai (subsurface/popup) */
     u32 xdg, roleobj;          /* xdg_surface; xdg_popup/subsurface */
     i32 px, py;                /* subsurface: no pai | popup: na geometria do pai */
@@ -63,9 +63,20 @@ static App app;
 static int have_app;
 static u32 serial = 1;
 static char title[32] = "Linux";
+static char app_id[32];                 /* xdg_toplevel.set_app_id: o WM acha o app do catalogo por ele */
 static u32 top_surface, top_xdg, top_level;       /* a janela */
+/* Um cliente pode ter varios wl_pointer/wl_keyboard (o Firefox pede os
+ * dele alem dos do GTK): como num compositor, a entrada vai para todos.
+ * pointer_id/keyboard_id = o mais recente (0 = nenhum). */
+#define MAXDEV 8
+static u32 ptrs[MAXDEV], kbds[MAXDEV];
+static int nptrs, nkbds;
 static u32 pointer_id, keyboard_id;
-static u32 kb_version;
+static u32 kb_surf;            /* superficie com o foco do teclado (0 = nenhuma) */
+static void dev_add(u32* v, int* n, u32 id) { if (*n < MAXDEV) v[(*n)++] = id; }
+static void dev_del(u32* v, int* n, u32 id) {
+    for (int i = 0; i < *n; i++) if (v[i] == id) { v[i] = v[--(*n)]; break; }
+}
 static i32 cfg_w, cfg_h;
 static i32 zcount = 1;
 
@@ -166,7 +177,7 @@ static int read_client(void) {
     PMsgHdr m; memset(&m, 0, sizeof m);
     m.iov = &iov; m.iovlen = 1; m.control = ctl; m.controllen = sizeof ctl;
     i64 n = sys_recvmsg(CONN, &m, 0x40 /* MSG_DONTWAIT */ | 0x40000000 /* MSG_CMSG_CLOEXEC */);
-    if (n == -11) return 1;                   /* nada agora */
+    if (n == -11) return -1;                  /* nada agora */
     if (n <= 0) return 0;
     inlen += (u32)n;
     if (m.controllen >= sizeof(PCmsgHdr)) {
@@ -206,6 +217,13 @@ static const struct { const char* name; int type; u32 version; } GLOBALS[] = {
     { "wl_seat", T_SEAT, 5 },
     { "wl_output", T_OUTPUT, 2 },
     { "wl_subcompositor", T_SUBCOMP, 1 },
+    /* area de transferencia / arrastar: o GTK 3 so cria o seat (mouse e
+     * teclado) depois de achar este global. Por enquanto sem ofertas entre
+     * programas: cada um so ve o proprio conteudo. */
+    { "wl_data_device_manager", T_DDM, 3 },
+    /* decoracao pelo servidor (KDE, entendida pelo GTK 3 e pelo Qt): a barra
+     * de titulo e a do WM do Pulsar, sem uma segunda desenhada pelo programa */
+    { "org_kde_kwin_server_decoration_manager", T_DECOMGR, 1 },
 };
 #define NGLOBALS (sizeof GLOBALS / sizeof GLOBALS[0])
 
@@ -229,6 +247,8 @@ static void bind_global(u32 name, const char* iface, u32 version, u32 id) {
         ev_end(e);
         e = ev_begin(id, 1); put_u32(3); put_u32(si.fb_w); put_u32(si.fb_h); put_u32(60000); ev_end(e);
         if (version >= 2) { e = ev_begin(id, 3); put_u32(1); ev_end(e); e = ev_begin(id, 2); ev_end(e); }
+    } else if (o->type == T_DECOMGR) {
+        Ev e = ev_begin(id, 0); put_u32(2); ev_end(e);   /* default_mode: Server */
     }
 }
 
@@ -273,8 +293,7 @@ static int read_layout(void) {
 
 /* wl_keyboard.keymap: o mapa XKB do layout (gerado por tools/genkeymaps.py),
  * numa memoria compartilhada terminada em NUL */
-static void send_keymap(void) {
-    if (!keyboard_id) return;
+static void send_keymap_to(u32 kbd) {
     read_layout();
     char path[64]; char* p = fmt_s(path, "/usr/share/pulsar/xkb/"); p = fmt_s(p, layout); fmt_s(p, ".xkb");
     PStat st;
@@ -292,7 +311,11 @@ static void send_keymap(void) {
     for (i64 n; (n = sys_read(fd, chunk, sizeof chunk)) > 0; off += (u64)n) sys_pwrite(km, chunk, (u64)n, off);
     sys_close(fd);
     outfds[noutfds++] = (i32)km;
-    Ev e = ev_begin(keyboard_id, 0); put_u32(1); put_u32((u32)size); ev_end(e);   /* xkb_v1 */
+    Ev e = ev_begin(kbd, 0); put_u32(1); put_u32((u32)size); ev_end(e);   /* xkb_v1 */
+}
+
+static void send_keymap(void) {
+    for (int i = 0; i < nkbds; i++) { flush(); send_keymap_to(kbds[i]); }
 }
 
 /* modificadores no formato XKB: Shift 0x1, Lock 0x2, Control 0x4, Mod1 (Alt)
@@ -301,7 +324,36 @@ static void send_mods(u8 m) {
     u32 dep = (m & MOD_SHIFT ? 0x1 : 0) | (m & MOD_CTRL ? 0x4 : 0) | (m & MOD_ALT ? 0x8 : 0)
             | (m & MOD_META ? 0x40 : 0) | (m & MOD_ALTGR ? 0x80 : 0);
     u32 lock = (m & MOD_CAPS ? 0x2 : 0) | 0x10;
-    Ev v = ev_begin(keyboard_id, 4); put_u32(serial++); put_u32(dep); put_u32(0); put_u32(lock); put_u32(0); ev_end(v);
+    u32 sr = serial++;
+    for (int i = 0; i < nkbds; i++) {
+        Ev v = ev_begin(kbds[i], 4); put_u32(sr); put_u32(dep); put_u32(0); put_u32(lock); put_u32(0); ev_end(v);
+    }
+}
+
+/* eventos de ponteiro/teclado para todos os objetos do cliente */
+static void ptr_ev2(u32 op, u32 a0, u32 a1) {          /* leave(serial, surf) */
+    for (int i = 0; i < nptrs; i++) { Ev v = ev_begin(ptrs[i], op); put_u32(a0); put_u32(a1); ev_end(v); }
+}
+static void ptr_ev3(u32 op, u32 a0, u32 a1, u32 a2) {  /* motion(t, x, y), axis(t, eixo, v) */
+    for (int i = 0; i < nptrs; i++) { Ev v = ev_begin(ptrs[i], op); put_u32(a0); put_u32(a1); put_u32(a2); ev_end(v); }
+}
+static void ptr_ev4(u32 op, u32 a0, u32 a1, u32 a2, u32 a3) {  /* enter, button */
+    for (int i = 0; i < nptrs; i++) { Ev v = ev_begin(ptrs[i], op); put_u32(a0); put_u32(a1); put_u32(a2); put_u32(a3); ev_end(v); }
+}
+static void ptr_frame(void) {                          /* wl_pointer.frame (versao >= 5) */
+    for (int i = 0; i < nptrs; i++) {
+        Obj* p = find(ptrs[i]);
+        if (p && p->version >= 5) { Ev v = ev_begin(ptrs[i], 5); ev_end(v); }
+    }
+}
+static void kb_ev2(u32 op, u32 a0, u32 a1, int with_array) {  /* leave / enter(serial, surf, keys) */
+    for (int i = 0; i < nkbds; i++) {
+        Ev v = ev_begin(kbds[i], op); put_u32(a0); put_u32(a1); if (with_array) put_array(0, 0); ev_end(v);
+    }
+}
+static void kb_key(u32 now, u32 key, u32 state) {
+    u32 sr = serial++;
+    for (int i = 0; i < nkbds; i++) { Ev v = ev_begin(kbds[i], 3); put_u32(sr); put_u32(now); put_u32(key); put_u32(state); ev_end(v); }
 }
 
 /* ------------------------------------------------------------ cena */
@@ -388,7 +440,13 @@ static void draw_surface(Obj* s, i32 cx0, i32 cy0, i32 cx1, i32 cy1) {
         u32* d = app.fb.base + (u64)y * SURF_W;
         const u32* sp = s->st + (u64)(y - ay) * s->sw - ax;
         if (!s->alpha) memcpy(d + x0, sp + x0, (u64)(x1 - x0) * 4);
-        else for (i32 x = x0; x < x1; x++) d[x] = over(d[x], sp[x]);
+        else {
+            for (i32 x = x0; x < x1; x++) {
+                u32 v = sp[x];
+                if (v >= 0xFF000000u) d[x] = v;
+                else if (v != 0) d[x] = over(d[x], v);
+            }
+        }
     }
 }
 
@@ -457,7 +515,12 @@ static void copy_rows(u32* dst, i32 dst_stride, i32 dx, i32 dy, const u8* src, u
         u32* d = dst + (u64)(dy + y) * dst_stride + dx;
         const u32* s = (const u32*)(src + (u64)(sy + y) * stride) + sx;
         if (!argb_over_white) memcpy(d, s, (u64)w * 4);
-        else for (i32 x = 0; x < w; x++) d[x] = over(0xFFFFFF, s[x]);
+        else {
+            for (i32 x = 0; x < w; x++) {
+                u32 v = s[x];
+                d[x] = (v >= 0xFF000000u) ? v : over(0xFFFFFF, v);
+            }
+        }
     }
 }
 
@@ -493,8 +556,11 @@ static void surface_commit(Obj* s) {
             if (s->role == R_TOPLEVEL) {
                 if (!have_app) {
                     i32 w = s->gw ? s->gw : bw, h = s->gw ? s->gh : bh;
-                    app_init(&app, KIND_LINUX, title, w, h);
+                    /* o primeiro HELLO leva o app_id (o WM reconhece o
+                       programa, ex.: Firefox no dock); o titulo vem logo depois */
+                    app_init(&app, KIND_LINUX, app_id[0] ? app_id : title, w, h);
                     have_app = 1;
+                    if (app_id[0]) app_title(&app, title);
                     cfg_w = app.w; cfg_h = app.h;
                 }
                 /* buffer -> janela: desloca pela geometria, recorta na janela */
@@ -512,10 +578,11 @@ static void surface_commit(Obj* s) {
                     for (i32 y = 0; y < app.h; y++)
                         for (i32 x = 0; x < app.w; x++) dst[(u64)y * dstride + x] = 0xFFFFFF;
                 if (src && wx0 < wx1 && wy0 < wy1) {
+                    int over_white = (buf->fmt == 0) && !s->opaque;
                     if (kids && base_valid)
-                        copy_rows(base_st, base_w, wx0, wy0, src, buf->stride, wx0 + ox, wy0 + oy, wx1 - wx0, wy1 - wy0, buf->fmt == 0);
+                        copy_rows(base_st, base_w, wx0, wy0, src, buf->stride, wx0 + ox, wy0 + oy, wx1 - wx0, wy1 - wy0, over_white);
                     else {
-                        copy_rows(app.fb.base, SURF_W, wx0, wy0, src, buf->stride, wx0 + ox, wy0 + oy, wx1 - wx0, wy1 - wy0, buf->fmt == 0);
+                        copy_rows(app.fb.base, SURF_W, wx0, wy0, src, buf->stride, wx0 + ox, wy0 + oy, wx1 - wx0, wy1 - wy0, over_white);
                         base_valid = 0;                            /* sem filhos: a tela e a copia */
                     }
                 }
@@ -524,8 +591,9 @@ static void surface_commit(Obj* s) {
                 s->sw = bw; s->sh = bh; s->mapped = 1;
             } else if (s->role == R_SUB || s->role == R_POPUP) {
                 int was = s->mapped && visible(s);
-                if (was) { abs_pos(s, &ax, &ay); win_damage(ax, ay, s->sw, s->sh); }
-                if (!s->st || s->sw != bw || s->sh != bh) {
+                int resized = !s->st || s->sw != bw || s->sh != bh;
+                if (was && resized) { abs_pos(s, &ax, &ay); win_damage(ax, ay, s->sw, s->sh); }
+                if (resized) {
                     free(s->st);
                     s->st = malloc((u64)bw * bh * 4);
                     s->sw = bw; s->sh = bh;
@@ -534,12 +602,12 @@ static void surface_commit(Obj* s) {
                 }
                 if (s->st && src && x0 < x1 && y0 < y1)
                     copy_rows(s->st, bw, x0, y0, src, buf->stride, x0, y0, x1 - x0, y1 - y0, 0);
-                s->alpha = buf->fmt == 0;
+                s->alpha = (buf->fmt == 0) && !s->opaque;
                 s->mapped = 1;
                 if (visible(s)) {
                     if (have_app) ensure_base();
                     abs_pos(s, &ax, &ay);
-                    if (was) win_damage(ax + x0, ay + y0, x1 - x0, y1 - y0);
+                    if (was && !resized) win_damage(ax + x0, ay + y0, x1 - x0, y1 - y0);
                     else win_damage(ax, ay, bw, bh);
                 }
             }
@@ -704,6 +772,13 @@ static void request(Obj* o, u32 op, Args* a) {
         break;
     case T_REGION:
         if (op == 0) destroy(o);
+        else if (op == 1) {                                /* add(x, y, w, h) */
+            a_i32(a); a_i32(a); i32 w = a_i32(a), h = a_i32(a);
+            if (w > 0 && h > 0) o->refs = 1;
+        } else if (op == 2) {                              /* subtract(x, y, w, h) */
+            a_i32(a); a_i32(a); i32 w = a_i32(a), h = a_i32(a);
+            if (w > 0 && h > 0) o->refs = 0;
+        }
         break;
     case T_SHM:
         if (op == 0) {                                     /* create_pool(id, fd, size) */
@@ -772,8 +847,22 @@ static void request(Obj* o, u32 op, Args* a) {
             if (o->ncb < 16) o->cbs[o->ncb++] = cb;
             break;
         }
+        case 4: {                                          /* set_opaque_region */
+            Obj* r = find(a_u32(a));
+            o->opaque = (r && r->type == T_REGION && r->refs > 0) ? 1 : 0;
+            break;
+        }
+        case 5: {                                          /* set_input_region */
+            u32 rid = a_u32(a);
+            if (!rid) o->no_input = 0;
+            else {
+                Obj* r = find(rid);
+                o->no_input = (r && r->type == T_REGION && r->refs == 0) ? 1 : 0;
+            }
+            break;
+        }
         case 6: surface_commit(o); break;                  /* commit */
-        default: break;                                    /* regioes, escala, transformacao: ignorados */
+        default: break;                                    /* escala, transformacao: ignorados */
         }
         break;
     case T_SUBCOMP:
@@ -862,22 +951,70 @@ static void request(Obj* o, u32 op, Args* a) {
             const char* t = a_str(a);
             strncpy(title, t, sizeof title - 1);
             if (have_app) app_title(&app, title);
-        } else if (op == 0) destroy(o);
+        } else if (op == 3) {                              /* set_app_id */
+            strncpy(app_id, a_str(a), sizeof app_id - 1);
+        } else if (op == 0) {
+            /* a janela foi destruida: sai da tela ja (como num compositor
+               Wayland), mas a conexao segue ate o programa desconectar. O
+               Firefox, por exemplo, ainda conversa com o compositor ao encerrar */
+            Obj* s = surf(o->ref);
+            if (s && s->roleobj == o->id) { s->role = R_NONE; s->mapped = 0; s->roleobj = 0; }
+            if (have_app) { app_bye(&app); have_app = 0; }
+            destroy(o);
+        }
         break;
     case T_SEAT:
-        if (op == 0) { pointer_id = a_u32(a); add(pointer_id, T_POINTER, o->version); }
+        if (op == 0) { pointer_id = a_u32(a); add(pointer_id, T_POINTER, o->version); dev_add(ptrs, &nptrs, pointer_id); }
         else if (op == 1) {
-            keyboard_id = a_u32(a); kb_version = o->version;
+            keyboard_id = a_u32(a);
             add(keyboard_id, T_KEYBOARD, o->version);
-            send_keymap();
-            if (kb_version >= 4) { Ev e = ev_begin(keyboard_id, 5); put_u32(25); put_u32(600); ev_end(e); }
+            dev_add(kbds, &nkbds, keyboard_id);
+            send_keymap_to(keyboard_id);
+            if (o->version >= 4) { Ev e = ev_begin(keyboard_id, 5); put_u32(25); put_u32(600); ev_end(e); }
+            /* ja com foco: o teclado novo tambem recebe o enter */
+            if (kb_surf) { Ev v = ev_begin(keyboard_id, 1); put_u32(serial++); put_u32(kb_surf); put_array(0, 0); ev_end(v); }
         }
         break;
     case T_POINTER:                                        /* 0 = set_cursor (cursor do sistema), 1 = release */
-        if (op == 1) destroy(o);
+        if (op == 1) {
+            dev_del(ptrs, &nptrs, o->id);
+            pointer_id = nptrs ? ptrs[nptrs - 1] : 0;
+            destroy(o);
+        }
         break;
     case T_KEYBOARD:                                       /* 0 = release */
-        if (op == 0) destroy(o);
+        if (op == 0) {
+            dev_del(kbds, &nkbds, o->id);
+            keyboard_id = nkbds ? kbds[nkbds - 1] : 0;
+            destroy(o);
+        }
+        break;
+    case T_DDM:
+        if (op == 0) add(a_u32(a), T_DSOURCE, o->version);  /* create_data_source */
+        else if (op == 1) { u32 id = a_u32(a); a_u32(a); add(id, T_DDEVICE, o->version); }  /* get_data_device */
+        break;
+    case T_DSOURCE:                                        /* offer, destroy, set_actions */
+        if (op == 1) destroy(o);
+        break;
+    case T_DDEVICE:                                        /* start_drag, set_selection, release */
+        if (op == 2) destroy(o);
+        break;
+    case T_DECOMGR:
+        if (op == 0) {                                     /* create(id, surface) */
+            u32 id = a_u32(a);
+            add(id, T_DECO, 1);
+            Ev e = ev_begin(id, 0); put_u32(2); ev_end(e); /* mode: Server */
+        }
+        break;
+    case T_DECO:
+        if (op == 0) destroy(o);                           /* release */
+        else if (op == 1) {
+            /* request_mode: confirma o modo pedido. Responder sempre Server
+               fazia o Firefox (que quer desenhar a propria barra) pedir de
+               novo a cada resposta, num laco que travava a thread principal */
+            u32 mode = a_u32(a);
+            Ev e = ev_begin(o->id, 0); put_u32(mode <= 2 ? mode : 2); ev_end(e);
+        }
         break;
     case T_OUTPUT: case T_CALLBACK:
         break;
@@ -906,7 +1043,6 @@ static void process(void) {
 /* ------------------------------------------------------------ eventos do WM */
 
 static int win_focused;
-static u32 kb_surf;            /* superficie com o foco do teclado (0 = nenhuma) */
 static u32 ptr_surf;           /* superficie sob o ponteiro (0 = fora) */
 static int last_down, swallow_up;
 static i32 last_x = -1, last_y = -1;
@@ -932,9 +1068,9 @@ static void kb_refocus(void) {
         }
     }
     if (want == kb_surf) return;
-    if (kb_surf && surf(kb_surf)) { Ev v = ev_begin(keyboard_id, 2); put_u32(serial++); put_u32(kb_surf); ev_end(v); }
+    if (kb_surf && surf(kb_surf)) kb_ev2(2, serial++, kb_surf, 0);
     kb_surf = want;
-    if (kb_surf) { Ev v = ev_begin(keyboard_id, 1); put_u32(serial++); put_u32(kb_surf); put_array(0, 0); ev_end(v); }
+    if (kb_surf) kb_ev2(1, serial++, kb_surf, 1);
 }
 
 /* superficie mais alta sob (x, y) da janela; devolve coordenadas locais */
@@ -952,6 +1088,7 @@ static Obj* hit_tree(u32 parent, i32 x, i32 y, i32* lx, i32* ly) {
         last = best->z;
         Obj* r = hit_tree(best->id, x, y, lx, ly);
         if (r) return r;
+        if (best->no_input) continue;
         i32 ax, ay; abs_pos(best, &ax, &ay);
         if (x >= ax && y >= ay && x < ax + best->sw && y < ay + best->sh) { *lx = x - ax; *ly = y - ay; return best; }
     }
@@ -972,6 +1109,7 @@ static Obj* hit(i32 x, i32 y, i32* lx, i32* ly) {
         last = best->z;
         Obj* r = hit_tree(best->id, x, y, lx, ly);
         if (r) return r;
+        if (best->no_input) continue;
         i32 ax, ay; abs_pos(best, &ax, &ay);
         i32 gx = best->gw ? best->gx : 0, gy = best->gw ? best->gy : 0;
         i32 gw = best->gw ? best->gw : best->sw, gh = best->gw ? best->gh : best->sh;
@@ -996,7 +1134,7 @@ static int any_grab(void) {
 }
 
 static void ptr_button(u32 now, u32 button, int pressed) {
-    Ev v = ev_begin(pointer_id, 3); put_u32(serial++); put_u32(now); put_u32(button); put_u32(pressed ? 1 : 0); ev_end(v);
+    ptr_ev4(3, serial++, now, button, pressed ? 1 : 0);
 }
 
 /* traduz um evento do WM para eventos Wayland */
@@ -1016,11 +1154,11 @@ static void handle_wm(WmEvent e) {
         u32 tid = t ? t->id : 0;
         if (ptr_surf && !surf(ptr_surf)) ptr_surf = 0;     /* a superficie foi destruida */
         if (tid != ptr_surf) {
-            if (ptr_surf) { Ev v = ev_begin(pointer_id, 1); put_u32(serial++); put_u32(ptr_surf); ev_end(v); }
-            if (tid) { Ev v = ev_begin(pointer_id, 0); put_u32(serial++); put_u32(tid); put_u32((u32)(lx * 256)); put_u32((u32)(ly * 256)); ev_end(v); }
+            if (ptr_surf) ptr_ev2(1, serial++, ptr_surf);
+            if (tid) ptr_ev4(0, serial++, tid, (u32)(lx * 256), (u32)(ly * 256));
             ptr_surf = tid; sent = 1;
         } else if (tid && (e.mx != last_x || e.my != last_y)) {
-            Ev v = ev_begin(pointer_id, 2); put_u32(now); put_u32((u32)(lx * 256)); put_u32((u32)(ly * 256)); ev_end(v);
+            ptr_ev3(2, now, (u32)(lx * 256), (u32)(ly * 256));
             sent = 1;
         }
         last_x = e.mx; last_y = e.my;
@@ -1031,7 +1169,7 @@ static void handle_wm(WmEvent e) {
             dismiss_popups();
             swallow_up = e.down;                           /* o soltar deste clique tambem nao vai */
             last_down = e.down;
-            if (sent) { Obj* p = find(pointer_id); if (p && p->version >= 5) { Ev v = ev_begin(pointer_id, 5); ev_end(v); } }
+            if (sent) ptr_frame();
             return;
         }
         if (ptr_surf) {
@@ -1042,22 +1180,19 @@ static void handle_wm(WmEvent e) {
             else if (e.click) { ptr_button(now, 0x110, 1); ptr_button(now, 0x110, 0); sent = 1; }  /* clique curto entre duas consultas */
             if (e.rclick) { ptr_button(now, 0x111, 1); ptr_button(now, 0x111, 0); sent = 1; }
             if (e.wheel) {
-                Ev v = ev_begin(pointer_id, 4); put_u32(now); put_u32(0); put_u32((u32)(-e.wheel * 10 * 256)); ev_end(v);
+                ptr_ev3(4, now, 0, (u32)(-e.wheel * 10 * 256));
                 sent = 1;
             }
         }
         last_down = e.down;
-        if (sent) {
-            Obj* p = find(pointer_id);
-            if (p && p->version >= 5) { Ev v = ev_begin(pointer_id, 5); ev_end(v); }
-        }
+        if (sent) ptr_frame();
     }
     if (keyboard_id && e.key) {
         if (!kb_surf) { win_focused = 1; kb_refocus(); }
         if (kb_surf) {
             send_mods(e.mods);
-            Ev v = ev_begin(keyboard_id, 3); put_u32(serial++); put_u32(now); put_u32(e.key); put_u32(1); ev_end(v);
-            v = ev_begin(keyboard_id, 3); put_u32(serial++); put_u32(now); put_u32(e.key); put_u32(0); ev_end(v);
+            kb_key(now, e.key, 1);
+            kb_key(now, e.key, 0);
         }
     }
     ensure_room();
@@ -1071,12 +1206,16 @@ int main(void) {
         PTimespec ts = { 0, have_app ? 8000000 : 200000000 };
         sys_ppoll(&pf, 1, &ts);
         if (pf.revents & (P_POLLIN | P_POLLHUP | P_POLLERR)) {
-            if (!read_client()) {                          /* o programa terminou */
-                if (have_app) app_bye(&app);
-                break;
+            for (;;) {
+                int rc = read_client();
+                if (rc == 0) {                             /* o programa terminou */
+                    if (have_app) app_bye(&app);
+                    return 0;
+                }
+                process();
+                if (rc < 0 || inlen >= sizeof in - 4096) break;
             }
         }
-        process();
         present();
         if (have_app) pump_wm();
         present();                                         /* dano gerado pelos eventos (popups fechados) */

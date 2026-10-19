@@ -1,0 +1,5 @@
+# Pacotes so do riscv64. A Mozilla nao publica o Firefox para RISC-V: o
+# navegador pre-instalado e o do Debian (tools/firefox_install.sh cria o
+# atalho e o icone).
+firefox-esr
+firefox-esr-l10n-pt-br   # interface em portugues, como o resto do sistema

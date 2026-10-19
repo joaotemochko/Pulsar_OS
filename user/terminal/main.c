@@ -279,8 +279,13 @@ static int run_external(const char* c){
     if(sys_stat(path, &st) != 0 || (st.mode & 0170000) != 0100000) return 0;
     static const char* env[] = {"HOME=/home/user", "PATH=/bin:/usr/bin", "TERM=dumb", "USER=usuario", "LANG=C.UTF-8",
                                 "XDG_RUNTIME_DIR=/run", "WAYLAND_DISPLAY=wayland-0",
-                                "XCOMPOSEFILE=/usr/share/pulsar/Compose", 0};
-    static u8 block[1024];
+                                "XCOMPOSEFILE=/usr/share/pulsar/Compose",
+                                "GDK_BACKEND=wayland", "MOZ_ENABLE_WAYLAND=1", "NO_AT_BRIDGE=1",
+                                "GSETTINGS_BACKEND=memory", "MOZ_CRASHREPORTER_DISABLE=1",
+                                "MOZ_DISABLE_CONTENT_SANDBOX=1", "MOZ_DISABLE_GMP_SANDBOX=1",
+                                "MOZ_DISABLE_RDD_SANDBOX=1", "MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1",
+                                "LIBGL_ALWAYS_SOFTWARE=1", 0};
+    static u8 block[2048];
     int envc = 0, n = 8;
     memcpy(block + n, argv, alen); n += alen;
     for(; env[envc]; envc++){ int l = strlen(env[envc]) + 1; memcpy(block + n, env[envc], l); n += l; }

@@ -46,7 +46,7 @@ EOF
 if [ ! -f "$SYSROOT/lib/libpcre2-8.a" ]; then
     rm -rf "${B:?}/pcre2" && mkdir -p "$B/pcre2" && cd "$B/pcre2"
     CC="$B/musl-cc" CFLAGS="-O2 -fPIC" AR="$LLVM_AR" RANLIB="$LLVM_AR s" \
-        "$TP/pcre2/configure" --host=$HOST --prefix="$SYSROOT" --disable-shared --enable-static \
+        "$TP/pcre2/configure" --host=$HOST --prefix="$SYSROOT" --enable-shared --enable-static \
         --enable-pcre2-8 --disable-pcre2-16 --disable-pcre2-32 --enable-unicode >/dev/null
     make -j8 libpcre2-8.la >/dev/null && make install-libLTLIBRARIES install-includeHEADERS \
         install-nodist_includeHEADERS install-pkgconfigDATA >/dev/null
@@ -70,8 +70,8 @@ fi
 [ -f "$SYSROOT/lib/libgdk_pixbuf-2.0.a" ] || mesonbuild gdk-pixbuf -Dpng=enabled -Djpeg=disabled \
     -Dtiff=disabled -Dgif=enabled -Dothers=enabled -Dbuiltin_loaders=all -Dgio_sniffing=false \
     -Dman=false -Ddocs=false -Dintrospection=disabled -Dtests=false -Dinstalled_tests=false \
-    "-Dc_link_args=['-fuse-ld=lld','-static','-Wl,--eh-frame-hdr','-L$SYSROOT/lib','-lpng16','-lz']"
-# (estatico: o meson nao repassa a libpng dos loaders embutidos para os
-# executaveis do proprio gdk-pixbuf; o lld acha os simbolos em qualquer ordem)
+    "-Dc_link_args=['-fuse-ld=lld','-Wl,--eh-frame-hdr','-L$SYSROOT/lib','-lpng16','-lz']"
+# (o meson nao repassa a libpng dos loaders embutidos para os executaveis do
+# proprio gdk-pixbuf; o lld acha os simbolos em qualquer ordem)
 
 echo "[glib-libs] $ARCH: pcre2, glib, fribidi, pango, gdk-pixbuf em $SYSROOT/lib"

@@ -60,17 +60,27 @@ A microkernel operating system written from scratch in **Rust**, **C** and assem
 
 ### Prerequisites
 - Rust **nightly** with `rust-src` (see `rust-toolchain.toml`; `build-std` builds `core` for the targets)
-- `clang`, `ld.lld` and `llvm-ar` (LLVM 15+) for the C apps and musl
+- LLVM **22** (`clang`, `ld.lld`, `llvm-ar`, libclang). It builds the C apps, musl, the whole Linux layer and Firefox, which requires clang 19 or newer. The official `LLVM-22.1.8-Linux-X64` release works; `~/pulsar-env.sh` puts it first in the `PATH`.
 - `mke2fs` (e2fsprogs 1.43+) to build the ext2 disk image (`make DISKFS=nbfs` builds the old flat image without it)
 - `qemu-system-aarch64` and/or `qemu-system-riscv64` (QEMU 8+; RISC-V uses the bundled OpenSBI)
 - Python 3 (image tools)
 - For the Linux compatibility libraries:
   - `cmake`, `meson` (1.4+) and `ninja`;
   - `pkg-config`, `bison`, `gperf`;
-  - the host glib tools (`glib-compile-resources`, `glib-mkenums`, `glib-genmarshal`), used while building gdk-pixbuf and, later, GTK;
+  - the host glib tools (`glib-compile-resources`, `glib-mkenums`, `glib-genmarshal`, `glib-compile-schemas`), used while building gdk-pixbuf and GTK;
   - `gcc` + `libexpat` for the host `wayland-scanner`.
 
   Meson is pure Python; running it from its release tarball is enough.
+
+### Get the sources
+
+The Vela browser lives in its own repository ([VelaBrowser](https://github.com/joaotemochko/VelaBrowser)) and is a git submodule at `user/vela`:
+
+```sh
+git clone --recurse-submodules https://github.com/joaotemochko/Pulsar_OS.git
+# or, in an existing clone:
+git submodule update --init
+```
 
 ### Run
 
@@ -81,7 +91,7 @@ make run SMP=8              # number of cores (1-8)
 make run MEM=8G             # more RAM for QEMU (the kernel uses the first 4 GiB; minimum 4G)
 ```
 
-`make` (or `make all ARCH=…`) builds the kernel, every app, and the disk image into `build/<arch>/`. `make run-debug` starts QEMU paused with a GDB stub on `:1234`. Press `Ctrl-A X` in the terminal to quit QEMU, or use *Desligar…* in the Pulsar menu.
+`make` (or `make all ARCH=…`) builds the kernel, every app, and the disk image into `build/<arch>/`. The 2 GiB disk comes with **Firefox pre-installed** as the default browser: it is the second icon in the Dock and is also found by search. On AArch64 it is the official mozilla.org build; on RISC-V it is Debian's `firefox-esr` (see [Firefox](#firefox-pre-installed)). The first build downloads it and the Debian packages; `FIREFOX=0` or `GLIBC=0` leaves them out. `make run-debug` starts QEMU paused with a GDB stub on `:1234`. Press `Ctrl-A X` in the terminal to quit QEMU, or use *Desligar…* in the Pulsar menu.
 
 Vela opens sites by name over HTTPS (e.g. `wikipedia.org`, `news.ycombinator.com`; names resolve through QEMU's DNS at `10.0.2.3`), searches the web when you type words instead of an address, and can open a local server over plain HTTP: run `python3 -m http.server 8080` on the host and open `10.0.2.2:8080/` (`10.0.2.2` is the host in QEMU's user-mode network). See [`user/vela/README.md`](user/vela/README.md).
 
@@ -249,7 +259,7 @@ DejaVu Sans is the fallback for symbols.
 Portions of this software are copyright © The FreeType Project (www.freetype.org). All rights reserved.
 
 ### C++, text shaping and 2D drawing for Linux programs
-**C++.** Linux programs get a complete C++ standard library: **libc++, libc++abi and libunwind** from LLVM 18.1.3, the same version as the clang that builds them.
+**C++.** Linux programs get a complete C++ standard library: **libc++, libc++abi and libunwind** from LLVM 22.1.8, the same version as the clang that builds them. libc++ 22 also uses LLVM libc's headers (`libc/shared`), which are kept for that reason. C++ code is compiled against the sysroot's libc++ (`-nostdinc++ -isystem <sysroot>/include/c++/v1`), not the copy clang ships for the host.
 
 - `tools/build_cxx_runtime.sh` runs LLVM's own CMake build of the runtimes for `<arch>-linux-musl`.
 - The result is a static `libc++.a` that already contains the ABI library and the unwinder.
@@ -311,6 +321,126 @@ Notes on the build:
 
 `/etc/fonts/local.conf` puts each script's Noto font before DejaVu Sans, which also covers Arabic and Hebrew but is only the last resort.
 
+### GTK 3
+GTK 3.24 runs on Pulsar with its **Wayland backend**, as an ordinary Linux program. It uses the Adwaita theme, real input, and popups for menus and dropdown lists. `tools/build_gtk_libs.sh` builds, all with meson:
+
+| Library | Version | Notes |
+|---|---|---|
+| wayland | 1.23.1 | libwayland-client/-cursor/-egl, now with pkg-config files |
+| wayland-protocols | 1.38 | |
+| libxkbcommon | 1.7.0 | |
+| atk | 2.38.0 | the standalone release; at-spi2-core's needs libxml2 even for ATK alone |
+| libepoxy | 1.5.10 | with the Khronos EGL headers. There is no libEGL, so GTK draws in software through cairo. |
+| cairo | 1.18.2 | rebuilt with glib, for `cairo-gobject` |
+| GTK | 3.24.52 | Wayland backend only; the input-method modules are built into the library |
+
+What GTK found missing, and what Pulsar now provides:
+
+- **`wlclient`:**
+  - `wl_data_device_manager`: GTK 3 only creates the seat (pointer and keyboard) once it sees this global. For now there are no clipboard offers between programs.
+  - `org_kde_kwin_server_decoration_manager`, defaulting to server-side decorations: GTK leaves the title bar to the Pulsar window manager instead of drawing a second one.
+- **Kernel:** `getresuid`/`getresgid`, and `fallocate` on memfd (used by wayland-cursor).
+- **Data:**
+  - the XKB data from **xkeyboard-config 2.43** in `/usr/share/X11/xkb` (GDK builds a default keymap by name before it receives Pulsar's);
+  - the compiled GSettings schemas in `/usr/share/glib-2.0/schemas`.
+- **Build:** **compiler-rt** 22.1.8 (builtins and `crtbegin`/`crtend`, position-independent). It replaces Rust's bare-metal compiler builtins in the musl sysroot, which can't go into shared libraries.
+
+`gtktest` is a GTK window with a label, a text entry, buttons, a check box, a slider, a progress bar and a dropdown list. The QEMU test types into it, clicks it and opens the list; it behaves the same on AArch64 and RISC-V.
+
+### Shared libraries
+Every library of the Linux layer is built both static and **shared**: the C++ runtime, fonts, drawing, glib, pango, gdk-pixbuf and GTK. That is about 76 `.so` files, 28 MB per architecture, installed in `/usr/lib` and loaded by `ld-musl` like on a Linux distribution.
+
+- **Dynamic GTK programs.** `gtktest-dyn` is the same `gtktest` linked dynamically: 17 KB instead of 20 MB. In this form `GtkBuilder` can look types up by name (`dlopen(NULL)`), which static musl can't do.
+- **`fc-*` tools.** They are now dynamic too.
+- **Build changes that made this possible:**
+  - **compiler-rt** is built first and populates the sysroot's `libgcc.a` and `crtbegin`/`crtend`. `libgcc_eh`, `libgcc_s` and `libatomic` are empty: the unwinder lives in libc++ and atomics are inline on both architectures.
+  - `tools/musl-cc.sh` links `.so` files, and dynamic executables when they link one, through the clang driver with `--sysroot`.
+  - Meson builds use `default_library=both`.
+- **Kernel:** answers `membarrier`'s query (no commands supported).
+
+Test programs in `/bin` stay statically linked, so they don't depend on the libraries of the disk they run on.
+
+### glibc programs
+Prebuilt Linux programs, such as the Firefox download from mozilla.org, are linked against **glibc** and expect a distribution's libraries. Pulsar ships a glibc environment next to the musl one. It is made of **Debian 13 (trixie)** binary packages, used unmodified, and the kernel's Linux personality runs them like any other ELF.
+
+- **Contents:** about 120 packages per architecture:
+  - glibc;
+  - libstdc++;
+  - bash and coreutils;
+  - GTK 3 with its whole stack and the Adwaita theme;
+  - the X11/XCB client libraries (the Firefox binary links them even on Wayland);
+  - D-Bus and ALSA.
+- **Layout:**
+  - libraries go in Debian's multiarch layout (`/usr/lib/aarch64-linux-gnu`, `/usr/lib/riscv64-linux-gnu`), apart from the musl world in `/usr/lib`;
+  - the loader is at `/lib/ld-linux-aarch64.so.1` or `/lib/ld-linux-riscv64-lp64d.so.1`.
+- **Build (`make glibc`; `make disk` includes it, `GLIBC=0` leaves it out):** `tools/glibc_env.py`:
+  - verifies Debian's `InRelease` with `gpgv` against the Debian archive keyring;
+  - checks the package index and every `.deb` by SHA-256;
+  - resolves dependencies;
+  - extracts the packages.
+
+  Package lists are in `user/glibc/pacotes.txt`; versions and hashes are pinned in `user/glibc/base-<arch>.lock`. Debian's install scripts never run, so the tool generates what they would have: the gdk-pixbuf `loaders.cache`, the MIME database, the icon-theme caches and the GSettings schemas.
+- **Kernel additions for glibc:**
+  - a 36-byte `termios`;
+  - `statx`;
+  - descriptors treated as 32-bit ints (`AT_FDCWD`);
+  - the xattr calls;
+  - `rseq`, which reports "not supported";
+  - `/proc/mounts` and `/proc/self/mountinfo`;
+  - `EPOLLET` on always-ready descriptors. libmount's mount monitor drains an epoll set until it comes back empty.
+- **Status:**
+  - Debian's `bash` and coreutils pass `user/glibc/glibctest.sh`;
+  - Debian's own `gtk3-widget-factory` (GTK 3, librsvg, the Adwaita theme) opens as a Pulsar window through the Wayland service, on both AArch64 and RISC-V;
+  - the official Firefox runs on it (below).
+
+### Firefox (pre-installed)
+Pulsar has no browser of its own yet (Vela is still young), so the disk comes with **Firefox**, installed the way a user would install it on Linux and launched like any Pulsar app: from the Dock (second icon) or from search.
+
+- **AArch64:** the **official build from mozilla.org** (153.5.0esr, pt-BR), unmodified, in `/opt/firefox`. `tools/firefox_install.sh` downloads it and checks it against a pinned SHA-256.
+- **RISC-V:** Mozilla publishes no RISC-V build, so it is Debian's `firefox-esr` (with the pt-BR language pack), which comes through the verified glibc environment (`user/glibc/pacotes-riscv64.txt`).
+- **Launching:** `/usr/bin/firefox` points to the installed copy. The Dock icon is Firefox's own, converted at build time (`tools/png2icn.py`) to `/usr/share/pulsar/icons/firefox.icn`. The shell launches catalog entries whose `bin` is a path as Linux programs (with the standard environment), and recognizes their windows by the Wayland `app_id`, which wlclient forwards in its first HELLO.
+- **What Firefox needed from Pulsar:**
+  - **user identity:** Linux processes run as the single user, `usuario` (uid 1000, also the owner of new files), not as root, which Firefox refuses;
+  - **process and file APIs:**
+    - `/proc/self/exe` holds the canonical path (symlinks resolved);
+    - `/proc/self/fd/N` reopens a descriptor (read-only copies of memfds);
+    - `/proc/self/maps` can be large (glibc finds the main thread's stack in it);
+    - `F_ADD_SEALS`, `FIONREAD`/`FIONBIO`, `waitid` (with `WNOWAIT`), `flock`, `getpriority` and `sched_*`;
+  - **Wayland (wlclient):**
+    - input goes to every `wl_pointer`/`wl_keyboard` the client created (GTK and Firefox each make their own);
+    - the decoration mode the client asks for is confirmed (always answering "server" made Firefox ask again forever);
+    - a destroyed toplevel closes its window right away while the connection stays open until the program exits;
+  - **shell:** Linux programs get 10 s to close before "não respondia";
+  - **disk:** an `/etc/machine-id`.
+- **Speed:** under QEMU's emulated CPUs it is slow: the first window takes a few minutes and clicks take seconds to respond. On hardware-virtualized or real CPUs this is not expected.
+
+### Firefox built from source (in progress)
+
+Separately, Firefox **153.5.0 ESR** is being ported as an ordinary musl Linux program. It is built for `<arch>-unknown-linux-musl` against the Pulsar sysroot, linked dynamically to the libraries in `/usr/lib`, and runs on GTK 3's Wayland-only backend (`cairo-gtk3-wayland-only`).
+
+`tools/build_firefox.sh <arch>` does the work:
+
+1. downloads the official source (verified by SHA-256) into `~/firefox-src`;
+2. applies the patches in `user/firefox/patches`, if any;
+3. runs `mach` with `user/firefox/mozconfig`.
+
+Turned off for this first port:
+
+- the seccomp sandbox;
+- D-Bus;
+- WebRTC;
+- the crash reporter and the updater;
+- the wasm-sandboxed libraries.
+
+Audio uses ALSA. **alsa-lib** is built by `tools/build_media_libs.sh`, because Web MIDI needs it on Linux; without `/dev/snd` it just reports no sound card.
+
+Host tools Firefox needs:
+
+- Rust stable with the `<arch>-unknown-linux-musl` target (`rustup target add`);
+- cbindgen (`cargo install cbindgen`);
+- Node.js (in `~/node-local`);
+- LLVM 22 (above).
+
 ### The `.pulse` executable format
 
 ```
@@ -369,7 +499,8 @@ Each segment carries `file_off`, `file_size`, `vaddr`, `mem_size` and R/W/X `fla
 │   ├── wlsrv/ wlclient/         # Wayland compatibility service (listener + per-client translator)
 │   ├── fsd/                     # filesystem daemon (IPC server)
 │   ├── editor/ ball/ sysmon/ trespass/      # Rust apps
-│   ├── terminal/ calc/ netmon/ vela/ hello_c/   # C apps
+│   ├── terminal/ calc/ netmon/ hello_c/   # C apps
+│   ├── vela/                    # Vela browser (git submodule: VelaBrowser)
 │   ├── linux/                   # Linux programs (musl): /bin, dynamic/, lib/ (-> /lib), rt/
 │   └── third_party/             # musl, BearSSL, QuickJS, stb, NanoSVG, fonts (see its README)
 └── tools/
@@ -381,6 +512,7 @@ Each segment carries `file_off`, `file_size`, `vaddr`, `mem_size` and R/W/X `fla
     ├── build_cxx_runtime.sh     # libc++, libc++abi, libunwind (LLVM's CMake build)
     ├── build_draw_libs.sh       # zlib, libpng, pixman, harfbuzz, cairo (configure / meson)
     ├── build_glib_libs.sh       # pcre2, glib, fribidi, pango, gdk-pixbuf (configure / meson)
+    ├── build_gtk_libs.sh        # wayland, xkbcommon, atk, epoxy, cairo-gobject, GTK 3 (meson)
     ├── meson-cross.sh           # meson cross file + pkg-config wrapper for <arch>-linux-musl
     ├── musl-cc.sh               # "cross compiler" for configure scripts: musl sysroot, static links
     ├── mknblr.py / mkpfs.py     # disk image builders
@@ -392,7 +524,7 @@ Each segment carries `file_off`, `file_size`, `vaddr`, `mem_size` and R/W/X `fla
 
 ## Roadmap
 
-- Linux personality, next steps towards Firefox: GTK 3 on the Wayland backend (with its remaining dependencies: atk, epoxy, the cursor and icon themes), and finally Firefox itself. Popups larger than their window would need WM support for override-redirect surfaces.
+- Linux personality, next steps towards Firefox: an icon theme, a clipboard shared between programs, popups that can leave their window, and then Firefox itself (its build needs Rust for `<arch>-unknown-linux-musl`, nodejs and cbindgen). Popups larger than their window would need WM support for override-redirect surfaces.
 - Fault tolerance: move device drivers (virtio-blk, virtio-net, virtio-gpu) out of the kernel into restartable user-space servers, so a driver bug becomes a restart instead of an oops.
 - Interrupt-driven virtio (block, input, network) instead of polling; move more drivers into user-space servers.
 - Vela: TLS 1.3, HTTP keep-alive, WebP images; shared clipboard between apps.

@@ -1,0 +1,17 @@
+diff --git a/build/moz.configure/toolchain.configure b/build/moz.configure/toolchain.configure
+index 7939243..e43c63d 100644
+--- a/build/moz.configure/toolchain.configure
++++ b/build/moz.configure/toolchain.configure
+@@ -2220,7 +2220,11 @@ set_define("_LIBCPP_REMOVE_TRANSITIVE_INCLUDES", True, when=using_libcxx)
+ @depends(target, build_environment)
+ def visibility_flags(target, env):
+     if target.os != "WINNT":
+-        if target.kernel in ("Darwin", "FreeBSD", "OpenBSD"):
++        # musl (Pulsar OS) uses libc++, like FreeBSD: the visibility pragma of
++        # gcc_hidden.h clashes with libc++'s per-class visibility attributes.
++        if target.kernel in ("Darwin", "FreeBSD", "OpenBSD") or target.raw_os.endswith(
++            "musl"
++        ):
+             return ("-fvisibility=hidden", "-fvisibility-inlines-hidden")
+         return (
+             "-I%s/system_wrappers" % os.path.join(env.dist),

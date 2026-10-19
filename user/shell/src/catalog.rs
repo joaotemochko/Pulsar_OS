@@ -81,6 +81,9 @@ pub struct AppDef {
     pub multi: bool,
     pub menus: &'static [(&'static str, &'static [MI])],
     pub keywords: &'static str,
+    /// app_id Wayland dos programas Linux (xdg_toplevel.set_app_id): a
+    /// janela que o wlclient abre com ele e deste app ("" = nenhum)
+    pub wl_id: &'static str,
 }
 
 pub const APP_FILES: u8 = 0;
@@ -96,6 +99,8 @@ pub const APP_ABOUT: u8 = 9;
 pub const APP_HELP: u8 = 10;
 /// Programa .pulse fora do catalogo (ex.: aberto pelo Terminal).
 pub const APP_GENERIC: u8 = 11;
+/// Firefox (programa Linux, /usr/bin/firefox): o navegador padrao por ora.
+pub const APP_FIREFOX: u8 = 12;
 
 const M_FILES: &[(&str, &[MI])] = &[
     ("Arquivo", &[
@@ -184,35 +189,41 @@ const M_MONITOR: &[(&str, &[MI])] = &[
 
 const M_NONE: &[(&str, &[MI])] = &[];
 
-pub static APPS: [AppDef; 12] = [
+pub static APPS: [AppDef; NAPPS] = [
     AppDef { id: APP_FILES, name: "Arquivos", bin: "", icon: Icon::Files, kind: Kind::Internal,
-        w: 720, h: 420, multi: false, menus: M_FILES, keywords: "finder explorer disco documentos" },
+        w: 720, h: 420, multi: false, menus: M_FILES, keywords: "finder explorer disco documentos", wl_id: "" },
     AppDef { id: APP_EDITOR, name: "Editor", bin: "editor.pulse", icon: Icon::Editor, kind: Kind::Process,
-        w: 620, h: 440, multi: true, menus: M_EDITOR, keywords: "texto notepad bloco notas" },
+        w: 620, h: 440, multi: true, menus: M_EDITOR, keywords: "texto notepad bloco notas", wl_id: "" },
     AppDef { id: APP_BALL, name: "Bolhas", bin: "ball.pulse", icon: Icon::Ball, kind: Kind::Process,
-        w: 480, h: 360, multi: false, menus: M_BALL, keywords: "ball demo animacao fisica" },
+        w: 480, h: 360, multi: false, menus: M_BALL, keywords: "ball demo animacao fisica", wl_id: "" },
     AppDef { id: APP_CALC, name: "Calculadora", bin: "calc.pulse", icon: Icon::Calc, kind: Kind::Process,
-        w: 260, h: 380, multi: false, menus: M_CALC, keywords: "calc contas" },
+        w: 260, h: 380, multi: false, menus: M_CALC, keywords: "calc contas", wl_id: "" },
     AppDef { id: APP_SETTINGS, name: "Configurações", bin: "", icon: Icon::Settings, kind: Kind::Internal,
-        w: 780, h: 480, multi: false, menus: M_NONE, keywords: "preferencias ajustes tema papel parede dock painel controle" },
+        w: 780, h: 480, multi: false, menus: M_NONE, keywords: "preferencias ajustes tema papel parede dock painel controle", wl_id: "" },
     AppDef { id: APP_TERMINAL, name: "Terminal", bin: "terminal.pulse", icon: Icon::Terminal, kind: Kind::Process,
-        w: 600, h: 380, multi: false, menus: M_TERMINAL, keywords: "shell console bash cmd prompt" },
+        w: 600, h: 380, multi: false, menus: M_TERMINAL, keywords: "shell console bash cmd prompt", wl_id: "" },
     AppDef { id: APP_NET, name: "Rede", bin: "netmon.pulse", icon: Icon::Network, kind: Kind::Process,
-        w: 420, h: 330, multi: false, menus: M_NET, keywords: "network internet ip wifi" },
+        w: 420, h: 330, multi: false, menus: M_NET, keywords: "network internet ip wifi", wl_id: "" },
     AppDef { id: APP_VELA, name: "Vela", bin: "vela.pulse", icon: Icon::Browser, kind: Kind::Process,
-        w: 1040, h: 700, multi: false, menus: M_VELA, keywords: "navegador browser web http internet" },
+        w: 1040, h: 700, multi: false, menus: M_VELA, keywords: "navegador browser web http internet", wl_id: "" },
     AppDef { id: APP_MONITOR, name: "Monitor do Sistema", bin: "sysmon.pulse", icon: Icon::Monitor, kind: Kind::Process,
-        w: 620, h: 440, multi: false, menus: M_MONITOR, keywords: "gerenciador tarefas task manager processos cpu" },
+        w: 620, h: 440, multi: false, menus: M_MONITOR, keywords: "gerenciador tarefas task manager processos cpu", wl_id: "" },
     AppDef { id: APP_ABOUT, name: "Sobre o Pulsar OS", bin: "", icon: Icon::Pulsar, kind: Kind::Internal,
-        w: 520, h: 300, multi: false, menus: M_NONE, keywords: "sobre versao sistema" },
+        w: 520, h: 300, multi: false, menus: M_NONE, keywords: "sobre versao sistema", wl_id: "" },
     AppDef { id: APP_HELP, name: "Atalhos do Teclado", bin: "", icon: Icon::Help, kind: Kind::Internal,
-        w: 560, h: 456, multi: false, menus: M_NONE, keywords: "ajuda help atalhos teclado" },
+        w: 560, h: 456, multi: false, menus: M_NONE, keywords: "ajuda help atalhos teclado", wl_id: "" },
     AppDef { id: APP_GENERIC, name: "Aplicativo", bin: "", icon: Icon::Program, kind: Kind::Process,
-        w: 400, h: 300, multi: true, menus: M_NONE, keywords: "" },
+        w: 400, h: 300, multi: true, menus: M_NONE, keywords: "", wl_id: "" },
+    // bin com caminho: programa Linux, aberto com o ambiente padrao; a janela
+    // vem pelo servico Wayland e e reconhecida pelo app_id
+    AppDef { id: APP_FIREFOX, name: "Firefox", bin: "/usr/bin/firefox", icon: Icon::Firefox, kind: Kind::Process,
+        w: 1040, h: 700, multi: false, menus: M_NONE, keywords: "navegador browser web http internet mozilla",
+        wl_id: "firefox" },
 ];
+pub const NAPPS: usize = 13;
 
 /// Ordem dos icones no dock (APP_SETTINGS fica depois do separador).
-pub const DOCK: [u8; 8] = [APP_FILES, APP_VELA, APP_TERMINAL, APP_EDITOR, APP_CALC, APP_MONITOR, APP_NET, APP_BALL];
+pub const DOCK: [u8; 8] = [APP_FILES, APP_FIREFOX, APP_TERMINAL, APP_EDITOR, APP_CALC, APP_MONITOR, APP_NET, APP_BALL];
 pub const DOCK_TAIL: u8 = APP_SETTINGS;
 
 pub fn app(id: u8) -> &'static AppDef {
@@ -221,6 +232,21 @@ pub fn app(id: u8) -> &'static AppDef {
 
 pub fn app_by_bin(bin: &[u8]) -> Option<&'static AppDef> {
     APPS.iter().find(|a| !a.bin.is_empty() && a.bin.as_bytes() == bin)
+}
+
+/// App do catalogo com este app_id Wayland ("firefox" tambem casa
+/// "firefox-esr", o do pacote do Debian).
+pub fn app_by_wl_id(id: &[u8]) -> Option<&'static AppDef> {
+    APPS.iter().find(|a| {
+        let w = a.wl_id.as_bytes();
+        !w.is_empty() && id.starts_with(w) && (id.len() == w.len() || id[w.len()] == b'-')
+    })
+}
+
+/// Programa Linux (bin e um caminho): aberto por spawn_path, sem janela
+/// reservada (ela chega pelo servico Wayland).
+pub fn is_linux(a: &AppDef) -> bool {
+    a.bin.starts_with('/')
 }
 
 /// Menu do logo do Pulsar (canto esquerdo da barra).

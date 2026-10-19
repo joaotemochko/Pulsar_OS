@@ -162,6 +162,7 @@ int main(int argc, char** argv) {
     g_main_loop_run(ml);
     gint64 dt = (g_get_monotonic_time() - t0) / 1000;
     check(ticks == 3 && idles == 1 && dt >= 80, "GMainLoop: 3 timeouts de 30 ms e um idle");
+    printf("[pangotest] GMainLoop: %d timeouts, %d idle, %lld ms\n", ticks, idles, (long long)dt);
 
     /* GRegex (pcre2) */
     GMatchInfo* mi = NULL;

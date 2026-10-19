@@ -1,0 +1,45 @@
+# mozconfig do Firefox para o Pulsar OS (usado por tools/build_firefox.sh).
+#
+# O Firefox roda na camada de compatibilidade Linux como um programa Linux
+# comum: musl, ligacao dinamica com as bibliotecas de /usr/lib (GTK 3, glib,
+# pango, cairo, fontconfig...) e o backend Wayland do GTK (o servico wlsrv do
+# Pulsar traduz para o gerenciador de janelas).
+#
+# Variaveis vindas do script: PULSAR_ARCH (aarch64|riscv64), PULSAR_SYSROOT,
+# PULSAR_OBJDIR, PULSAR_LIBCLANG, PULSAR_PKGCONFIG.
+
+ac_add_options --enable-application=browser
+ac_add_options --target=${PULSAR_ARCH}-unknown-linux-musl
+ac_add_options --with-sysroot=${PULSAR_SYSROOT}
+mk_add_options MOZ_OBJDIR=${PULSAR_OBJDIR}
+
+# so Wayland (sem X11/libX11/xcb)
+ac_add_options --enable-default-toolkit=cairo-gtk3-wayland-only
+
+ac_add_options --enable-optimize
+ac_add_options --disable-debug
+ac_add_options --enable-linker=lld
+ac_add_options --with-libclang-path=${PULSAR_LIBCLANG}
+ac_add_options --disable-bootstrap
+
+# o que o Pulsar ainda nao tem ou nao precisa num primeiro porte
+ac_add_options --disable-sandbox             # seccomp-bpf/namespaces
+ac_add_options --disable-dbus
+ac_add_options --disable-necko-wifi
+ac_add_options --disable-crashreporter
+ac_add_options --disable-updater
+ac_add_options --disable-tests
+ac_add_options --disable-webrtc
+ac_add_options --disable-geckodriver
+ac_add_options --without-wasm-sandboxed-libraries
+# audio pela alsa-lib (sem PulseAudio); o Pulsar ainda nao tem /dev/snd
+ac_add_options --enable-audio-backends=alsa
+
+export PKG_CONFIG=${PULSAR_PKGCONFIG}
+
+# o C++ do Pulsar e a libc++ do LLVM (nao ha libstdc++ no sysroot); as
+# ferramentas que rodam no host (x86_64, glibc) seguem com a libstdc++ dele
+export CC=clang
+export CXX="clang++ -stdlib=libc++ -nostdinc++ -isystem ${PULSAR_SYSROOT}/include/c++/v1"
+export HOST_CC=clang
+export HOST_CXX=clang++

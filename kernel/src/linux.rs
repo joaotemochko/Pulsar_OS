@@ -30,6 +30,7 @@ const ERANGE: i64 = 34;
 const ENAMETOOLONG: i64 = 36;
 const ENOSYS: i64 = 38;
 const EOPNOTSUPP: i64 = 95;
+const ENODATA: i64 = 61;
 const EPIPE: i64 = 32;
 const E2BIG: i64 = 7;
 const ETIMEDOUT: i64 = 110;
@@ -119,14 +120,14 @@ fn clock_ns(clk: u64) -> Result<u64, i64> {
     }
 }
 
-/// Dorme `ns` nanossegundos (granularidade de milissegundo).
+/// Dorme `ns` nanossegundos (resolucao do contador de hardware).
 unsafe fn sleep_ns(frame: *mut Context, ns: u64) {
-    let ms = ns.div_ceil(1_000_000);
-    if ms == 0 {
+    if ns == 0 {
         unsafe { (*frame).set_ret(0) };
         return;
     }
-    unsafe { process::sleep(frame, ms) };
+    let ticks = ((ns as u128 * arch::timer_freq() as u128).div_ceil(1_000_000_000) as u64).max(1);
+    unsafe { process::sleep_ticks(frame, ticks) };
 }
 
 // ------------------------------------------------------------ arquivos
@@ -150,23 +151,55 @@ fn open_flags(f: u64) -> Result<u32, i64> {
 }
 
 fn at_dir(dirfd: u64) -> Result<u32, i64> {
-    file::dir_of(dirfd as i64)
+    file::dir_of(dirfd as i32 as i64)          // int no Linux: os 32 bits altos nao contam
 }
 
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
 const AT_EMPTY_PATH: u64 = 0x1000;
 
-fn fstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> R {
+/// stat de (dirfd, caminho) com as flags AT_* (base de fstatat e statx).
+fn stat_at(dirfd: u64, path: u64, flags: u64) -> Result<file::Stat, i64> {
     let mut p = [0u8; crate::ext2::PATH_MAX];
     let path = cstr(path, &mut p)?;
-    let st = if path.is_empty() {
+    if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 { return Err(ENOENT); }
-        if dirfd as i64 == AT_FDCWD { file::stat(at_dir(dirfd)?, b".", true)? } else { file::fstat(dirfd)? }
+        if dirfd as i32 as i64 == AT_FDCWD { file::stat(at_dir(dirfd)?, b".", true) } else { file::fstat(dirfd) }
     } else {
-        file::stat(at_dir(dirfd)?, path, flags & AT_SYMLINK_NOFOLLOW == 0)?
-    };
-    put(statbuf, st)
+        file::stat(at_dir(dirfd)?, path, flags & AT_SYMLINK_NOFOLLOW == 0)
+    }
+}
+
+fn fstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> R {
+    put(statbuf, stat_at(dirfd, path, flags)?)
+}
+
+/// statx(dirfd, caminho, flags, mascara, buf): a glibc usa no RISC-V (e a
+/// musl, quando existe). `struct statx` tem 256 bytes; preenche os campos
+/// basicos (STATX_BASIC_STATS).
+fn statx(dirfd: u64, path: u64, flags: u64, buf: u64) -> R {
+    let st = stat_at(dirfd, path, flags)?;
+    let mut b = [0u8; 256];
+    let w32 = |b: &mut [u8; 256], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let w64 = |b: &mut [u8; 256], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    w32(&mut b, 0, 0x7ff);                                  // stx_mask = STATX_BASIC_STATS
+    w32(&mut b, 4, st.blksize as u32);
+    w32(&mut b, 16, st.nlink);
+    w32(&mut b, 20, st.uid);
+    w32(&mut b, 24, st.gid);
+    b[28..30].copy_from_slice(&(st.mode as u16).to_le_bytes());
+    w64(&mut b, 32, st.ino);
+    w64(&mut b, 40, st.size as u64);
+    w64(&mut b, 48, st.blocks as u64);
+    for (o, sec, ns) in [(64, st.atime, st.atime_ns), (96, st.ctime, st.ctime_ns), (112, st.mtime, st.mtime_ns)] {
+        w64(&mut b, o, sec as u64);
+        w32(&mut b, o + 8, ns as u32);
+    }
+    w32(&mut b, 128, (st.rdev >> 8) as u32 & 0xfff);        // stx_rdev_major/minor
+    w32(&mut b, 132, st.rdev as u32 & 0xff);
+    w32(&mut b, 136, (st.dev >> 8) as u32 & 0xfff);         // stx_dev_major/minor
+    w32(&mut b, 140, st.dev as u32 & 0xff);
+    put(buf, b)
 }
 
 #[derive(Clone, Copy)]
@@ -242,6 +275,9 @@ fn statfs(buf: u64) -> R {
     put(buf, v)
 }
 
+/// uid/gid dos processos da camada Linux (o usuario do Pulsar).
+pub const USER_ID: u32 = 1000;
+
 // ------------------------------------------------------------ despacho
 
 pub fn dispatch(frame: *mut Context) {
@@ -289,6 +325,32 @@ pub fn dispatch_nr(frame: *mut Context, nr: u64) {
             if pid < -1 || pid == 0 { ctx.set_ret((-ENOSYS) as u64); return; } // grupos de processo
             return unsafe { process::wait_child(frame, pid, a[1], a[2] & 1 != 0) };
         }
+        95 => {                                         // waitid(tipo, id, siginfo, opcoes, rusage)
+            let pid = match a[0] { 0 => -1, 1 => a[1] as i32 as i64, _ => { ctx.set_ret((-EINVAL) as u64); return; } };
+            if a[3] & 4 == 0 { ctx.set_ret((-EINVAL) as u64); return; }        // so WEXITED
+            if a[2] != 0 && ubuf(a[2], 128, true).is_err() { ctx.set_ret((-EFAULT) as u64); return; }
+            if a[4] != 0 { let _ = put(a[4], [0u8; 144]); }
+            let r = unsafe { process::waitid_child(frame, pid, a[3] & 1 != 0, a[3] & 0x0100_0000 != 0) };
+            let mut si = [0u8; 128];
+            match r {
+                process::Waited::Blocked => return,
+                process::Waited::NoChild => { ctx.set_ret((-10i64) as u64); return; } // ECHILD
+                process::Waited::Nothing => {}
+                process::Waited::Found(cpid, st) => {
+                    // siginfo de SIGCHLD: signo, errno, code, pid, uid, status
+                    let (code, val) = if st & 0x7F != 0 { (if st & 0x80 != 0 { 3 } else { 2 }, st & 0x7F) }
+                                      else { (1, (st >> 8) & 0xFF) };      // CLD_EXITED / KILLED / DUMPED
+                    si[0..4].copy_from_slice(&17u32.to_le_bytes());
+                    si[8..12].copy_from_slice(&(code as u32).to_le_bytes());
+                    si[16..20].copy_from_slice(&(cpid as u32).to_le_bytes());
+                    si[20..24].copy_from_slice(&USER_ID.to_le_bytes());
+                    si[24..28].copy_from_slice(&val.to_le_bytes());
+                }
+            }
+            if a[2] != 0 { let _ = put(a[2], si); }
+            ctx.set_ret(0);
+            return;
+        }
         129 | 130 | 131 => return kill(frame, nr, a),
         139 => return crate::signal::sigreturn(frame),       // rt_sigreturn: frame inteiro trocado
         133 => {                                        // rt_sigsuspend(mask, size)
@@ -335,19 +397,43 @@ pub fn dispatch_nr(frame: *mut Context, nr: u64) {
 fn fork(frame: *mut Context, a: [u64; 6]) {
     const CLONE_VM: u64 = 0x100;
     const CLONE_VFORK: u64 = 0x4000;
-    let (flags, stack) = (a[0], a[1]);
+    const CLONE_SETTLS: u64 = 0x80000;
+    const CLONE_PARENT_SETTID: u64 = 0x100000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+    const CLONE_CHILD_SETTID: u64 = 0x1000000;
+    let (flags, stack, ptid, tls_val, ctid) = (a[0], a[1], a[2], a[3], a[4]);
     let ctx = unsafe { &mut *frame };
+    if flags & CLONE_PARENT_SETTID != 0 && ubuf(ptid, 4, true).is_err() {
+        ctx.set_ret((-EFAULT) as u64);
+        return;
+    }
+    if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 && ubuf(ctid, 4, true).is_err() {
+        ctx.set_ret((-EFAULT) as u64);
+        return;
+    }
+    let tls = if flags & CLONE_SETTLS != 0 { Some(tls_val) } else { None };
+    let clear = if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 };
     if flags & CLONE_VM != 0 {
         if flags & CLONE_VFORK == 0 { ctx.set_ret((-EINVAL) as u64); return; }
         // vfork: o filho usa o espaco do pai; o pai dorme ate o execve/exit
-        if unsafe { process::fork(frame, None, stack) }.is_none() { ctx.set_ret((-EAGAIN) as u64); }
+        if unsafe { process::fork(frame, None, stack, tls, clear) }.is_none() { ctx.set_ret((-EAGAIN) as u64); }
         return;
     }
     let Some((_, root, _)) = process::current_space() else { ctx.set_ret((-EINVAL) as u64); return };
     let Some(new) = arch::mmu::clone_user_space(root) else { ctx.set_ret((-ENOMEM) as u64); return };
     let asid = crate::loader::alloc_asid();
-    match unsafe { process::fork(frame, Some((new, asid)), stack) } {
-        Some(pid) => ctx.set_ret(pid as u64),
+    match unsafe { process::fork(frame, Some((new, asid)), stack, tls, clear) } {
+        Some(pid) => {
+            if flags & CLONE_PARENT_SETTID != 0 {
+                unsafe { core::ptr::write_volatile(ptid as *mut u32, pid as u32) };
+            }
+            if flags & CLONE_CHILD_SETTID != 0 {
+                if let Some(pa) = arch::mmu::translate_user(new, ctid, true) {
+                    unsafe { core::ptr::write_volatile(pa as *mut u32, pid as u32) };
+                }
+            }
+            ctx.set_ret(pid as u64);
+        }
         None => { arch::mmu::free_user_space(new); ctx.set_ret((-EAGAIN) as u64); }
     }
 }
@@ -396,7 +482,7 @@ fn futex(frame: *mut Context, a: [u64; 6]) {
     if addr & 3 != 0 || ubuf(addr, 4, false).is_err() { ctx.set_ret((-EINVAL) as u64); return; }
     match op {
         0 | 9 => {                                      // WAIT / WAIT_BITSET
-            let mut ms = 0;
+            let mut ticks = 0;
             if a[3] != 0 {
                 let t = match get::<Timespec>(a[3]).and_then(ns_of) {
                     Ok(t) => t,
@@ -412,9 +498,9 @@ fn futex(frame: *mut Context, a: [u64; 6]) {
                     ctx.set_ret((-(if cur == val as u32 { ETIMEDOUT } else { EAGAIN })) as u64);
                     return;
                 }
-                ms = rel.div_ceil(1_000_000);
+                ticks = ((rel as u128 * arch::timer_freq() as u128).div_ceil(1_000_000_000) as u64).max(1);
             }
-            unsafe { process::futex_wait(frame, addr, val as u32, ms) }
+            unsafe { process::futex_wait_ticks(frame, addr, val as u32, ticks) }
         }
         1 | 10 => ctx.set_ret(process::futex_wake(addr, val)), // WAKE / WAKE_BITSET
         3 | 4 => {                                      // REQUEUE / CMP_REQUEUE
@@ -479,7 +565,9 @@ fn call(frame: *mut Context, nr: u64, a: [u64; 6]) -> R {
         62 => file::lseek(a[0], a[1] as i64, a[2]),
         80 => put(a[1], file::fstat(a[0])?),
         79 => fstatat(a[0], a[1], a[2], a[3]),          // newfstatat
-        291 => Err(ENOSYS),                             // statx: a musl cai no fstatat
+        291 => statx(a[0], a[1], a[2], a[4]),            // statx (a glibc usa no RISC-V)
+        #[cfg(target_arch = "riscv64")]
+        258 => Err(ENOSYS),                             // riscv_hwprobe: a glibc escolhe as rotinas genericas
         61 => { ubuf(a[1], a[2], true)?; file::getdents(a[0], a[1], a[2]) }
         34 => file::mkdir(at_dir(a[0])?, cstr(a[1], &mut p1)?, a[2] as u16),
         35 => file::unlink(at_dir(a[0])?, cstr(a[1], &mut p1)?, a[2] & AT_REMOVEDIR != 0),
@@ -517,8 +605,15 @@ fn call(frame: *mut Context, nr: u64, a: [u64; 6]) -> R {
             let _ = file::close(fd);
             r
         }
-        82 | 83 | 81 => Ok(0),                         // fsync, fdatasync, sync (escrita imediata)
+        82 | 83 | 81 => { file::sync(); Ok(0) }         // fsync, fdatasync, sync
         223 => Ok(0),                                   // fadvise64: so uma dica
+        // atributos estendidos (xattr): o ext2 do Pulsar nao tem; responde como
+        // o Linux num sistema de arquivos sem eles (ls -l e cp perguntam)
+        5 | 6 | 7 => Err(EOPNOTSUPP),                   // setxattr, lsetxattr, fsetxattr
+        8 | 9 | 10 | 14 | 15 | 16 => Err(ENODATA),      // getxattr..., removexattr...: nao existe
+        11 | 12 | 13 => Ok(0),                          // listxattr...: lista vazia
+        293 | 435 => Err(ENOSYS),                       // rseq, clone3: a glibc usa o fallback (clone)
+        283 => if a[0] == 0 { Ok(0) } else { Err(EINVAL) }, // membarrier: QUERY = nenhum comando (usam o caminho comum)
         23 => file::dup(a[0], u64::MAX),
         24 => {                                         // dup3(old, new, flags)
             if a[0] == a[1] { return Err(EINVAL); }
@@ -545,7 +640,7 @@ fn call(frame: *mut Context, nr: u64, a: [u64; 6]) -> R {
         }
         49 => file::chdir(at_dir(AT_FDCWD as u64)?, cstr(a[0], &mut p1)?),
         50 => {                                         // fchdir
-            let ino = file::dir_of(a[0] as i64)?;
+            let ino = file::dir_of(a[0] as i32 as i64)?;
             let l = process::current_leader().ok_or(EINVAL)?;
             file::set_cwd_of(l, ino);
             Ok(0)
@@ -626,7 +721,7 @@ fn call(frame: *mut Context, nr: u64, a: [u64; 6]) -> R {
             4 | 8 => neg(crate::vm::discard(a[0], a[1])), // DONTNEED, FREE
             _ => Ok(0),
         },
-        216 => Err(ENOMEM),                             // mremap: a libc copia
+        216 => neg(crate::vm::mremap(a[0], a[1], a[2], a[3])),
         227 => Ok(0),                                   // msync
 
         // ---- processos e threads
@@ -636,9 +731,23 @@ fn call(frame: *mut Context, nr: u64, a: [u64; 6]) -> R {
         172 => Ok(process::current_ids().1 as u64),     // getpid
         173 => Ok(process::current_ids().2 as u64),     // getppid
         178 => Ok(process::current_ids().0 as u64),     // gettid
-        174 | 175 | 176 | 177 => Ok(0),                 // uid/gid: root
+        // o Pulsar tem um usuario so: os programas Linux rodam como ele
+        // ("usuario", 1000 em /etc/passwd, dono de /home/user), nao como root
+        174 | 175 | 176 | 177 => Ok(USER_ID as u64),    // getuid/geteuid/getgid/getegid
+        148 | 150 => {                                  // getresuid/getresgid: real, efetivo, salvo
+            for p in [a[0], a[1], a[2]] { put(p, USER_ID)?; }
+            Ok(0)
+        }
         154 | 155 | 157 => Ok(process::current_ids().1 as u64), // setpgid/getpgid/setsid
         167 => Ok(0),                                   // prctl
+        213 => Ok(0),                                   // readahead: so uma dica
+        141 => Ok(20),                                  // getpriority: nice 0 (o kernel devolve 20 - nice)
+        140 => Ok(0),                                   // setpriority: aceito, sem efeito
+        32 => { file::fstat_ok(a[0])?; Ok(0) }          // flock: sempre concedida (como as travas de registro)
+        120 => Ok(0),                                   // sched_getscheduler: SCHED_OTHER
+        121 => put(a[1], 0u32),                         // sched_getparam: prioridade 0
+        119 => Ok(0),                                   // sched_setscheduler: aceito
+        125 | 126 => Ok(0),                             // sched_get_priority_max/min (SCHED_OTHER: 0)
         123 => {                                        // sched_getaffinity(pid, size, mask)
             if a[1] < 8 { return Err(EINVAL); }
             let n = process::online_cpus();
@@ -734,15 +843,49 @@ fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         3 => Ok((file::get_flags(fd)? & (file::O_ACCMODE | file::O_APPEND | file::O_NONBLOCK)) as u64), // F_GETFL
         4 => file::set_flags(fd, arg as u32),           // F_SETFL
         5 | 6 | 7 | 36 | 37 | 38 => Ok(0),              // travas de registro: sempre concedidas
+        // F_ADD_SEALS/F_GET_SEALS: memfd aceita os selos (defesa extra do
+        // Firefox; aqui nao sao impostos, como num memfd sem MFD_ALLOW_SEALING
+        // que nao reclamasse). Outros descritores: EINVAL, como no Linux.
+        1033 | 1034 => if file::fd_obj(fd)?.is_some() { Ok(0) } else { Err(EINVAL) },
         _ => Err(EINVAL),
     }
 }
 
+/// `struct termios` do KERNEL Linux (asm-generic: 4 flags, c_line, c_cc[19]
+/// = 36 bytes), com os valores de um terminal comum. A glibc passa
+/// exatamente essa estrutura no TCGETS (a de 60 bytes e so da libc): escrever
+/// mais que 36 bytes corrompia a pilha dela ("stack smashing detected").
+fn console_termios() -> [u8; 36] {
+    let mut t = [0u8; 36];
+    let flags: [u32; 4] = [
+        0x0100 | 0x0400,                                    // c_iflag: ICRNL | IXON
+        0x0001 | 0x0004,                                    // c_oflag: OPOST | ONLCR
+        0x000F | 0x0030 | 0x0080,                           // c_cflag: B38400 | CS8 | CREAD
+        0x1 | 0x2 | 0x8 | 0x10 | 0x20 | 0x200 | 0x800 | 0x8000, // c_lflag: ISIG ICANON ECHO ECHOE ECHOK ECHOCTL ECHOKE IEXTEN
+    ];
+    for (i, f) in flags.iter().enumerate() { t[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes()); }
+    // c_line = 0; c_cc: INTR ^C, QUIT ^\, ERASE DEL, KILL ^U, EOF ^D, TIME 0, MIN 1
+    let cc: [(usize, u8); 7] = [(0, 3), (1, 0x1c), (2, 0x7f), (3, 0x15), (4, 4), (5, 0), (6, 1)];
+    for (i, v) in cc { t[17 + i] = v; }
+    t
+}
+
 fn ioctl(fd: u64, req: u64, arg: u64) -> R {
+    match req {
+        0x541B => return put(arg, file::fionread(fd)?.min(i32::MAX as u64) as i32), // FIONREAD
+        0x5421 => {                                     // FIONBIO: liga/desliga O_NONBLOCK
+            let on = get::<i32>(arg)? != 0;
+            let fl = file::get_flags(fd)?;
+            file::set_flags(fd, if on { fl | file::O_NONBLOCK } else { fl & !file::O_NONBLOCK })?;
+            return Ok(0);
+        }
+        0x5451 | 0x5450 => return file::set_cloexec(fd, req == 0x5451), // FIOCLEX/FIONCLEX
+        _ => {}
+    }
     if !file::is_console(fd)? { return Err(ENOTTY); }
     match req {
         0x5413 => put(arg, [24u16, 80, 0, 0]),          // TIOCGWINSZ
-        0x5401 => put(arg, [0u8; 60]),                  // TCGETS
+        0x5401 => put(arg, console_termios()),         // TCGETS: struct termios do kernel (36 bytes)
         0x5402 | 0x5403 | 0x5404 | 0x5414 => Ok(0),     // TCSETS*, TIOCSWINSZ
         0x540F => put(arg, process::current_ids().1 as u32), // TIOCGPGRP
         _ => Err(ENOTTY),
@@ -774,7 +917,10 @@ fn mmap(a: [u64; 6]) -> R {
             return neg(crate::vm::mmap_obj(addr, len, prot, pf, obj, off / 4096));
         }
     }
-    // arquivo: copia privada (MAP_SHARED de arquivo ainda nao reflete escritas)
+    if let Some((ino, _)) = file::fd_file_ino(fd)? {
+        return neg(crate::vm::mmap_file(addr, len, prot, pf, ino, off / 4096));
+    }
+    // fallback (ex.: /proc, /dev): copia privada imediata
     let start = neg(crate::vm::mmap(addr, len, prot | 3, pf))?;
     let fill = (|| -> R {
         ubuf(start, len, true)?;
@@ -924,7 +1070,6 @@ fn msg_io(fd: u64, msg: u64, send: bool, flags: u64) -> R {
 /// lista) e refazem a syscall, mantendo o prazo original.
 fn wait_ready(frame: *mut Context, nr: u64, a: [u64; 6]) {
     let ctx = unsafe { &mut *frame };
-    let seen = process::io_seq(process::POLL_KEY);
     let tick = |ns: u64| ((ns as u128 * arch::timer_freq() as u128) / 1_000_000_000) as u64;
     // prazo pedido (u64::MAX = sem prazo)
     let timeout_ns: Result<Option<u64>, i64> = match nr {
@@ -946,25 +1091,25 @@ fn wait_ready(frame: *mut Context, nr: u64, a: [u64; 6]) {
     };
     match scan {
         Err(e) => { process::io_deadline_clear(); ctx.set_ret((-e) as u64); }
-        Ok((n, _)) if n > 0 => { process::io_deadline_clear(); ctx.set_ret(n as u64); }
+        Ok((n, _, _, _)) if n > 0 => { process::io_deadline_clear(); ctx.set_ret(n as u64); }
         Ok(_) if deadline != u64::MAX && arch::now() >= deadline => {
             process::io_deadline_clear();
             if nr == 72 { let _ = clear_sets(a[0], a[1], a[2], a[3]); }
             ctx.set_ret(0);
         }
-        Ok((_, net)) => {
+        Ok((_, net, mask, seen)) => {
             let slice = if net { arch::now() + crate::time::ms_to_ticks(file::NET_SLICE_MS) } else { u64::MAX };
             let wake = deadline.min(slice);
             file::flush_wakes();
-            unsafe { process::io_wait_until(frame, process::POLL_KEY, seen, if wake == u64::MAX { 0 } else { wake }) };
+            unsafe { process::io_wait_mask(frame, mask, seen, if wake == u64::MAX { 0 } else { wake }) };
         }
     }
 }
 
 /// struct pollfd { int fd; short events; short revents; }
-fn scan_poll(fds: u64, nfds: u64) -> Result<(usize, bool), i64> {
+fn scan_poll(fds: u64, nfds: u64) -> Result<(usize, bool, u64, u64), i64> {
     if nfds > 1024 { return Err(EINVAL); }
-    if nfds == 0 { return Ok((0, false)); }
+    if nfds == 0 { return Ok((0, false, 0, process::io_seq(process::POLL_KEY))); }
     ubuf(fds, nfds * 8, true)?;
     let mut items = [(0i64, 0u32, 0u32); 1024];
     for i in 0..nfds as usize {
@@ -979,7 +1124,7 @@ fn scan_poll(fds: u64, nfds: u64) -> Result<(usize, bool), i64> {
 }
 
 /// fd_set de select: bits em palavras de 64.
-fn scan_select(n: u64, rd: u64, wr: u64, ex: u64) -> Result<(usize, bool), i64> {
+fn scan_select(n: u64, rd: u64, wr: u64, ex: u64) -> Result<(usize, bool, u64, u64), i64> {
     if n > 1024 { return Err(EINVAL); }
     let words = n.div_ceil(64) as usize;
     let load = |p: u64| -> Result<[u64; 16], i64> {
@@ -998,7 +1143,7 @@ fn scan_select(n: u64, rd: u64, wr: u64, ex: u64) -> Result<(usize, bool), i64> 
         if x[fd / 64] & bit != 0 { ev |= 0x002; }
         if ev != 0 { items[k] = (fd as i64, ev, 0); k += 1; }
     }
-    let (_, net) = file::poll_fds(&mut items[..k])?;
+    let (_, net, mask, seen) = file::poll_fds(&mut items[..k])?;
     let (mut or, mut ow, mut ox) = ([0u64; 16], [0u64; 16], [0u64; 16]);
     let mut count = 0;
     for &(fd, ev, re) in &items[..k] {
@@ -1013,7 +1158,7 @@ fn scan_select(n: u64, rd: u64, wr: u64, ex: u64) -> Result<(usize, bool), i64> 
             if p != 0 { for wi in 0..words { unsafe { w64(p + wi as u64 * 8, s[wi]) }; } }
         }
     }
-    Ok((count, net))
+    Ok((count, net, mask, seen))
 }
 
 fn clear_sets(n: u64, rd: u64, wr: u64, ex: u64) -> R {
@@ -1029,6 +1174,8 @@ unsafe fn w64(a: u64, v: u64) { unsafe { core::ptr::write_unaligned(a as *mut u6
 
 // ------------------------------------------------------------ sendmsg/recvmsg locais
 
+static mut UNIX_BUF: [u64; arch::platform::MAX_CPUS] = [0; arch::platform::MAX_CPUS];
+
 /// sendmsg/recvmsg em socket local: iovecs juntados num buffer (uma
 /// mensagem so, no modo pacote) e descritores em SCM_RIGHTS.
 fn unix_msg(fd: u64, msg: u64, send: bool, flags: u64) -> R {
@@ -1036,72 +1183,74 @@ fn unix_msg(fd: u64, msg: u64, send: bool, flags: u64) -> R {
     let (iov, iovlen, ctl, ctllen) = (m[2], m[3], m[4], m[5]);
     if iovlen > 1024 { return Err(EINVAL); }
     const BOUNCE: u64 = 64 * 1024;
-    let buf = crate::frame_allocator::alloc_contig(16).ok_or(ENOMEM)?;
-    let r = (|| -> R {
-        let nonblock = flags & 0x40 != 0;
-        if send {
-            // junta os dados
-            let mut total = 0u64;
-            for i in 0..iovlen {
-                let v: Iovec = get(iov + i * 16)?;
-                let n = v.len.min(BOUNCE - total);
-                if n == 0 { continue; }
-                ubuf(v.base, n, false)?;
-                unsafe { core::ptr::copy_nonoverlapping(v.base as *const u8, (buf + total) as *mut u8, n as usize) };
-                total += n;
-            }
-            // SCM_RIGHTS: cmsghdr { u64 len; i32 level; i32 type; int fds[] }
-            let mut fds = [0i32; crate::unix::MAX_FDS];
-            let mut nfds = 0;
-            let mut off = 0u64;
-            while ctl != 0 && off + 16 <= ctllen {
-                let h: [u32; 4] = get(ctl + off)?;
-                let clen = h[0] as u64 | (h[1] as u64) << 32;
-                if clen < 16 { break; }
-                if h[2] == 1 && h[3] == 1 {
-                    let n = ((clen - 16) / 4) as usize;
-                    for k in 0..n {
-                        if nfds == fds.len() { return Err(EINVAL); }
-                        fds[nfds] = get(ctl + off + 16 + k as u64 * 4)?;
-                        nfds += 1;
-                    }
-                }
-                off += (clen + 7) & !7;
-            }
-            nosig(file::unix_send(fd, buf, total, &fds[..nfds], nonblock), flags)
-        } else {
-            let mut cap = 0u64;
-            for i in 0..iovlen { let v: Iovec = get(iov + i * 16)?; cap += v.len; }
-            let mut fds = [0i32; crate::unix::MAX_FDS];
-            let room = if ctl != 0 && ctllen >= 16 { ((ctllen - 16) / 4) as usize } else { 0 };
-            let (n, nfds, trunc) = file::unix_recv(fd, buf, cap.min(BOUNCE), nonblock, flags & 0x4000_0000 != 0,
-                                                   &mut fds[..room.min(crate::unix::MAX_FDS)])?;
-            // espalha nos iovecs
-            let mut done = 0u64;
-            for i in 0..iovlen {
-                if done == n { break; }
-                let v: Iovec = get(iov + i * 16)?;
-                let k = v.len.min(n - done);
-                ubuf(v.base, k, true)?;
-                unsafe { core::ptr::copy_nonoverlapping((buf + done) as *const u8, v.base as *mut u8, k as usize) };
-                done += k;
-            }
-            let mut oflags = if trunc { 0x20u32 } else { 0 };    // MSG_TRUNC
-            if nfds > 0 {
-                let clen = 16 + nfds as u64 * 4;
-                ubuf(ctl, (clen + 7) & !7, true)?;
-                put(ctl, clen)?;
-                put(ctl + 8, [1u32, 1u32])?;
-                for k in 0..nfds { put(ctl + 16 + k as u64 * 4, fds[k])?; }
-                put(msg + 40, (clen + 7) & !7)?;
-            } else {
-                put(msg + 40, 0u64)?;
-            }
-            if room < nfds { oflags |= 0x8; }                   // MSG_CTRUNC
-            put(msg + 48, oflags)?;
-            Ok(n)
+    let cpu = arch::cpu_id();
+    let buf = unsafe {
+        if UNIX_BUF[cpu] == 0 {
+            UNIX_BUF[cpu] = crate::frame_allocator::alloc_contig(16).ok_or(ENOMEM)?;
         }
-    })();
-    crate::frame_allocator::free_contig(buf, 16);
-    r
+        UNIX_BUF[cpu]
+    };
+    let nonblock = flags & 0x40 != 0;
+    if send {
+        // junta os dados
+        let mut total = 0u64;
+        for i in 0..iovlen {
+            let v: Iovec = get(iov + i * 16)?;
+            let n = v.len.min(BOUNCE - total);
+            if n == 0 { continue; }
+            ubuf(v.base, n, false)?;
+            unsafe { core::ptr::copy_nonoverlapping(v.base as *const u8, (buf + total) as *mut u8, n as usize) };
+            total += n;
+        }
+        // SCM_RIGHTS: cmsghdr { u64 len; i32 level; i32 type; int fds[] }
+        let mut fds = [0i32; crate::unix::MAX_FDS];
+        let mut nfds = 0;
+        let mut off = 0u64;
+        while ctl != 0 && off + 16 <= ctllen {
+            let h: [u32; 4] = get(ctl + off)?;
+            let clen = h[0] as u64 | (h[1] as u64) << 32;
+            if clen < 16 { break; }
+            if h[2] == 1 && h[3] == 1 {
+                let n = ((clen - 16) / 4) as usize;
+                for k in 0..n {
+                    if nfds == fds.len() { return Err(EINVAL); }
+                    fds[nfds] = get(ctl + off + 16 + k as u64 * 4)?;
+                    nfds += 1;
+                }
+            }
+            off += (clen + 7) & !7;
+        }
+        nosig(file::unix_send(fd, buf, total, &fds[..nfds], nonblock), flags)
+    } else {
+        let mut cap = 0u64;
+        for i in 0..iovlen { let v: Iovec = get(iov + i * 16)?; cap += v.len; }
+        let mut fds = [0i32; crate::unix::MAX_FDS];
+        let room = if ctl != 0 && ctllen >= 16 { ((ctllen - 16) / 4) as usize } else { 0 };
+        let (n, nfds, trunc) = file::unix_recv(fd, buf, cap.min(BOUNCE), nonblock, flags & 0x4000_0000 != 0,
+                                               &mut fds[..room.min(crate::unix::MAX_FDS)])?;
+        // espalha nos iovecs
+        let mut done = 0u64;
+        for i in 0..iovlen {
+            if done == n { break; }
+            let v: Iovec = get(iov + i * 16)?;
+            let k = v.len.min(n - done);
+            ubuf(v.base, k, true)?;
+            unsafe { core::ptr::copy_nonoverlapping((buf + done) as *const u8, v.base as *mut u8, k as usize) };
+            done += k;
+        }
+        let mut oflags = if trunc { 0x20u32 } else { 0 };    // MSG_TRUNC
+        if nfds > 0 {
+            let clen = 16 + nfds as u64 * 4;
+            ubuf(ctl, (clen + 7) & !7, true)?;
+            put(ctl, clen)?;
+            put(ctl + 8, [1u32, 1u32])?;
+            for k in 0..nfds { put(ctl + 16 + k as u64 * 4, fds[k])?; }
+            put(msg + 40, (clen + 7) & !7)?;
+        } else {
+            put(msg + 40, 0u64)?;
+        }
+        if room < nfds { oflags |= 0x8; }                   // MSG_CTRUNC
+        put(msg + 48, oflags)?;
+        Ok(n)
+    }
 }

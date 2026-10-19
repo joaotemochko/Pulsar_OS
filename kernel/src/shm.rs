@@ -14,7 +14,7 @@ use crate::sync::SpinLock;
 
 pub static SHM: SpinLock = SpinLock::new();
 
-const MAX_OBJS: usize = 64;
+const MAX_OBJS: usize = 512;  // memfd/shm (o Firefox usa muitos)
 const NAME_MAX: usize = 64;
 /// Tamanho maximo de um objeto (1 GiB).
 pub const MAX_SIZE: u64 = 1 << 30;

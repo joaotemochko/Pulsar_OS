@@ -3,9 +3,12 @@
 #include <string.h>
 
 static void pack_title(const char* t, u64* out){
+    /* ate 24 bytes, cortando num limite de caractere UTF-8 (nao no meio de um "—") */
+    int n=0; while(n<24 && t[n]) n++;
+    while(n>0 && t[n] && ((u8)t[n]&0xC0)==0x80) n--;
     for(int i=0;i<3;i++){
         u64 v=0;
-        for(int b=0;b<8;b++){ char c=t[0]?*t++:0; v|=((u64)(u8)c)<<(b*8); }
+        for(int b=0;b<8;b++){ int k=i*8+b; v|=((u64)(u8)(k<n?t[k]:0))<<(b*8); }
         out[i]=v;
     }
 }

@@ -8,7 +8,7 @@
 #
 # Tudo que depende da arquitetura vai para build/$(ARCH)/.
 
-.PHONY: all kernel user user_rust user_c disk run run-debug clean distclean musl linux_apps
+.PHONY: all kernel user user_rust user_c disk run run-debug clean distclean musl linux_apps glibc firefox
 
 ARCH ?= aarch64
 SMP  ?= 4
@@ -23,12 +23,12 @@ ifeq ($(ARCH),aarch64)
   RUST_TARGET  := aarch64-unknown-none-softfloat
   USER_TARGET  := aarch64-unknown-none
   CLANG_TARGET := --target=aarch64-none-elf
-  QEMU         := qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a53
+  QEMU         := qemu-system-aarch64 -machine virt,gic-version=2 -cpu max,pauth=off -accel tcg,thread=multi,tb-size=512
 else ifeq ($(ARCH),riscv64)
   RUST_TARGET  := riscv64imac-unknown-none-elf
   USER_TARGET  := riscv64gc-unknown-none-elf
   CLANG_TARGET := --target=riscv64-none-elf -march=rv64imafdc -mabi=lp64d -mcmodel=medany -mno-relax
-  QEMU         := qemu-system-riscv64 -machine virt
+  QEMU         := qemu-system-riscv64 -machine virt -accel tcg,thread=multi,tb-size=512
 else
   $(error ARCH deve ser aarch64 ou riscv64)
 endif
@@ -92,7 +92,7 @@ LIBC_A    := $(LIBC_OBJ)/libpulsar.a
 CRT0      := $(LIBC_OBJ)/crt0.o
 
 $(LIBC_OBJ)/%.o: user/libc/src/%.c user/libc/include/*.h | $(LIBC_OBJ)
-	@$(CC) -Iuser/libc/include -Iuser/third_party/stb -c $< -o $@
+	@$(CC) -O2 -Iuser/libc/include -Iuser/third_party/stb -c $< -o $@
 
 $(CRT0): user/libc/src/crt0_$(ARCH).s | $(LIBC_OBJ)
 	@clang $(CLANG_TARGET) -c $< -o $@ 2>/dev/null
@@ -105,7 +105,7 @@ $(LIBC_A): $(LIBC_OBJS)
 $(BUILD)/%.elf: $$(wildcard user/%/*.c) $$(wildcard user/%/*.h) user/%/link.ld $(LIBC_A) $(CRT0)
 	@mkdir -p $(BUILD)/obj-$*
 	@for f in $(wildcard user/$*/*.c); do \
-	    $(CC) -Iuser/libc/include -Iuser/$* -c $$f -o $(BUILD)/obj-$*/$$(basename $$f .c).o || exit 1; \
+	    $(CC) -O2 -Iuser/libc/include -Iuser/$* -c $$f -o $(BUILD)/obj-$*/$$(basename $$f .c).o || exit 1; \
 	done
 	@$(LD) -T user/$*/link.ld -e _start $(CRT0) $(BUILD)/obj-$*/*.o $(LIBC_A) $(BUILTINS) -o $@
 
@@ -153,7 +153,11 @@ $(QJS_A): $(QJS_OBJS)
 
 # ---- Vela: varios .c + fontes TrueType e o prelude.js embutidos ----
 VELA_OBJ  := $(BUILD)/obj-vela
+# o Vela e um submodulo git (github.com/joaotemochko/VelaBrowser)
 VELA_SRCS := $(wildcard user/vela/*.c)
+ifeq ($(VELA_SRCS),)
+$(error user/vela esta vazio: rode "git submodule update --init" (o Vela e um submodulo))
+endif
 VELA_OBJS := $(patsubst user/vela/%.c,$(VELA_OBJ)/%.o,$(VELA_SRCS)) $(VELA_OBJ)/gen_fonts.o $(VELA_OBJ)/gen_prelude.o
 VELA_CC   := $(CC) -Iuser/libc/include -Iuser/vela -I$(TP)/bearssl/inc -I$(TP)/quickjs -I$(TP)/stb -I$(TP)/nanosvg -I$(TP)/brotli/include
 FONTS     := font_sans_regular=$(TP)/fonts/NotoSans-Regular.ttf font_sans_bold=$(TP)/fonts/NotoSans-Bold.ttf \
@@ -207,6 +211,10 @@ LINUX_BINS  := $(addprefix $(BUILD)/linux/,$(LINUX_APPS))
 # compartilhadas (user/linux/lib/<nome>.c -> /lib/lib<nome>.so)
 DYN_APPS    := $(basename $(notdir $(wildcard user/linux/dynamic/*.c)))
 DYN_BINS    := $(addprefix $(BUILD)/linux/dyn/,$(DYN_APPS))
+# programas GTK tambem em versao dinamica (/bin/<nome>-dyn): as bibliotecas
+# vem de /usr/lib pelo ld-musl
+DYN_GTK     := gtktest
+DYN_BINS    += $(addprefix $(BUILD)/linux/dyn/,$(addsuffix -dyn,$(DYN_GTK)))
 SO_LIBS     := $(addprefix $(BUILD)/linux/lib/lib,$(addsuffix .so,$(basename $(notdir $(wildcard user/linux/lib/*.c)))))
 LDSO_NAME   := ld-musl-$(ARCH).so.1
 # rotinas do compilador (long double etc.) para o libc.so: os objetos do
@@ -239,7 +247,7 @@ $(MUSL_LIBC): $(RTLIB)
 # bibliotecas graficas da compatibilidade (fontes originais em user/third_party):
 # libffi, libwayland-client, xdg-shell e libxkbcommon, compiladas sem meson
 LINUX_GFX := $(SYSROOT)/lib/libxkbcommon.a
-$(LINUX_GFX): $(MUSL_LIBC) tools/build_linux_libs.sh
+$(LINUX_GFX): $(MUSL_LIBC) $(SYSROOT)/lib/libc++.a tools/build_linux_libs.sh
 	@echo "== libffi, libwayland-client, libxkbcommon ($(ARCH)) =="
 	@AR=$(AR) sh tools/build_linux_libs.sh $(ARCH) $(SYSROOT) $(BUILD)/linuxlibs $(LCC) >/dev/null
 # cabecalhos UAPI do Linux (linux/*.h, asm/*.h), os do pacote linux-headers
@@ -253,13 +261,15 @@ $(CXX_RT): $(LINUX_HDRS) tools/build_cxx_runtime.sh
 	@echo "== libc++, libc++abi, libunwind ($(ARCH)) =="
 	@sh tools/build_cxx_runtime.sh $(ARCH) $(SYSROOT) $(BUILD)/cxxrt >/dev/null 2>&1 \
 	    || { echo "falhou: veja $(BUILD)/cxxrt"; exit 1; }
-LCXX := clang++ --target=$(MUSL_TRIPLE) --sysroot=$(CURDIR)/$(SYSROOT) -stdlib=libc++ -O2 -Wall
+# a libc++ e a do sysroot (nao a que vem junto com o clang, feita para o host)
+LCXX := clang++ --target=$(MUSL_TRIPLE) --sysroot=$(CURDIR)/$(SYSROOT) -stdlib=libc++ \
+        -nostdinc++ -isystem $(CURDIR)/$(SYSROOT)/include/c++/v1 -O2 -Wall
 
 # fontes: expat + freetype + fontconfig (os configure originais, cruzando via
 # tools/musl-cc.sh); os programas fc-* e /etc/fonts vao para $(FONT_ROOT)
 FONT_LIBS := $(SYSROOT)/lib/libfontconfig.a
 FONT_ROOT := $(BUILD)/fontroot
-$(FONT_LIBS): $(MUSL_LIBC) $(RTLIB) tools/build_font_libs.sh tools/musl-cc.sh
+$(FONT_LIBS): $(CXX_RT) $(RTLIB) tools/build_font_libs.sh tools/musl-cc.sh tools/meson-cross.sh
 	@echo "== expat, freetype, fontconfig ($(ARCH)) =="
 	@AR=$(AR) sh tools/build_font_libs.sh $(ARCH) $(SYSROOT) $(RTLIB) $(BUILD)/fontlibs $(FONT_ROOT) >/dev/null 2>&1 \
 	    || { echo "falhou: veja $(BUILD)/fontlibs"; exit 1; }
@@ -275,26 +285,94 @@ $(GLIB_LIBS): $(DRAW_LIBS) tools/build_glib_libs.sh tools/meson-cross.sh
 	@echo "== pcre2, glib, fribidi, pango, gdk-pixbuf ($(ARCH)) =="
 	@sh tools/build_glib_libs.sh $(ARCH) $(SYSROOT) $(RTLIB) $(BUILD)/glibs >/dev/null 2>&1 \
 	    || { echo "falhou: veja $(BUILD)/glibs/*.log"; exit 1; }
-GFX_LIBS := -L$(SYSROOT)/lib -lpangocairo-1.0 -lpangoft2-1.0 -lpango-1.0 -lfribidi -lgdk_pixbuf-2.0 \
+# GTK 3 (backend Wayland) e o que falta para ele: wayland/xkbcommon com .pc,
+# atk, libepoxy, cairo-gobject (tools/build_gtk_libs.sh, meson)
+GTK_LIBS := $(SYSROOT)/lib/libgtk-3.a
+$(GTK_LIBS): $(GLIB_LIBS) $(LINUX_GFX) tools/build_gtk_libs.sh tools/meson-cross.sh
+	@echo "== wayland, xkbcommon, atk, epoxy, gtk 3 ($(ARCH)) =="
+	@sh tools/build_gtk_libs.sh $(ARCH) $(SYSROOT) $(RTLIB) $(BUILD)/gtklibs $(BUILD)/linuxlibs/host/wayland-scanner \
+	    >/dev/null 2>&1 || { echo "falhou: veja $(BUILD)/gtklibs/*.log"; exit 1; }
+	@glib-compile-schemas --targetdir=$(SYSROOT)/share/glib-2.0/schemas $(SYSROOT)/share/glib-2.0/schemas
+# midia: alsa-lib (o Firefox exige); configuracao em $(MEDIA_ROOT)/usr/share/alsa
+MEDIA_LIBS := $(SYSROOT)/lib/libasound.so
+MEDIA_ROOT := $(BUILD)/mediaroot
+$(MEDIA_LIBS): $(CXX_RT) tools/build_media_libs.sh tools/meson-cross.sh
+	@echo "== alsa-lib ($(ARCH)) =="
+	@sh tools/build_media_libs.sh $(ARCH) $(SYSROOT) $(RTLIB) $(BUILD)/medialibs $(MEDIA_ROOT) >/dev/null 2>&1 \
+	    || { echo "falhou: veja $(BUILD)/medialibs"; exit 1; }
+
+# ambiente glibc (camada Linux): bibliotecas do Debian 13 para programas
+# Linux prontos, como o Firefox de mozilla.org. Pacotes em user/glibc/pacotes.txt,
+# versoes e SHA-256 travados em user/glibc/base-<arch>.lock; os .deb (conferidos
+# pela assinatura do Debian) ficam em $(GLIBC_CACHE). GLIBC=0 deixa o disco sem ele.
+GLIBC       ?= 1
+GLIBC_ROOT  := $(BUILD)/glibcroot
+GLIBC_CACHE ?= $(HOME)/debian-cache
+GLIBC_LINGUAS ?= pt pt_BR en en_GB
+GLIBC_ENV   := $(if $(filter 1,$(GLIBC)),$(GLIBC_ROOT)/.pronto)
+# lista comum + a da arquitetura (user/glibc/pacotes-<arch>.txt), se houver
+GLIBC_LISTS := user/glibc/pacotes.txt $(wildcard user/glibc/pacotes-$(ARCH).txt)
+$(GLIBC_ROOT)/.pronto: tools/glibc_env.py $(GLIBC_LISTS) user/glibc/base-$(ARCH).lock
+	@echo "== ambiente glibc ($(ARCH), Debian) =="
+	@rm -rf $(GLIBC_ROOT) && python3 tools/glibc_env.py $(ARCH) $(GLIBC_ROOT) $(GLIBC_CACHE) \
+	    --lock user/glibc/base-$(ARCH).lock $(addprefix @,$(GLIBC_LISTS))
+	@rm -rf $(GLIBC_ROOT)/usr/share/doc $(GLIBC_ROOT)/usr/share/man $(GLIBC_ROOT)/usr/share/info
+	@# traducoes: so as linguas do Pulsar (GLIBC_LINGUAS)
+	@find $(GLIBC_ROOT)/usr/share/locale -mindepth 1 -maxdepth 1 -type d \
+	    $(foreach l,$(GLIBC_LINGUAS),! -name '$(l)') -exec rm -rf {} +
+	@touch $@
+glibc: $(GLIBC_ENV)
+
+# Firefox pre-instalado (navegador padrao por ora; precisa do ambiente glibc):
+# o pacote oficial da Mozilla no aarch64, o firefox-esr do Debian no riscv64.
+# FIREFOX=0 deixa de fora.
+FIREFOX      ?= $(GLIBC)
+FIREFOX_ROOT := $(BUILD)/firefoxroot
+FIREFOX_ENV  := $(if $(filter 1,$(FIREFOX)),$(FIREFOX_ROOT)/.pronto)
+$(FIREFOX_ROOT)/.pronto: tools/firefox_install.sh tools/png2icn.py $(GLIBC_ROOT)/.pronto
+	@echo "== Firefox ($(ARCH)) =="
+	@sh tools/firefox_install.sh $(ARCH) $(FIREFOX_ROOT) $(GLIBC_CACHE) $(GLIBC_ROOT)
+	@touch $@
+firefox: $(FIREFOX_ENV)
+
+# dados XKB (xkeyboard-config): o GDK monta um mapa padrao pelos nomes
+# (rules evdev, layout us) antes de receber o do Pulsar. So dados: build
+# nativo, igual para as duas arquiteturas.
+XKB_DATA := build/xkbdata/root/usr/share/X11/xkb
+$(XKB_DATA):
+	@echo "== xkeyboard-config =="
+	@rm -rf build/xkbdata && meson setup build/xkbdata/build user/third_party/xkeyboard-config --prefix=/usr \
+	    -Dxorg-rules-symlinks=false >/dev/null && ninja -C build/xkbdata/build >/dev/null \
+	    && DESTDIR=$(CURDIR)/build/xkbdata/root ninja -C build/xkbdata/build install >/dev/null
+GFX_LIBS := -L$(SYSROOT)/lib -lgtk-3 -lgdk-3 -latk-1.0 -lepoxy -lcairo-gobject -lwayland-cursor -lwayland-egl \
+            -lpangocairo-1.0 -lpangoft2-1.0 -lpango-1.0 -lfribidi -lgdk_pixbuf-2.0 \
             -lgio-2.0 -lgobject-2.0 -lgmodule-2.0 -lglib-2.0 -lpcre2-8 \
             -lcairo -lharfbuzz -lpixman-1 -lpng16 -lz -lxdg-shell -lwayland-client -lffi \
             -lxkbcommon -lfontconfig -lfreetype -lexpat -lc++
 # cabecalhos das bibliotecas acima (sem pkg-config: na primeira passada elas
 # ainda nao existem)
 LINUX_INC := $(addprefix -I$(SYSROOT)/include/,freetype2 harfbuzz cairo pango-1.0 glib-2.0 gdk-pixbuf-2.0 \
-             fribidi gio-unix-2.0) -I$(SYSROOT)/lib/glib-2.0/include
+             fribidi gio-unix-2.0 gtk-3.0 atk-1.0) -I$(SYSROOT)/lib/glib-2.0/include
 
-$(BUILD)/linux/%: user/linux/%.c $(MUSL_LIBC) $(LINUX_GFX) $(GLIB_LIBS) $(PULSAR_RT)
+$(BUILD)/linux/%: user/linux/%.c $(MUSL_LIBC) $(LINUX_GFX) $(GTK_LIBS) $(PULSAR_RT)
 	@mkdir -p $(BUILD)/linux
 	@$(LCC) $(LINUX_INC) -c $< -o $@.o
 	@$(LD) -static --eh-frame-hdr $(SYSROOT)/lib/crt1.o $(SYSROOT)/lib/crti.o $@.o $(GFX_LIBS) $(MUSL_LIBC) $(PULSAR_RT) $(BUILTINS) \
 	    $(SYSROOT)/lib/crtn.o -o $@
 
-$(BUILD)/linux/%: user/linux/%.cpp $(MUSL_LIBC) $(LINUX_GFX) $(GLIB_LIBS) $(PULSAR_RT)
+$(BUILD)/linux/%: user/linux/%.cpp $(MUSL_LIBC) $(LINUX_GFX) $(GTK_LIBS) $(PULSAR_RT)
 	@mkdir -p $(BUILD)/linux
 	@$(LCXX) $(LINUX_INC) -c $< -o $@.o
 	@$(LD) -static --eh-frame-hdr $(SYSROOT)/lib/crt1.o $(SYSROOT)/lib/crti.o $@.o $(GFX_LIBS) $(MUSL_LIBC) \
 	    $(PULSAR_RT) $(BUILTINS) $(SYSROOT)/lib/crtn.o -o $@
+
+# programa GTK dinamico: driver do clang com --sysroot e o pkg-config do sysroot
+DCC := clang --target=$(MUSL_TRIPLE) --sysroot=$(CURDIR)/$(SYSROOT) -fuse-ld=lld -O2 -Wall \
+       -Wl,--dynamic-linker=/lib/$(LDSO_NAME) -Wl,--eh-frame-hdr
+$(BUILD)/linux/dyn/%-dyn: user/linux/%.c $(GTK_LIBS)
+	@mkdir -p $(BUILD)/linux/dyn
+	@$(DCC) $< -o $@ $$(PKG_CONFIG_LIBDIR=$(SYSROOT)/lib/pkgconfig:$(SYSROOT)/share/pkgconfig PKG_CONFIG_PATH= \
+	    pkg-config --cflags --libs gtk+-3.0)
 
 $(BUILD)/linux/lib/lib%.so: user/linux/lib/%.c $(MUSL_LIBC)
 	@mkdir -p $(BUILD)/linux/lib
@@ -313,7 +391,7 @@ $(BUILD)/linux/dyn/%: user/linux/dynamic/%.c $(MUSL_LIBC) $(SO_LIBS)
 $(BUILD)/linux/%.pulse: $(BUILD)/linux/% tools/elf2pulse.py
 	@python3 tools/elf2pulse.py $< $@ >/dev/null
 
-musl: $(MUSL_LIBC) $(LINUX_GFX) $(FONT_LIBS) $(CXX_RT) $(DRAW_LIBS) $(GLIB_LIBS)
+musl: $(MUSL_LIBC) $(LINUX_GFX) $(FONT_LIBS) $(CXX_RT) $(DRAW_LIBS) $(GLIB_LIBS) $(GTK_LIBS) $(MEDIA_LIBS)
 linux_apps: $(LINUX_BINS) $(addsuffix .pulse,$(LINUX_BINS)) $(DYN_BINS) $(SO_LIBS)
 
 # ---- disco ----
@@ -323,22 +401,43 @@ linux_apps: $(LINUX_BINS) $(addsuffix .pulse,$(LINUX_BINS)) $(DYN_BINS) $(SO_LIB
 # rootfs/ (repositorio) tem os arquivos de /etc (resolv.conf, hosts...).
 # DISKFS=nbfs gera o Nebular FS plano antigo.
 DISKFS    ?= ext2
-DISK_SIZE ?= 512M
+# 2 GiB: o Firefox (~280 MB) e o perfil/cache dele cabem com folga
+DISK_SIZE ?= 2G
 MKE2FS    := $(shell command -v mke2fs || echo /sbin/mke2fs)
 ROOTFS    := $(BUILD)/root
 ROOT_DIRS := bin dev etc home/user proc run tmp usr/bin usr/lib usr/share
 
-disk: user $(if $(filter ext2,$(DISKFS)),linux_apps)
+disk: user $(if $(filter ext2,$(DISKFS)),linux_apps $(XKB_DATA) $(GLIBC_ENV) $(FIREFOX_ENV))
 	@echo "== Disco $(DISK) ($(DISKFS)) =="
 ifeq ($(DISKFS),ext2)
 	@rm -rf $(ROOTFS) && mkdir -p $(addprefix $(ROOTFS)/,$(ROOT_DIRS))
 	@cp $(DISK_PULSES) welcome.txt pulsar.cfg $(ROOTFS)/
 	@cp -r rootfs/. $(ROOTFS)/
+	@# identidade da instalacao (D-Bus, GLib e o Firefox leem): nova a cada disco
+	@python3 -c "import uuid; print(uuid.uuid4().hex)" > $(ROOTFS)/etc/machine-id
 	@$(if $(LINUX_BINS),cp $(LINUX_BINS) $(addsuffix .pulse,$(LINUX_BINS)) $(ROOTFS)/bin/)
 	@mkdir -p $(ROOTFS)/lib && cp $(SYSROOT)/lib/libc.so $(SO_LIBS) $(ROOTFS)/lib/ && ln -sf libc.so $(ROOTFS)/lib/$(LDSO_NAME)
 	@$(if $(DYN_BINS),cp $(DYN_BINS) $(ROOTFS)/bin/)
+	@mkdir -p $(ROOTFS)/usr/lib && cp -P $(SYSROOT)/lib/*.so* $(ROOTFS)/usr/lib/ && rm -f $(ROOTFS)/usr/lib/libc.so \
+	    && cp -r $(SYSROOT)/lib/gtk-3.0 $(ROOTFS)/usr/lib/
+	@mkdir -p $(ROOTFS)/usr/share/X11 && cp -r $(XKB_DATA) $(ROOTFS)/usr/share/X11/
+	@cp -r $(MEDIA_ROOT)/. $(ROOTFS)/
+	@mkdir -p $(ROOTFS)/usr/share/glib-2.0/schemas && cp $(SYSROOT)/share/glib-2.0/schemas/gschemas.compiled \
+	    $(ROOTFS)/usr/share/glib-2.0/schemas/
 	@cp -r $(FONT_ROOT)/. $(ROOTFS)/ && mkdir -p $(ROOTFS)/usr/share/fonts/pulsar \
 	    && cp user/third_party/fonts-linux/* $(ROOTFS)/usr/share/fonts/pulsar/
+	@# os dois mundos (musl e glibc) leem /usr/share/glib-2.0/schemas: um so
+	@# gschemas.compiled com os esquemas dos dois
+	@$(if $(GLIBC_ENV),cp $(SYSROOT)/share/glib-2.0/schemas/*.xml $(ROOTFS)/usr/share/glib-2.0/schemas/ \
+	    && cp -a $(GLIBC_ROOT)/. $(ROOTFS)/ && rm -f $(ROOTFS)/.pronto \
+	    && glib-compile-schemas $(ROOTFS)/usr/share/glib-2.0/schemas)
+	@$(if $(FIREFOX_ENV),cp -a $(FIREFOX_ROOT)/. $(ROOTFS)/ && rm -f $(ROOTFS)/.pronto \
+	    $(ROOTFS)/usr/lib/firefox-esr/glxtest $(ROOTFS)/usr/lib/firefox-esr/vaapitest \
+	    $(ROOTFS)/usr/lib/firefox-esr/v4l2test $(ROOTFS)/usr/lib/firefox-esr/vulkantest \
+	    $(ROOTFS)/usr/lib/firefox-esr/crashreporter $(ROOTFS)/usr/lib/firefox-esr/pingsender)
+	@find $(ROOTFS)/usr/share/fonts $(ROOTFS)/etc/fonts -exec touch -h -d "@1700000000" {} + 2>/dev/null || true
+	@fc-cache -s -f -y $(ROOTFS) 2>/dev/null || true
+	@find $(ROOTFS)/usr/share/fonts $(ROOTFS)/etc/fonts $(ROOTFS)/var/cache/fontconfig -exec touch -h -d "@1700000000" {} + 2>/dev/null || true
 	@rm -f $(DISK)
 	@$(MKE2FS) -q -F -t ext2 -b 4096 -O none,filetype,sparse_super,large_file \
 	    -E root_owner=0:0 -L Pulsar -d $(ROOTFS) $(DISK) $(DISK_SIZE)
@@ -349,7 +448,7 @@ endif
 QEMU_ARGS := -smp $(SMP) -m $(MEM) -serial mon:stdio \
 	-global virtio-mmio.force-legacy=false \
 	-device virtio-gpu-device -device virtio-keyboard-device -device virtio-tablet-device \
-	-drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 \
+	-drive file=$(DISK),if=none,format=raw,cache=unsafe,aio=threads,id=hd0 -device virtio-blk-device,drive=hd0 \
 	-netdev user,id=n0 -device virtio-net-device,netdev=n0 \
 	-device virtio-rng-device
 

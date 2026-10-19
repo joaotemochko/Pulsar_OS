@@ -52,8 +52,8 @@ const RO_LARGE_FILE: u32 = 0x2;
 
 // ------------------------------------------------------------ cache
 
-const WAYS: usize = 4;
-const SETS: usize = 256;          // 1024 blocos (4 MiB com blocos de 4 KiB)
+const WAYS: usize = 8;
+const SETS: usize = 2048;         // 16384 blocos (64 MiB com blocos de 4 KiB)
 const SLOTS: usize = WAYS * SETS;
 
 #[derive(Clone, Copy)]
@@ -66,6 +66,8 @@ struct Slot {
 
 static mut CACHE_MEM: u64 = 0;
 static mut SLOT: [Slot; SLOTS] = [Slot { blk: 0, valid: false, dirty: false, used: 0 }; SLOTS];
+static mut DIRTY_LIST: [(u32, u16); SLOTS] = [(0, 0); SLOTS];
+static mut DIRTY_COUNT: usize = 0;
 static mut TICK: u32 = 0;
 
 fn slots() -> &'static mut [Slot; SLOTS] {
@@ -98,22 +100,25 @@ fn bget(b: u32, load: bool) -> Res<*mut u8> {
             return Ok(slot_ptr(i));
         }
     }
-    // vitima: invalida, ou a menos usada recentemente
+    // vitima: invalida, ou a menos usada recentemente (preferindo limpas)
     let mut v = base;
     for i in base..base + WAYS {
         if !ss[i].valid { v = i; break; }
         if now.wrapping_sub(ss[i].used) > now.wrapping_sub(ss[v].used) { v = i; }
     }
     if ss[v].valid && ss[v].dirty {
-        // despejar um bloco sujo: grava todos de uma vez (em lote e em
-        // ordem); os proximos despejos encontram blocos limpos
-        if !flush_dirty() { return Err(EIO); }
+        if !disk_io(true, ss[v].blk, slot_ptr(v) as u64, 1) { return Err(EIO); }
+        ss[v].dirty = false;
+        unsafe { DIRTY_COUNT = DIRTY_COUNT.saturating_sub(1); }
     }
     ss[v] = Slot { blk: b, valid: false, dirty: false, used: now };
     if load {
         if !disk_io(false, b, slot_ptr(v) as u64, 1) { return Err(EIO); }
     } else {
-        unsafe { core::ptr::write_bytes(slot_ptr(v), 0, fs().bs as usize) };
+        unsafe {
+            core::ptr::write_bytes(slot_ptr(v), 0, fs().bs as usize);
+            DIRTY_COUNT += 1;
+        }
         ss[v].dirty = true;
     }
     ss[v].valid = true;
@@ -125,7 +130,13 @@ fn bdirty(b: u32) {
     let ss = slots();
     let set = (b as usize).wrapping_mul(0x9E37_79B9) >> 8 & (SETS - 1);
     for i in set * WAYS..set * WAYS + WAYS {
-        if ss[i].valid && ss[i].blk == b { ss[i].dirty = true; return; }
+        if ss[i].valid && ss[i].blk == b {
+            if !ss[i].dirty {
+                ss[i].dirty = true;
+                unsafe { DIRTY_COUNT += 1; }
+            }
+            return;
+        }
     }
 }
 
@@ -134,21 +145,31 @@ fn bforget(b: u32) {
     let ss = slots();
     let set = (b as usize).wrapping_mul(0x9E37_79B9) >> 8 & (SETS - 1);
     for i in set * WAYS..set * WAYS + WAYS {
-        if ss[i].valid && ss[i].blk == b { ss[i].valid = false; ss[i].dirty = false; }
+        if ss[i].valid && ss[i].blk == b {
+            if ss[i].dirty {
+                unsafe { DIRTY_COUNT = DIRTY_COUNT.saturating_sub(1); }
+            }
+            ss[i].valid = false;
+            ss[i].dirty = false;
+        }
     }
 }
 
 /// Grava todos os blocos sujos, ordenados por numero; blocos consecutivos
 /// viram uma so requisicao scatter-gather.
 fn flush_dirty() -> bool {
-    let mut list = [(0u32, 0u16); SLOTS];
+    if unsafe { DIRTY_COUNT == 0 } { return true; }
+    let list_all = unsafe { &mut *(&raw mut DIRTY_LIST) };
     let mut n = 0;
     for i in 0..SLOTS {
         let s = slots()[i];
-        if s.valid && s.dirty { list[n] = (s.blk, i as u16); n += 1; }
+        if s.valid && s.dirty { list_all[n] = (s.blk, i as u16); n += 1; }
     }
-    if n == 0 { return true; }
-    let list = &mut list[..n];
+    if n == 0 {
+        unsafe { DIRTY_COUNT = 0; }
+        return true;
+    }
+    let list = &mut list_all[..n];
     list.sort_unstable_by_key(|e| e.0);
     let bs = fs().bs as u32;
     let mut ok = true;
@@ -162,7 +183,10 @@ fn flush_dirty() -> bool {
         }
         let lba = list[i].0 as u64 * (bs as u64 / 512);
         if blk::transfer_sg(true, lba, &segs[..k]) {
-            for j in i..i + k { slots()[list[j].1 as usize].dirty = false; }
+            for j in i..i + k {
+                slots()[list[j].1 as usize].dirty = false;
+                unsafe { DIRTY_COUNT = DIRTY_COUNT.saturating_sub(1); }
+            }
         } else {
             ok = false;
         }
@@ -443,6 +467,7 @@ fn free_inode(ino: u32, dir: bool) -> Res<()> {
         if dir { gd_add16(g, GD_USED_DIRS, -1)?; }
         f.free_inodes += 1;
     }
+    icache_inv(ino);
     Ok(())
 }
 
@@ -473,7 +498,13 @@ pub struct Inode {
 }
 
 impl Inode {
-    fn zeroed() -> Self { unsafe { core::mem::zeroed() } }
+    const fn zeroed() -> Self {
+        Self {
+            mode: 0, uid: 0, size_lo: 0, atime: 0, ctime: 0, mtime: 0, dtime: 0,
+            gid: 0, links: 0, blocks512: 0, flags: 0, osd1: 0, block: [0; 15],
+            generation: 0, file_acl: 0, size_hi: 0, faddr: 0, osd2: [0; 12],
+        }
+    }
     pub fn size(&self) -> u64 {
         if self.mode & S_IFMT == S_IFREG { self.size_lo as u64 | (self.size_hi as u64) << 32 } else { self.size_lo as u64 }
     }
@@ -487,6 +518,25 @@ impl Inode {
     fn fast_symlink(&self) -> bool { self.kind() == S_IFLNK && self.blocks512 == 0 }
 }
 
+const ICACHE_SLOTS: usize = 1024;
+
+#[derive(Clone, Copy)]
+struct ICacheEntry {
+    ino: u32,
+    node: Inode,
+}
+
+static mut ICACHE: [ICacheEntry; ICACHE_SLOTS] = [ICacheEntry { ino: 0, node: Inode::zeroed() }; ICACHE_SLOTS];
+
+fn icache_inv(ino: u32) {
+    let idx = (ino as usize) & (ICACHE_SLOTS - 1);
+    unsafe {
+        if ICACHE[idx].ino == ino {
+            ICACHE[idx].ino = 0;
+        }
+    }
+}
+
 fn inode_loc(ino: u32) -> Res<(u32, usize)> {
     let f = fs();
     if ino == 0 || ino > f.inodes { return Err(EINVAL); }
@@ -498,9 +548,19 @@ fn inode_loc(ino: u32) -> Res<(u32, usize)> {
 }
 
 pub fn read_inode(ino: u32) -> Res<Inode> {
+    if ino != 0 {
+        let idx = (ino as usize) & (ICACHE_SLOTS - 1);
+        let e = unsafe { ICACHE[idx] };
+        if e.ino == ino {
+            return Ok(e.node);
+        }
+    }
     let (b, o) = inode_loc(ino)?;
     let p = bget(b, true)?;
-    Ok(unsafe { core::ptr::read_unaligned(p.add(o) as *const Inode) })
+    let node = unsafe { core::ptr::read_unaligned(p.add(o) as *const Inode) };
+    let idx = (ino as usize) & (ICACHE_SLOTS - 1);
+    unsafe { ICACHE[idx] = ICacheEntry { ino, node }; }
+    Ok(node)
 }
 
 fn write_inode(ino: u32, n: &Inode) -> Res<()> {
@@ -508,6 +568,8 @@ fn write_inode(ino: u32, n: &Inode) -> Res<()> {
     let p = bget(b, true)?;
     unsafe { core::ptr::write_unaligned(p.add(o) as *mut Inode, *n) };
     bdirty(b);
+    let idx = (ino as usize) & (ICACHE_SLOTS - 1);
+    unsafe { ICACHE[idx] = ICacheEntry { ino, node: *n }; }
     Ok(())
 }
 
@@ -646,8 +708,9 @@ pub fn read(ino: u32, off: u64, dst: *mut u8, len: usize) -> Res<usize> {
         let chunk = (bs as usize - inblk).min(len - done);
         let b = bmap(&n, pos / bs)?;
         if b != 0 && !cached(b) {
-            // quantos blocos seguintes do arquivo sao contiguos no disco
-            let want = ((len - done) as u64).div_ceil(bs).min(32) as u32;
+            // quantos blocos seguintes do arquivo sao contiguos no disco (readahead minimo de 8 blocos)
+            let max_rem = (size - (pos - inblk as u64)).div_ceil(bs).min(32) as u32;
+            let want = ((len - done) as u64).div_ceil(bs).max(8).min(max_rem as u64) as u32;
             let mut run = 1u32;
             while run < want && bmap(&n, pos / bs + run as u64)? == b + run { run += 1; }
             prefetch(b, run as usize);
@@ -668,6 +731,9 @@ pub fn read(ino: u32, off: u64, dst: *mut u8, len: usize) -> Res<usize> {
 /// Le o arquivo inteiro para um buffer FISICAMENTE contiguo (loader):
 /// blocos vizinhos no disco viram uma unica requisicao, direto no destino.
 pub fn read_all_phys(ino: u32, dst_pa: u64) -> Res<u64> {
+    if unsafe { DIRTY_COUNT > 0 } {
+        sync();
+    }
     let n = read_inode(ino)?;
     let size = n.size();
     let bs = fs().bs;
@@ -685,8 +751,6 @@ pub fn read_all_phys(ino: u32, dst_pa: u64) -> Res<u64> {
         while l + run < nblk && run * bs < (1 << 20) && bmap(&n, l + run)? == b + run as u32 {
             run += 1;
         }
-        // o cache pode ter versoes mais novas que o disco
-        sync();
         if !disk_io(false, b, dst_pa + l * bs, run as u32) { return Err(EIO); }
         l += run;
     }
@@ -724,7 +788,6 @@ pub fn write(ino: u32, off: u64, src: *const u8, len: usize) -> Res<usize> {
     n.mtime = t;
     n.ctime = t;
     write_inode(ino, &n)?;
-    sync();
     match err {
         Some(e) if done == 0 => Err(e),
         _ => Ok(done),
@@ -739,11 +802,60 @@ pub fn truncate(ino: u32, size: u64) -> Res<()> {
     n.mtime = t;
     n.ctime = t;
     write_inode(ino, &n)?;
-    sync();
     Ok(())
 }
 
 // ------------------------------------------------------------ diretorios
+
+const DCACHE_SLOTS: usize = 1024;
+const DCACHE_NAME_MAX: usize = 60;
+
+#[derive(Clone, Copy)]
+struct DentryCache {
+    dir: u32,
+    ino: u32,     // 0 = entrada negativa (ENOENT)
+    ftype: u8,
+    nlen: u8,
+    valid: bool,
+    name: [u8; DCACHE_NAME_MAX],
+}
+
+static mut DCACHE: [DentryCache; DCACHE_SLOTS] = [DentryCache {
+    dir: 0, ino: 0, ftype: 0, nlen: 0, valid: false, name: [0; DCACHE_NAME_MAX],
+}; DCACHE_SLOTS];
+
+fn dcache_idx(dir: u32, name: &[u8]) -> usize {
+    let mut h = (dir as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for &b in name {
+        h = (h ^ b as u64).wrapping_mul(0x1000_0000_01B3);
+    }
+    ((h >> 16) ^ h) as usize & (DCACHE_SLOTS - 1)
+}
+
+fn dcache_put(dir: u32, name: &[u8], ino: u32, ftype: u8) {
+    if name.len() > DCACHE_NAME_MAX { return; }
+    let idx = dcache_idx(dir, name);
+    unsafe {
+        let e = &mut DCACHE[idx];
+        e.dir = dir;
+        e.ino = ino;
+        e.ftype = ftype;
+        e.nlen = name.len() as u8;
+        e.valid = true;
+        e.name[..name.len()].copy_from_slice(name);
+    }
+}
+
+fn dcache_inv(dir: u32, name: &[u8]) {
+    if name.len() > DCACHE_NAME_MAX { return; }
+    let idx = dcache_idx(dir, name);
+    unsafe {
+        let e = &mut DCACHE[idx];
+        if e.valid && e.dir == dir && e.nlen as usize == name.len() && &e.name[..name.len()] == name {
+            e.valid = false;
+        }
+    }
+}
 
 /// Entrada de diretorio decodificada.
 #[derive(Clone, Copy)]
@@ -789,11 +901,40 @@ pub fn readdir(dir: u32, pos: u64) -> Res<Option<Dirent>> {
 }
 
 pub fn lookup(dir: u32, name: &[u8]) -> Res<Option<(u32, u8)>> {
-    let mut pos = 0;
-    while let Some(d) = readdir(dir, pos)? {
-        if d.name() == name { return Ok(Some((d.ino, d.ftype))); }
-        pos = d.next;
+    if name.len() <= DCACHE_NAME_MAX {
+        let idx = dcache_idx(dir, name);
+        let e = unsafe { &DCACHE[idx] };
+        if e.valid && e.dir == dir && e.nlen as usize == name.len() && &e.name[..name.len()] == name {
+            return Ok(if e.ino == 0 { None } else { Some((e.ino, e.ftype)) });
+        }
     }
+    let n = read_inode(dir)?;
+    if !n.is_dir() { return Err(ENOTDIR); }
+    let bs = fs().bs;
+    let nblk = n.size() / bs;
+    for l in 0..nblk {
+        let b = bmap(&n, l)?;
+        if b == 0 { continue; }
+        let p = bget(b, true)?;
+        let mut off = 0usize;
+        while off < bs as usize {
+            let (ino, rec, nlen, ft) = unsafe {
+                (core::ptr::read_unaligned(p.add(off) as *const u32),
+                 core::ptr::read_unaligned(p.add(off + 4) as *const u16) as usize,
+                 *p.add(off + 6) as usize, *p.add(off + 7))
+            };
+            if rec < 8 || off + rec > bs as usize { return Err(EIO); }
+            if ino != 0 && nlen == name.len() {
+                let ename = unsafe { core::slice::from_raw_parts(p.add(off + 8), nlen) };
+                if ename == name {
+                    dcache_put(dir, name, ino, ft);
+                    return Ok(Some((ino, ft)));
+                }
+            }
+            off += rec;
+        }
+    }
+    dcache_put(dir, name, 0, 0);
     Ok(None)
 }
 
@@ -801,6 +942,7 @@ fn rec_need(nlen: usize) -> usize { (8 + nlen + 3) & !3 }
 
 /// Insere `name` -> `ino` no diretorio (em espaco livre ou num bloco novo).
 fn dir_add(dir: u32, name: &[u8], ino: u32, ft: u8) -> Res<()> {
+    dcache_put(dir, name, ino, ft);
     let mut n = read_inode(dir)?;
     let bs = fs().bs;
     let need = rec_need(name.len());
@@ -867,6 +1009,7 @@ fn touch_dir(dir: u32) -> Res<()> {
 
 /// Remove a entrada `name` (funde o espaco com a anterior do bloco).
 fn dir_remove(dir: u32, name: &[u8]) -> Res<()> {
+    dcache_inv(dir, name);
     let n = read_inode(dir)?;
     let bs = fs().bs;
     for l in 0..n.size() / bs {
@@ -915,6 +1058,7 @@ fn dir_is_empty(dir: u32) -> Res<bool> {
 
 /// Troca o alvo de ".." de um diretorio movido.
 fn set_dotdot(dir: u32, parent: u32) -> Res<()> {
+    dcache_put(dir, b"..", parent, FT_DIR);
     let n = read_inode(dir)?;
     let b = bmap(&n, 0)?;
     if b == 0 { return Err(EIO); }
@@ -999,6 +1143,69 @@ pub fn resolve_at(start: u32, path: &[u8], follow: bool) -> Res<u32> {
     }
 }
 
+/// Caminho canonico de um caminho ABSOLUTO: sem links simbolicos, "." e
+/// ".." (o que o Linux mostra em /proc/self/exe). Ret bytes gravados em `out`.
+pub fn realpath(path: &[u8], out: &mut [u8; PATH_MAX]) -> Res<usize> {
+    if path.first() != Some(&b'/') { return Err(EINVAL); }
+    if path.len() > PATH_MAX { return Err(ENAMETOOLONG); }
+    let mut buf = [0u8; PATH_MAX];
+    buf[..path.len()].copy_from_slice(path);
+    let mut len = path.len();
+    let mut links = 0;
+    'restart: loop {
+        // saida: "/a/b" (vazia = raiz); cur = inode do que ja esta na saida
+        let mut olen = 0;
+        let mut cur = ROOT_INO;
+        let mut i = 0;
+        while i < len {
+            while i < len && buf[i] == b'/' { i += 1; }
+            if i >= len { break; }
+            let s = i;
+            while i < len && buf[i] != b'/' { i += 1; }
+            let comp = &buf[s..i];
+            if comp == b"." { continue; }
+            if comp == b".." {
+                olen = out[..olen].iter().rposition(|&c| c == b'/').unwrap_or(0);
+                cur = if olen == 0 { ROOT_INO } else { resolve_at(ROOT_INO, &out[..olen], false)? };
+                continue;
+            }
+            if !read_inode(cur)?.is_dir() { return Err(ENOTDIR); }
+            let Some((ino, _)) = lookup(cur, comp)? else { return Err(ENOENT) };
+            if read_inode(ino)?.kind() == S_IFLNK {
+                links += 1;
+                if links > MAX_LINKS { return Err(ELOOP); }
+                // novo caminho = (saida ate aqui, se o alvo for relativo) + alvo + resto
+                let mut target = [0u8; PATH_MAX];
+                let tl = readlink(ino, &mut target)?;
+                let mut nb = [0u8; PATH_MAX];
+                let mut k = 0;
+                if target.first() != Some(&b'/') {
+                    nb[0] = b'/';
+                    nb[1..1 + olen].copy_from_slice(&out[..olen]);
+                    k = 1 + olen;
+                    nb[k] = b'/';
+                    k += 1;
+                }
+                let rest = len - i;
+                if k + tl + rest > PATH_MAX { return Err(ENAMETOOLONG); }
+                nb[k..k + tl].copy_from_slice(&target[..tl]);
+                k += tl;
+                nb[k..k + rest].copy_from_slice(&buf[i..len]);
+                buf = nb;
+                len = k + rest;
+                continue 'restart;
+            }
+            if olen + 1 + comp.len() > PATH_MAX { return Err(ENAMETOOLONG); }
+            out[olen] = b'/';
+            out[olen + 1..olen + 1 + comp.len()].copy_from_slice(comp);
+            olen += 1 + comp.len();
+            cur = ino;
+        }
+        if olen == 0 { out[0] = b'/'; olen = 1; }
+        return Ok(olen);
+    }
+}
+
 /// Divide em (diretorio pai resolvido, nome final); relativo parte de `at`.
 fn parent_of(at: u32, path: &[u8]) -> Res<(u32, &[u8])> {
     let mut end = path.len();
@@ -1020,6 +1227,9 @@ fn new_inode(mode: u16, dir_hint: u32, is_dir: bool) -> Res<(u32, Inode)> {
     let t = now();
     let mut n = Inode::zeroed();
     n.mode = mode;
+    // dono: o usuario do Pulsar (o mesmo uid que a camada Linux informa)
+    n.uid = crate::linux::USER_ID as u16;
+    n.gid = crate::linux::USER_ID as u16;
     n.atime = t;
     n.ctime = t;
     n.mtime = t;
@@ -1044,7 +1254,6 @@ pub fn create(at: u32, path: &[u8], perm: u16, excl: bool) -> Res<(u32, bool)> {
     let (ino, n) = new_inode(S_IFREG | (perm & 0o7777), dir, false)?;
     write_inode(ino, &n)?;
     dir_add(dir, name, ino, FT_REG)?;
-    sync();
     Ok((ino, true))
 }
 
@@ -1059,7 +1268,6 @@ pub fn mknod_socket(at: u32, path: &[u8], perm: u16) -> Res<u32> {
     let (ino, n) = new_inode(S_IFSOCK | (perm & 0o7777), dir, false)?;
     write_inode(ino, &n)?;
     dir_add(dir, name, ino, FT_SOCK)?;
-    sync();
     Ok(ino)
 }
 
@@ -1082,7 +1290,6 @@ pub fn mkdir(at: u32, path: &[u8], perm: u16) -> Res<u32> {
     let mut pn = read_inode(dir)?;
     pn.links += 1;
     write_inode(dir, &pn)?;
-    sync();
     Ok(ino)
 }
 
@@ -1100,7 +1307,6 @@ pub fn symlink(target: &[u8], at: u32, path: &[u8]) -> Res<()> {
         write(ino, 0, target.as_ptr(), target.len())?;
     }
     dir_add(dir, name, ino, FT_LNK)?;
-    sync();
     Ok(())
 }
 
@@ -1127,7 +1333,6 @@ pub fn release_inode(ino: u32) -> Res<()> {
     n.dtime = now();
     write_inode(ino, &n)?;
     free_inode(ino, dir)?;
-    sync();
     Ok(())
 }
 
@@ -1140,7 +1345,6 @@ pub fn unlink(at: u32, path: &[u8], is_open: impl Fn(u32) -> bool) -> Res<Option
     dir_remove(dir, name)?;
     let open = is_open(ino);
     let orphan = drop_link(ino, !open)?;
-    sync();
     Ok(if orphan && open { Some(ino) } else { None })
 }
 
@@ -1154,7 +1358,6 @@ pub fn rmdir(at: u32, path: &[u8]) -> Res<()> {
     let mut pn = read_inode(dir)?;
     pn.links = pn.links.saturating_sub(1);
     write_inode(dir, &pn)?;
-    sync();
     Ok(())
 }
 
@@ -1205,7 +1408,6 @@ pub fn rename(fat: u32, from: &[u8], tat: u32, to: &[u8], is_open: impl Fn(u32) 
         b.links += 1;
         write_inode(ddir, &b)?;
     }
-    sync();
     Ok(orphan)
 }
 

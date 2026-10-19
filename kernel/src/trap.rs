@@ -20,9 +20,24 @@ pub fn on_syscall(frame: *mut Context) {
     signal::deliver(frame);
 }
 
+/// Depuracao: registra na serial tambem as falhas que vao para o tratador
+/// do proprio programa (o Firefox, por exemplo, trata SIGSEGV e aborta com
+/// MOZ_CRASH sem dizer onde). pc/lr com a base das bibliotecas (LD_DEBUG=files)
+/// localizam o codigo.
+const LOG_HANDLED_FAULTS: bool = false;
+
 /// Falha do programa. Processos Linux com tratador para o sinal
 /// correspondente (`sig`, codigo `code`) o recebem; os demais morrem.
 pub fn on_user_fault_sig(frame: *mut Context, what: &str, addr: u64, sig: u32, code: i32) {
+    if LOG_HANDLED_FAULTS {
+        let pc = unsafe { (*frame).pc() };
+        #[cfg(target_arch = "aarch64")]
+        let lr = unsafe { (*frame).x[30] };
+        #[cfg(target_arch = "riscv64")]
+        let lr = unsafe { (*frame).x[1] };     // ra
+        let _ = write!(Uart, "[falha] pid {} ({}) {} em {:#x} pc={:#x} lr={:#x}\n",
+            process::current_pid(), process::current_name(), what, addr, pc, lr);
+    }
     if signal::fault_signal(sig, code, addr) {
         signal::deliver(frame);
         return;

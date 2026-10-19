@@ -19,9 +19,9 @@ TP=$(cd "$(dirname "$0")/../user/third_party" && pwd)
 TOOLS=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$B" "$ROOT"
 B=$(cd "$B" && pwd); ROOT=$(cd "$ROOT" && pwd)
+# musl-cc, pkg-config e o sysroot com libgcc/crtbegin (tools/meson-cross.sh).
 # CC e um caminho so (o libtool copiaria para os .a qualquer .a citado no CC)
-printf '#!/bin/sh\nexec "%s" %s "%s" "%s" "$@"\n' "$TOOLS/musl-cc.sh" "$ARCH" "$SYSROOT" "$RTLIB" > "$B/musl-cc"
-chmod +x "$B/musl-cc"
+sh "$TOOLS/meson-cross.sh" "$ARCH" "$SYSROOT" "$RTLIB" "$B"
 export CC="$B/musl-cc"
 export CFLAGS="-O2 -w"
 export AR=${AR:-llvm-ar} RANLIB="${AR:-llvm-ar} s"
@@ -32,7 +32,7 @@ HOST=$ARCH-linux-musl
 # ---------------------------------------------------------------- expat
 if [ ! -f "$SYSROOT/lib/libexpat.a" ]; then
     rm -rf "$B/expat" && mkdir -p "$B/expat" && cd "$B/expat"
-    "$TP/expat/configure" --host=$HOST --prefix="$SYSROOT" --disable-shared --enable-static \
+    "$TP/expat/configure" --host=$HOST --prefix="$SYSROOT" --enable-shared --enable-static \
         --without-docbook --without-examples --without-tests --without-xmlwf >/dev/null
     make -j8 >/dev/null && make install >/dev/null
 fi
@@ -40,7 +40,7 @@ fi
 # ---------------------------------------------------------------- freetype
 if [ ! -f "$SYSROOT/lib/libfreetype.a" ]; then
     rm -rf "$B/freetype" && mkdir -p "$B/freetype" && cd "$B/freetype"
-    "$TP/freetype/configure" --host=$HOST --prefix="$SYSROOT" --disable-shared --enable-static \
+    "$TP/freetype/configure" --host=$HOST --prefix="$SYSROOT" --enable-shared --enable-static \
         --with-zlib=no --with-bzip2=no --with-png=no --with-harfbuzz=no --with-brotli=no >/dev/null
     make -j8 >/dev/null && make install >/dev/null
 fi
@@ -49,13 +49,13 @@ fi
 if [ ! -f "$SYSROOT/lib/libfontconfig.a" ]; then
     rm -rf "$B/fontconfig" "$B/fc-dest" && mkdir -p "$B/fontconfig" && cd "$B/fontconfig"
     "$TP/fontconfig/configure" --host=$HOST --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
-        --disable-shared --enable-static --disable-docs --disable-nls --disable-cache-build \
+        --enable-shared --enable-static --disable-docs --disable-nls --disable-cache-build \
         --with-default-fonts=/usr/share/fonts --with-cache-dir=/var/cache/fontconfig \
         FREETYPE_CFLAGS="-I$SYSROOT/include/freetype2" FREETYPE_LIBS="-L$SYSROOT/lib -lfreetype" \
         EXPAT_CFLAGS="-I$SYSROOT/include" EXPAT_LIBS="-L$SYSROOT/lib -lexpat" >/dev/null
     make -j8 >/dev/null
     make install DESTDIR="$B/fc-dest" >/dev/null
-    cp "$B/fc-dest/usr/lib/libfontconfig.a" "$SYSROOT/lib/"
+    cp -P "$B/fc-dest/usr/lib/libfontconfig.a" "$B/fc-dest/usr/lib/libfontconfig.so"* "$SYSROOT/lib/"
     rm -rf "$SYSROOT/include/fontconfig" && cp -r "$B/fc-dest/usr/include/fontconfig" "$SYSROOT/include/"
     sed "s|^prefix=.*|prefix=$SYSROOT|" "$B/fc-dest/usr/lib/pkgconfig/fontconfig.pc" > "$SYSROOT/lib/pkgconfig/fontconfig.pc"
 fi

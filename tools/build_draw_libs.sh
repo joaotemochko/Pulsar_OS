@@ -32,8 +32,9 @@ mesonbuild() {  # <nome> <opcoes...>
 # ---------------------------------------------------------------- zlib
 if [ ! -f "$SYSROOT/lib/libz.a" ]; then
     rm -rf "${B:?}/zlib" && cp -r "$TP/zlib" "$B/zlib" && cd "$B/zlib"   # configure de zlib so roda na arvore
-    CC="$B/musl-cc" CFLAGS="-O2 -fPIC" AR="$LLVM_AR" CHOST=$HOST ./configure --static --prefix="$SYSROOT" >/dev/null
-    make -j8 libz.a >/dev/null && make install >/dev/null
+    CC="$B/musl-cc" CFLAGS="-O2 -fPIC" AR="$LLVM_AR" CHOST=$HOST LDSHARED="$B/musl-cc -shared -Wl,-soname,libz.so.1" \
+        ./configure --prefix="$SYSROOT" >/dev/null
+    make -j8 >/dev/null && make install >/dev/null
 fi
 
 # ---------------------------------------------------------------- libpng
@@ -41,7 +42,7 @@ if [ ! -f "$SYSROOT/lib/libpng16.a" ]; then
     rm -rf "${B:?}/libpng" && mkdir -p "$B/libpng" && cd "$B/libpng"
     CC="$B/musl-cc" CFLAGS="-O2 -fPIC" AR="$LLVM_AR" RANLIB="$LLVM_AR s" PKG_CONFIG="$B/pkg-config" \
     CPPFLAGS="-I$SYSROOT/include" LDFLAGS="-L$SYSROOT/lib" \
-        "$TP/libpng/configure" --host=$HOST --prefix="$SYSROOT" --disable-shared --enable-static \
+        "$TP/libpng/configure" --host=$HOST --prefix="$SYSROOT" --enable-shared --enable-static \
         --disable-tests --disable-tools >/dev/null
     make -j8 >/dev/null && make install >/dev/null
 fi

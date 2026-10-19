@@ -359,6 +359,8 @@ pub fn spawn(at: u32, path: &[u8], args: &Args) -> Res<usize> {
     let parent = process::current_leader();
     let cwd = parent.map_or(crate::ext2::ROOT_INO, crate::file::cwd_of);
     let asid = crate::loader::alloc_asid();
+    let mut cbuf = [0u8; crate::ext2::PATH_MAX];
+    let exe = canon_exe(path, &mut cbuf);
     let pid = process::create_ex(entry, sp, root, asid, basename(path), abi, &mut |slot| {
         if abi == process::ABI_LINUX {
             // a tabela de VMAs do slot novo esta vazia: registrar a pilha so
@@ -371,13 +373,25 @@ pub fn spawn(at: u32, path: &[u8], args: &Args) -> Res<usize> {
             crate::file::clone_table(p, slot);
             crate::file::exec_cleanup(slot);
         }
-        process::set_exe_path(slot, path);
+        process::set_exe_path(slot, exe);
         process::set_cmdline(slot, args.argv);
     });
     crate::file::flush_wakes();     // pontas de pipe fechadas pelo close-on-exec
     let Some(pid) = pid else { mmu::free_user_space(root); return Err(EAGAIN) };
     let _ = write!(Uart, "[exec] '{}' -> pid {}\n", core::str::from_utf8(path).unwrap_or("?"), pid);
     Ok(pid)
+}
+
+/// /proc/self/exe: o caminho canonico do executavel (links resolvidos),
+/// como no Linux. O Firefox acha os proprios arquivos por ele quando aberto
+/// pelo atalho /usr/bin/firefox -> /opt/firefox/firefox.
+/// (Calculado antes de criar o processo: le o disco, o que nao pode ser
+/// feito com a trava do escalonador.)
+fn canon_exe<'a>(path: &'a [u8], buf: &'a mut [u8; crate::ext2::PATH_MAX]) -> &'a [u8] {
+    match crate::file::realpath(path, buf) {
+        Ok(n) => &buf[..n],
+        Err(_) => path,
+    }
 }
 
 /// execve(): carrega `path` e troca a imagem do processo corrente. So
@@ -389,6 +403,8 @@ pub fn execve(frame: *mut crate::arch::Context, at: u32, path: &[u8], args: &Arg
     let loaded = load_image(file, path, args);
     frame_allocator::free_contig(buf, frames);
     let (root, entry, sp, abi, segs) = loaded?;
+    let mut cbuf = [0u8; crate::ext2::PATH_MAX];
+    let exe = canon_exe(path, &mut cbuf);
     let asid = crate::loader::alloc_asid();
     let ok = unsafe {
         process::exec_replace(frame, root, asid, entry, sp, abi, name, &mut |slot| {
@@ -396,7 +412,7 @@ pub fn execve(frame: *mut crate::arch::Context, at: u32, path: &[u8], args: &Arg
                 crate::vm::add_region(slot, STACK_TOP - STACK_SIZE, STACK_TOP, 3);
                 segs.register(slot);
             }
-            process::set_exe_path(slot, path);
+            process::set_exe_path(slot, exe);
             process::set_cmdline(slot, args.argv);
         })
     };
