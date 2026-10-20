@@ -20,7 +20,17 @@ typedef long               ssize_t;
 /* ---- syscall bruto: AArch64 svc #0 (num em x8) / RISC-V ecall (num em a7);
  *      argumentos em x0..x2 / a0..a2, retorno em x0 / a0 ---- */
 static inline u64 __syscall(u64 num, u64 a0, u64 a1, u64 a2) {
-#if defined(__riscv)
+#if defined(__x86_64__)
+    register u64 r_rax __asm__("rax") = num;
+    register u64 r_rdi __asm__("rdi") = a0;
+    register u64 r_rsi __asm__("rsi") = a1;
+    register u64 r_rdx __asm__("rdx") = a2;
+    __asm__ volatile("syscall"
+        : "+r"(r_rax)
+        : "r"(r_rdi), "r"(r_rsi), "r"(r_rdx)
+        : "rcx", "r11", "memory");
+    return r_rax;
+#elif defined(__riscv)
     register u64 r7 __asm__("a7") = num;
     register u64 r0 __asm__("a0") = a0;
     register u64 r1 __asm__("a1") = a1;
@@ -39,7 +49,18 @@ static inline u64 __syscall(u64 num, u64 a0, u64 a1, u64 a2) {
 
 /* quarto argumento em x3/a3 (syscalls de arquivo com dois caminhos etc.) */
 static inline u64 __syscall4(u64 num, u64 a0, u64 a1, u64 a2, u64 a3) {
-#if defined(__riscv)
+#if defined(__x86_64__)
+    register u64 r_rax __asm__("rax") = num;
+    register u64 r_rdi __asm__("rdi") = a0;
+    register u64 r_rsi __asm__("rsi") = a1;
+    register u64 r_rdx __asm__("rdx") = a2;
+    register u64 r_r10 __asm__("r10") = a3;
+    __asm__ volatile("syscall"
+        : "+r"(r_rax)
+        : "r"(r_rdi), "r"(r_rsi), "r"(r_rdx), "r"(r_r10)
+        : "rcx", "r11", "memory");
+    return r_rax;
+#elif defined(__riscv)
     register u64 r7 __asm__("a7") = num;
     register u64 r0 __asm__("a0") = a0;
     register u64 r1 __asm__("a1") = a1;
@@ -57,6 +78,8 @@ static inline u64 __syscall4(u64 num, u64 a0, u64 a1, u64 a2, u64 a3) {
     return x0;
 #endif
 }
+
+
 
 /* ---- numeros de syscall (espelham o kernel) ---- */
 enum {
@@ -78,6 +101,7 @@ enum {
     SYS_PREAD=71, SYS_PWRITE=72, SYS_FSINFO=73, SYS_SPAWN_EX=74, SYS_WAIT=75, SYS_PIPE=76, SYS_FCNTL=77,
     SYS_SOCKET=78, SYS_BIND=79, SYS_LISTEN=80, SYS_ACCEPT=81, SYS_CONNECT=82, SYS_SENDMSG=83,
     SYS_RECVMSG=84, SYS_PPOLL=85, SYS_MMAP_FD=86, SYS_MEMFD=87, SYS_SOCKETPAIR=88, SYS_SHUTDOWN=89,
+    SYS_FB_SET_MODE=90,
 };
 
 static inline void  sys_write(const char* s, u64 n){ __syscall(SYS_WRITE,(u64)s,n,0); }
@@ -213,7 +237,20 @@ static inline i64 sys_pipe(i32 fds[2], u32 flags){ return (i64)__syscall(SYS_PIP
 static inline i64 sys_fcntl(i64 fd, u64 cmd, u64 arg){ return (i64)__syscall(SYS_FCNTL,fd,cmd,arg); }
 /* ---- sockets, poll e memoria compartilhada (estruturas POSIX) ---- */
 static inline u64 __syscall6(u64 num, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
-#if defined(__riscv)
+#if defined(__x86_64__)
+    register u64 r_rax __asm__("rax") = num;
+    register u64 r_rdi __asm__("rdi") = a0;
+    register u64 r_rsi __asm__("rsi") = a1;
+    register u64 r_rdx __asm__("rdx") = a2;
+    register u64 r_r10 __asm__("r10") = a3;
+    register u64 r_r8  __asm__("r8")  = a4;
+    register u64 r_r9  __asm__("r9")  = a5;
+    __asm__ volatile("syscall"
+        : "+r"(r_rax)
+        : "r"(r_rdi), "r"(r_rsi), "r"(r_rdx), "r"(r_r10), "r"(r_r8), "r"(r_r9)
+        : "rcx", "r11", "memory");
+    return r_rax;
+#elif defined(__riscv)
     register u64 r7 __asm__("a7") = num;
     register u64 r0 __asm__("a0") = a0; register u64 r1 __asm__("a1") = a1;
     register u64 r2 __asm__("a2") = a2; register u64 r3 __asm__("a3") = a3;
@@ -229,6 +266,7 @@ static inline u64 __syscall6(u64 num, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u6
     return x0;
 #endif
 }
+
 #define P_AF_UNIX        1
 #define P_SOCK_STREAM    1
 #define P_SOCK_SEQPACKET 5
@@ -334,13 +372,14 @@ Theme theme_make(int dark, u32 accent);
 void  ui_button(Fb* fb, Rect r, const char* label, const Theme* th, int primary, int hover);
 
 /* ---- protocolo do WM ---- */
-#define SURF_W 1280
-#define SURF_H 816
+#define SURF_W 2560
+#define SURF_H 1440
+static inline i64 sys_fb_set_mode(u32 w, u32 h){ return (i64)__syscall(SYS_FB_SET_MODE,w,h,0); }
 #define SVC_FS 1
 #define SVC_WM 2
 #define SVC_WAYLAND 3   /* wlsrv: compatibilidade com programas graficos Linux */
 enum { FS_OP_COUNT=1, FS_OP_STAT=2, FS_OP_READ=3 };
-enum { WM_OP_HELLO=1, WM_OP_COMMIT=2, WM_OP_POLL=3, WM_OP_TITLE=4, WM_OP_BYE=5 };
+enum { WM_OP_HELLO=1, WM_OP_COMMIT=2, WM_OP_POLL=3, WM_OP_TITLE=4, WM_OP_BYE=5, WM_OP_SET_RES=6 };
 
 #define APP_MENU_SAVE   1
 #define APP_MENU_NEW    2

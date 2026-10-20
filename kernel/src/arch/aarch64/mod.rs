@@ -34,7 +34,7 @@ pub mod platform {
     pub const FB_PA: u64 = 0x4600_0000;
     /// ...e o endereco em que o userspace a enxerga (aqui VA == PA).
     pub const FB_UVA: u64 = 0x4600_0000;
-    pub const FB_REGION_BYTES: u64 = 64 * 1024 * 1024;
+    pub const FB_REGION_BYTES: u64 = 176 * 1024 * 1024;
 
     // MMIO (identity-mapped)
     pub const UART_BASE: u64 = 0x0900_0000;

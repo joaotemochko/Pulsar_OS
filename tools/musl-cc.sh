@@ -12,6 +12,7 @@
 #     e as rotinas do compilador (<rtlib>).
 # Assim os configure das bibliotecas (expat, freetype, fontconfig...) rodam
 # sem modificacao, cruzando para <arch>-linux-musl.
+[ -f "$HOME/pulsar-env.sh" ] && . "$HOME/pulsar-env.sh"
 ARCH=$1; SYSROOT=$2; RTLIB=$3; shift 3
 RES=$(clang -print-resource-dir)
 CC="clang --target=$ARCH-linux-musl -nostdinc -isystem $SYSROOT/include -isystem $RES/include"

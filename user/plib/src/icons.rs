@@ -296,6 +296,7 @@ pub enum Sym {
     Apps,
     Doc,
     Clock,
+    Display,
 }
 
 /// Desenha um simbolo de tamanho `s` (px) com canto superior em (x,y).
@@ -456,6 +457,11 @@ pub fn sym(fb: &Fb, sym: Sym, x: i32, y: i32, s: i32, c: u32) {
             fb.ring16(p.x(50), p.y(50), p.l(44), w, c, 255);
             fb.line16(p.x(50), p.y(50), p.x(50), p.y(24), w, c, 255);
             fb.line16(p.x(50), p.y(50), p.x(68), p.y(60), w, c, 255);
+        }
+        Sym::Display => {
+            fb.round_border(Rect::new(p.px(8), p.py(14), p.pl(84), p.pl(56)), s / 8, c, 255);
+            fb.line16(p.x(50), p.y(70), p.x(50), p.y(86), w, c, 255);
+            fb.line16(p.x(30), p.y(86), p.x(70), p.y(86), w, c, 255);
         }
     }
 }

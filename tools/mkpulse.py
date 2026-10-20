@@ -14,8 +14,9 @@ PULSE_MAGIC = 0x534C5550  # "PULS"
 PT_LOAD = 1
 PF_X, PF_W, PF_R = 1, 2, 4
 SEG_R, SEG_W, SEG_X = 1, 2, 4
-EM_AARCH64, EM_RISCV = 183, 243
-ARCH_IDS = {EM_AARCH64: (1, "AArch64"), EM_RISCV: (2, "RISC-V RV64")}
+EM_AARCH64, EM_RISCV, EM_X86_64 = 183, 243, 62
+ARCH_IDS = {EM_AARCH64: (1, "AArch64"), EM_RISCV: (2, "RISC-V RV64"), EM_X86_64: (3, "x86_64")}
+
 
 def main():
     if len(sys.argv) != 4:

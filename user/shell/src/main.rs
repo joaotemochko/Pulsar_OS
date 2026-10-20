@@ -188,9 +188,10 @@ enum Dialog { None, Poweroff }
 #[derive(Clone, Copy)]
 enum Hit { App(u8), File(u16), Cmd(Action, &'static str, Icon), Calc(i64) }
 
-const SEARCH_CMDS: [(&str, Action, Icon); 6] = [
+const SEARCH_CMDS: [(&str, Action, Icon); 7] = [
     ("Desligar", Action::Poweroff, Icon::Pulsar),
     ("Alternar modo escuro", Action::ToggleDark, Icon::Settings),
+    ("Resolução da tela", Action::Settings(2), Icon::Settings),
     ("Papel de parede", Action::Settings(1), Icon::Settings),
     ("Atalhos do teclado", Action::Help, Icon::Help),
     ("Mostrar área de trabalho", Action::ShowDesktop, Icon::Files),
@@ -252,6 +253,7 @@ struct Wm {
     dock_n: usize,
     dock_area: Rect,
     bounce: [u64; NAPPS],
+    launching: [u64; NAPPS],
     // dados do sistema
     files: [FileInfo; MAX_FILES],
     nfiles: usize,
@@ -309,6 +311,7 @@ impl Wm {
             panels: Panels::new(), phits: hits_array(), hover_hit: Rect::empty(), hover_light: None,
             dock_hover: -1, dock_rects: [(Rect::empty(), 0); 16], dock_n: 0, dock_area: Rect::empty(),
             bounce: [0; NAPPS],
+            launching: [0; NAPPS],
             files: [FileInfo::zero(); MAX_FILES], nfiles: 0,
             sys: SysInfo { arch_id: 0, ncpus: 0, mem_total_kb: 0, mem_free_kb: 0, fb_w: 0, fb_h: 0, uptime_ms: 0, arch_name: [0; 16] },
             loads: [0; 8], clock: Buf::new(), net_up: false,
@@ -329,15 +332,19 @@ impl Wm {
         set_focus(getpid());
         wait_service(SVC_FS);
 
-        let (cfg, n) = config::load(&mut self.cfg_raw);
+        let (mut cfg, n) = config::load(&mut self.cfg_raw);
+        if (self.w != 1280 || self.h != 800) && cfg.res_w == 1280 && cfg.res_h == 800 {
+            cfg.res_w = self.w as u16;
+            cfg.res_h = self.h as u16;
+        }
         self.cfg = cfg;
         self.cfg_len = n;
         if n == 0 { self.save_config(); }
-        self.apply_config(true);
         for k in 0..6 {
             let t = &mut thumbs()[k * (THUMB_W * THUMB_H) as usize..(k + 1) * (THUMB_W * THUMB_H) as usize];
             wallpaper::render_thumb(k as u8, t, THUMB_W, THUMB_H, self.w, self.h);
         }
+        self.apply_config(true);
         self.refresh_files();
         self.sys = sysinfo();
         self.update_clock();
@@ -385,7 +392,55 @@ impl Wm {
 
     // ============================================================ config
 
-    fn apply_config(&mut self, wallpaper_changed: bool) {
+    fn apply_resolution(&mut self, rw: u32, rh: u32) -> bool {
+        if !fb_set_mode(rw, rh) { return false; }
+        let (nw, nh) = fb_info();
+        self.w = nw as i32;
+        self.h = nh as i32;
+        self.scr = Fb::new(self.scr.base, self.w, self.h, self.w);
+        self.wall = Fb::new(WALL_ADDR as *mut u32, self.w, self.h, self.w);
+        self.blur = Fb::new(WALLBLUR_ADDR as *mut u32, self.w, self.h, self.w);
+        self.sys = sysinfo();
+        for k in 0..6 {
+            let t = &mut thumbs()[k * (THUMB_W * THUMB_H) as usize..(k + 1) * (THUMB_W * THUMB_H) as usize];
+            wallpaper::render_thumb(k as u8, t, THUMB_W, THUMB_H, self.w, self.h);
+        }
+        self.mx = self.mx.clamp(0, self.w - 1);
+        self.my = self.my.clamp(0, self.h - 1);
+        cursor_move(self.mx, self.my);
+        let wa = self.work_area();
+        for i in 0..MAXWIN {
+            if !self.wins[i].used { continue; }
+            let w = &mut self.wins[i];
+            w.restore.w = w.restore.w.min(wa.w);
+            w.restore.h = w.restore.h.min(wa.h);
+            w.restore.x = w.restore.x.min(wa.right() - w.restore.w).max(wa.x);
+            w.restore.y = w.restore.y.min(wa.bottom() - w.restore.h).max(wa.y);
+            w.r = match w.state {
+                WState::Normal => {
+                    let mut r = w.r;
+                    r.w = r.w.min(wa.w);
+                    r.h = r.h.min(wa.h);
+                    r.x = r.x.min(wa.right() - r.w).max(wa.x);
+                    r.y = r.y.min(wa.bottom() - r.h).max(wa.y);
+                    r
+                }
+                WState::Max => wa,
+                WState::SnapL => Rect::new(wa.x, wa.y, wa.w / 2, wa.h),
+                WState::SnapR => Rect::new(wa.x + wa.w / 2, wa.y, wa.w - wa.w / 2, wa.h),
+            };
+        }
+        true
+    }
+
+    fn apply_config(&mut self, mut wallpaper_changed: bool) {
+        if self.cfg.res_w >= 640 && self.cfg.res_h >= 480
+            && (self.cfg.res_w as i32 != self.w || self.cfg.res_h as i32 != self.h)
+        {
+            if self.apply_resolution(self.cfg.res_w as u32, self.cfg.res_h as u32) {
+                wallpaper_changed = true;
+            }
+        }
         self.th = Theme::new(self.cfg.dark, self.cfg.accent_rgb());
         self.kb.layout = self.cfg.layout;
         if wallpaper_changed {
@@ -787,6 +842,15 @@ impl Wm {
                         self.damage(self.dock_area);
                     }
                 }
+                WM_OP_SET_RES => {
+                    let (rw, rh) = ((m.data[0] as u16) & !1, (m.data[1] as u16) & !1);
+                    if (640..=2560).contains(&rw) && (480..=1440).contains(&rh) {
+                        self.do_action(Action::SetResolution(rw, rh));
+                        r.data[0] = 0;
+                    } else {
+                        r.data[0] = u64::MAX;
+                    }
+                }
                 _ => {}
             }
             reply(from, &r);
@@ -898,6 +962,10 @@ impl Wm {
         let mut w = Win::empty();
         w.used = true;
         w.app = app;
+        if (app as usize) < NAPPS {
+            self.launching[app as usize] = 0;
+            self.bounce[app as usize] = 0;
+        }
         w.internal = internal;
         w.r = Rect::new(x, y, ww.min(wa.w), wh.min(wa.h));
         w.restore = w.r;
@@ -929,13 +997,21 @@ impl Wm {
             }
             if catalog::is_linux(def) {
                 // programa Linux: a janela vem depois, pelo servico Wayland
+                let now = uptime_ms();
+                let aid = app as usize;
+                if aid < NAPPS && self.launching[aid] != 0 && now < self.launching[aid] + 15_000 {
+                    self.bounce[aid] = now + 1200;
+                    return;
+                }
+                if aid < NAPPS { self.launching[aid] = now; }
                 if spawn_path(def.bin) < 0 {
+                    if aid < NAPPS { self.launching[aid] = 0; }
                     let mut b = Buf::<72>::new();
                     b.s(def.bin).s(" não foi encontrado no disco.");
                     self.toast_b(def.icon, "Não foi possível abrir".as_bytes(), b.get());
                     return;
                 }
-                self.bounce[app as usize] = uptime_ms() + 800;
+                if aid < NAPPS { self.bounce[aid] = now + 1500; }
                 return;
             }
             let pid = spawn(def.bin);
@@ -953,6 +1029,7 @@ impl Wm {
     fn close_window(&mut self, i: usize) {
         let w = &mut self.wins[i];
         if !w.used { return; }
+        if (w.app as usize) < NAPPS { self.launching[w.app as usize] = 0; }
         if w.internal {
             let o = w.outer();
             w.used = false;
@@ -1058,7 +1135,7 @@ impl Wm {
             Action::About => self.launch(APP_ABOUT, -1),
             Action::Help => self.launch(APP_HELP, -1),
             Action::Settings(p) => {
-                self.panels.settings_page = p.min(4);
+                self.panels.settings_page = p.min(5);
                 self.launch(APP_SETTINGS, -1);
                 if let Some(i) = self.find_app_win(APP_SETTINGS) { self.damage(self.wins[i].outer()); }
             }
@@ -1137,6 +1214,14 @@ impl Wm {
             Action::ToggleMagnify => self.set_cfg(|c| c.dock_magnify = !c.dock_magnify),
             Action::SetAccent(k) => self.set_cfg(|c| c.accent = k),
             Action::SetWallpaper(k) => self.set_cfg(|c| c.wallpaper = k),
+            Action::SetResolution(rw, rh) => {
+                if self.w != rw as i32 || self.h != rh as i32 {
+                    self.set_cfg(|c| { c.res_w = rw; c.res_h = rh; });
+                    let mut b = Buf::<64>::new();
+                    b.s("Resolução aplicada: ").u(self.w as u64).s(" × ").u(self.h as u64).s(" px");
+                    self.toast_b(Icon::Settings, "Tela redimensionada".as_bytes(), b.get());
+                }
+            }
             Action::DockSize(k) => self.set_cfg(|c| c.dock_size = k),
             Action::DockLeft(v) => self.set_cfg(|c| c.dock_left = v),
             Action::SetClock24(v) => { self.set_cfg(|c| c.clock24 = v); self.update_clock(); }
@@ -1999,6 +2084,16 @@ impl Wm {
             }
         }
         // animacao do dock (pulo ao abrir um app)
+        for k in 0..NAPPS {
+            if self.launching[k] > 0 {
+                if now >= self.launching[k] + 15_000 {
+                    self.launching[k] = 0;
+                    self.bounce[k] = 0;
+                } else if self.bounce[k] <= now {
+                    self.bounce[k] = now + 700;
+                }
+            }
+        }
         if self.bounce.iter().any(|&b| b != 0) {
             for k in 0..self.dock_n {
                 let (r, app) = self.dock_rects[k];

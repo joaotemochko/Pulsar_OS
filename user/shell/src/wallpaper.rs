@@ -145,13 +145,13 @@ pub fn render_thumb(kind: u8, out: &mut [u32], tw: i32, th: i32, w: i32, h: i32)
 }
 
 const DS: i32 = 4; // fator de reducao do desfoque
-static mut SMALL: [u32; 400 * 300] = [0; 400 * 300];
-static mut TMP: [u32; 1024] = [0; 1024];
+static mut SMALL: [u32; 640 * 360] = [0; 640 * 360];
+static mut TMP: [u32; 2560] = [0; 2560];
 
 /// Gera `blur` = versao fortemente desfocada de `wall`: reduz 4x (media),
 /// desfoca a imagem pequena e amplia com interpolacao bilinear.
 pub fn make_blur(wall: &Fb, blur: &Fb) {
-    let (sw, sh) = ((wall.w / DS).min(400), (wall.h / DS).min(300));
+    let (sw, sh) = ((wall.w / DS).min(640), (wall.h / DS).min(360));
     let small = unsafe { &mut *(&raw mut SMALL) };
     for sy in 0..sh {
         for sx in 0..sw {

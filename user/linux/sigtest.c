@@ -53,6 +53,8 @@ static void on_segv_skip(int s, siginfo_t* si, void* ucv) {
     ucontext_t* uc = ucv;
 #if defined(__aarch64__)
     uc->uc_mcontext.pc += 4;                  /* pula a instrucao que falhou */
+#elif defined(__x86_64__)
+    uc->uc_mcontext.gregs[REG_RIP] += 4;
 #else
     uc->uc_mcontext.__gregs[0] += 4;
 #endif
@@ -144,6 +146,8 @@ int main(void) {
     volatile long marker = 1;
 #if defined(__aarch64__)
     __asm__ volatile("mov x9, #16\n str xzr, [x9]" ::: "x9", "memory");
+#elif defined(__x86_64__)
+    __asm__ volatile("xor %%rax, %%rax\n movb $0, 16(%%rax)" ::: "rax", "memory");
 #else
     __asm__ volatile(".option push\n.option norvc\nli t0, 16\nsd zero, 0(t0)\n.option pop" ::: "t0", "memory");
 #endif

@@ -35,7 +35,8 @@ import urllib.request
 MIRROR = "https://deb.debian.org/debian"
 SUITE = "trixie"
 ARCHS = {"aarch64": ("arm64", "aarch64-linux-gnu", "ld-linux-aarch64.so.1"),
-         "riscv64": ("riscv64", "riscv64-linux-gnu", "ld-linux-riscv64-lp64d.so.1")}
+         "riscv64": ("riscv64", "riscv64-linux-gnu", "ld-linux-riscv64-lp64d.so.1"),
+         "x86_64":  ("amd64",   "x86_64-linux-gnu",  "ld-linux-x86-64.so.2")}
 # pacotes que so fazem sentido numa distribuicao instalada (scripts, daemons,
 # gerenciador de pacotes): as dependencias deles nao entram no Pulsar
 SKIP = {"debconf", "debconf-2.0", "dpkg", "perl-base", "adduser", "passwd", "login",
@@ -229,6 +230,12 @@ def main():
     if os.path.lexists(link):
         os.remove(link)
     os.symlink(f"/usr/lib/{triplet}/{ldso}", link)
+    if arch == "x86_64":
+        os.makedirs(os.path.join(root, "lib64"), exist_ok=True)
+        link64 = os.path.join(root, "lib64", ldso)
+        if os.path.lexists(link64):
+            os.remove(link64)
+        os.symlink(f"/usr/lib/{triplet}/{ldso}", link64)
     # o que os scripts de instalacao do Debian gerariam (aqui eles nao rodam)
     pixbuf_cache(root, triplet)
     mime = os.path.join(root, "usr/share/mime")

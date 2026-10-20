@@ -27,8 +27,9 @@ PULSE_MAGIC = 0x534C5550
 PT_LOAD, PT_INTERP, PT_PHDR = 1, 3, 6
 PF_X, PF_W, PF_R = 1, 2, 4
 SEG_R, SEG_W, SEG_X = 1, 2, 4
-ARCH_IDS = {183: (1, "AArch64"), 243: (2, "RISC-V RV64")}
+ARCH_IDS = {183: (1, "AArch64"), 243: (2, "RISC-V RV64"), 62: (3, "x86_64")}
 ABI_LINUX = 1
+
 
 
 def convert(data):

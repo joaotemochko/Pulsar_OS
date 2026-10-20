@@ -68,13 +68,19 @@ fn reg_write(base: u64, off: u64, val: u32) {
 pub fn probe(device_id: u32) -> Option<u64> {
     for i in 0..VIRTIO_MMIO_SLOTS {
         let base = VIRTIO_MMIO_BASE + i * VIRTIO_MMIO_STRIDE;
-        if reg_read(base, MAGIC_VALUE) != MAGIC {
+        let magic = reg_read(base, MAGIC_VALUE);
+        if magic != MAGIC {
             continue;
         }
-        if reg_read(base, VERSION) != 2 {
+        let ver = reg_read(base, VERSION);
+        let id = reg_read(base, DEVICE_ID);
+        let mut u = crate::uart::Uart;
+        use core::fmt::Write;
+        let _ = write!(u, "[virtio] slot {} at 0x{:x}: ver={} id={}\n", i, base, ver, id);
+        if ver != 2 {
             continue; // legado (v1) nao suportado
         }
-        if reg_read(base, DEVICE_ID) == device_id {
+        if id == device_id {
             return Some(base);
         }
     }

@@ -113,7 +113,7 @@ pub fn kernel_root() -> u64 {
 }
 
 /// Mapeia uma pagina de 4KB com a trava MMU ja presa.
-unsafe fn map_page_locked(root_pa: u64, va: u64, pa: u64, flags: PageFlags) -> bool {
+pub unsafe fn map_page_locked(root_pa: u64, va: u64, pa: u64, flags: PageFlags) -> bool {
     let (i0, i1, i2, i3) = indices(va);
     unsafe {
         let Some(l1) = next_table(root_pa, i0) else { return false };
@@ -490,21 +490,18 @@ pub fn clone_user_space(src: u64) -> Option<u64> {
                         let pa = e3 & ADDR_MASK;
                         let flags = PageFlags { bits: e3 & !ADDR_MASK & !VALID_MASK };
                         let read_only = (e3 & (1 << 7)) != 0; // AP[2]=1: somente leitura
-                        let target = if frame_allocator::reserved(pa) || e3 & SW_SHARED != 0 {
-                            pa
+                        let (target, child_flags) = if frame_allocator::reserved(pa) || e3 & SW_SHARED != 0 {
+                            (pa, flags)
                         } else if read_only {
                             frame_allocator::inc_ref(pa);
-                            pa
+                            (pa, flags)
                         } else {
-                            let Some(f) = frame_allocator::alloc_frame() else {
-                                drop(_g);
-                                free_user_space(dst);
-                                return None;
-                            };
-                            core::ptr::copy_nonoverlapping(pa as *const u8, f as *mut u8, 4096);
-                            f
+                            // Copy-on-write: marca pai e filho como somente-leitura e incrementa ref
+                            (l3 as *mut u64).add(i3).write_volatile(e3 | (1 << 7));
+                            frame_allocator::inc_ref(pa);
+                            (pa, PageFlags { bits: flags.bits | (1 << 7) })
                         };
-                        if !map_page_locked(dst, va, target, flags) {
+                        if !map_page_locked(dst, va, target, child_flags) {
                             if !frame_allocator::reserved(pa) && e3 & SW_SHARED == 0 {
                                 frame_allocator::free_frame(target);
                             }
@@ -516,6 +513,7 @@ pub fn clone_user_space(src: u64) -> Option<u64> {
                 }
             }
         }
+        flush_tlb();
     }
     Some(dst)
 }

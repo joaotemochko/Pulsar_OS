@@ -190,6 +190,7 @@ const SYS_SPAWN_EX: u64 = 74;
 const SYS_WAIT: u64 = 75;
 const SYS_PIPE: u64 = 76;
 const SYS_FCNTL: u64 = 77;
+const SYS_FB_SET_MODE: u64 = 90;
 const SYS_DEBUG_OOPS: u64 = 99;
 
 const ERR: u64 = u64::MAX; // -1
@@ -261,6 +262,10 @@ pub fn dispatch(frame: *mut Context) {
             // so a trava da GPU: as outras CPUs seguem livres
             crate::gpu::present_rect((a1 >> 32) as u32, a1 as u32, (a2 >> 32) as u32, a2 as u32);
             unsafe { (*frame).set_ret(0) };
+        }
+        SYS_FB_SET_MODE => {
+            let ok = crate::gpu::set_resolution(a1 as u32, a2 as u32);
+            unsafe { (*frame).set_ret(if ok { 0 } else { ERR }) };
         }
         SYS_INPUT_POLL => {
             ctx.set_ret(match crate::input::poll_for(process::current_pid()) {
@@ -436,6 +441,7 @@ pub fn dispatch(frame: *mut Context) {
             None => ERR,
         }),
         SYS_POWEROFF => {
+            let _ = crate::file::sync();
             Uart.write_string("\n[kernel] desligando a pedido do usuario. Ate logo!\n");
             arch::poweroff();
         }

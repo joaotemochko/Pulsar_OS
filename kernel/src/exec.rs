@@ -25,6 +25,9 @@ pub const STACK_SIZE: u64 = 8 << 20;
 /// Base de carga de executaveis ELF independentes de posicao (static-pie).
 const PIE_BASE: u64 = 0x1000_0000;
 /// Faixa aceita para segmentos ELF (abaixo da regiao grafica).
+#[cfg(target_arch = "x86_64")]
+const USER_LO: u64 = 0x0100_0000;
+#[cfg(not(target_arch = "x86_64"))]
 const USER_LO: u64 = 0x1_0000;
 const USER_HI: u64 = 0x4000_0000;
 /// Maior executavel aceito.
@@ -36,12 +39,17 @@ const ARG_MAX: usize = 128 * 1024;
 const EM_MACHINE: u16 = 183;
 #[cfg(target_arch = "riscv64")]
 const EM_MACHINE: u16 = 243;
+#[cfg(target_arch = "x86_64")]
+const EM_MACHINE: u16 = 62;
 
 #[cfg(target_arch = "aarch64")]
 const HWCAP: u64 = 0b11; // FP | ASIMD
 #[cfg(target_arch = "riscv64")]
 const HWCAP: u64 = (1 << (b'i' - b'a')) | (1 << (b'm' - b'a')) | (1 << (b'a' - b'a'))
     | (1 << (b'f' - b'a')) | (1 << (b'd' - b'a')) | (1 << (b'c' - b'a'));
+#[cfg(target_arch = "x86_64")]
+const HWCAP: u64 = 0;
+
 
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;

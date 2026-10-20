@@ -34,11 +34,13 @@ pub fn init() {
     if extra > 0 {
         bm()[WORDS - 1] |= !0u64 << (64 - extra);
     }
-    // a regiao grafica fica dentro da RAM gerenciada: reserva os frames
-    let mut a = FB_PA;
-    while a < FB_PA + FB_REGION_BYTES {
-        set_used(((a - HEAP_START) / PAGE_SIZE) as usize);
-        a += PAGE_SIZE;
+    // a regiao grafica fica dentro da RAM gerenciada: reserva os frames (se cair no heap)
+    if FB_PA >= HEAP_START && FB_PA < HEAP_START + HEAP_SIZE {
+        let mut a = FB_PA;
+        while a < FB_PA + FB_REGION_BYTES && a < HEAP_START + HEAP_SIZE {
+            set_used(((a - HEAP_START) / PAGE_SIZE) as usize);
+            a += PAGE_SIZE;
+        }
     }
 }
 
@@ -77,6 +79,16 @@ pub fn inc_ref(addr: u64) {
     let _g = FRAME.guard();
     let r = &mut refs()[idx];
     *r = r.saturating_add(1);
+}
+
+/// Retorna a contagem de referencias de um frame (usado no copy-on-write).
+pub fn ref_count(addr: u64) -> usize {
+    if addr < HEAP_START || addr >= HEAP_START + HEAP_SIZE || reserved(addr) {
+        return 1;
+    }
+    let idx = ((addr - HEAP_START) / PAGE_SIZE) as usize;
+    let _g = FRAME.guard();
+    refs()[idx] as usize
 }
 
 /// Aloca um frame de 4KB. Retorna o endereco fisico.

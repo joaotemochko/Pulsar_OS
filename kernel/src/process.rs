@@ -357,6 +357,17 @@ pub fn current_name() -> &'static str {
     name_str(&procs()[s].name)
 }
 
+pub fn set_current_name(name: &[u8]) {
+    let _g = SCHED.guard();
+    let s = cur_slot();
+    if s != IDLE {
+        let p = &mut procs()[s];
+        p.name = [0u8; NAME_LEN];
+        let n = name.len().min(NAME_LEN - 1);
+        p.name[..n].copy_from_slice(&name[..n]);
+    }
+}
+
 fn name_str(n: &[u8; NAME_LEN]) -> &str {
     let len = n.iter().position(|&b| b == 0).unwrap_or(NAME_LEN);
     core::str::from_utf8(&n[..len]).unwrap_or("?")

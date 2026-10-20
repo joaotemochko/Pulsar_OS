@@ -120,7 +120,7 @@ unsafe fn next_table(table: u64, idx: usize) -> Option<u64> {
     }
 }
 
-unsafe fn map_page_locked(root: u64, va: u64, pa: u64, flags: PageFlags) -> bool {
+pub unsafe fn map_page_locked(root: u64, va: u64, pa: u64, flags: PageFlags) -> bool {
     unsafe {
         let Some(l1) = next_table(root, vpn(va, 2)) else { return false };
         let Some(l0) = next_table(l1, vpn(va, 1)) else { return false };
@@ -328,21 +328,18 @@ pub fn clone_user_space(src: u64) -> Option<u64> {
                     let pa = pte_pa(e0);
                     let flags = PageFlags { bits: e0 & 0x3FE };
                     let read_only = (e0 & W) == 0;
-                    let target = if frame_allocator::reserved(pa) || e0 & RSW_SHARED != 0 {
-                        pa
+                    let (target, child_flags) = if frame_allocator::reserved(pa) || e0 & RSW_SHARED != 0 {
+                        (pa, flags)
                     } else if read_only {
                         frame_allocator::inc_ref(pa);
-                        pa
+                        (pa, flags)
                     } else {
-                        let Some(f) = frame_allocator::alloc_frame() else {
-                            drop(_g);
-                            free_user_space(dst);
-                            return None;
-                        };
-                        core::ptr::copy_nonoverlapping(pa as *const u8, f as *mut u8, 4096);
-                        f
+                        // Copy-on-write: limpa bit W no pai e no filho e incrementa ref
+                        set_entry(l0, i0, e0 & !W);
+                        frame_allocator::inc_ref(pa);
+                        (pa, PageFlags { bits: flags.bits & !W })
                     };
-                    if !map_page_locked(dst, va, target, flags) {
+                    if !map_page_locked(dst, va, target, child_flags) {
                         if !frame_allocator::reserved(pa) && e0 & RSW_SHARED == 0 {
                             frame_allocator::free_frame(target);
                         }
@@ -353,6 +350,7 @@ pub fn clone_user_space(src: u64) -> Option<u64> {
                 }
             }
         }
+        flush_tlb();
     }
     Some(dst)
 }

@@ -174,8 +174,10 @@ pub fn write_file(idx: usize, src_pa: u64, size: u32) -> bool {
             Backend::Pfs => crate::pfs::write_file(idx, src_pa, size),
             Backend::Ext2 => {
                 let Some(ino) = legacy_ino(idx) else { return false };
-                crate::ext2::write(ino, 0, src_pa as *const u8, size as usize) == Ok(size as usize)
-                    && crate::ext2::truncate(ino, size as u64).is_ok()
+                let ok = crate::ext2::write(ino, 0, src_pa as *const u8, size as usize) == Ok(size as usize)
+                    && crate::ext2::truncate(ino, size as u64).is_ok();
+                let _ = crate::ext2::sync();
+                ok
             }
             Backend::None => false,
         }

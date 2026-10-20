@@ -13,6 +13,9 @@
 ARCH ?= aarch64
 SMP  ?= 4
 MEM  ?= 4G
+RES  ?= 1280x800
+XRES := $(word 1,$(subst x, ,$(RES)))
+YRES := $(word 2,$(subst x, ,$(RES)))
 
 # Rust baremetal precisa de build-std (nightly ou RUSTC_BOOTSTRAP=1).
 export RUSTC_BOOTSTRAP := 1
@@ -29,15 +32,25 @@ else ifeq ($(ARCH),riscv64)
   USER_TARGET  := riscv64gc-unknown-none-elf
   CLANG_TARGET := --target=riscv64-none-elf -march=rv64imafdc -mabi=lp64d -mcmodel=medany -mno-relax
   QEMU         := qemu-system-riscv64 -machine virt -accel tcg,thread=multi,tb-size=512
+else ifeq ($(ARCH),x86_64)
+  RUST_TARGET  := x86_64-unknown-none
+  USER_TARGET  := x86_64-unknown-none
+  CLANG_TARGET := --target=x86_64-none-elf
+  QEMU         := /home/ubuntu/qemu-local/bin/qemu-system-x86_64 -L /home/ubuntu/qemu-local/share/qemu -M microvm,graphics=on,isa-serial=on,rtc=on,pit=on -cpu max -accel tcg,thread=multi,tb-size=512
 else
-  $(error ARCH deve ser aarch64 ou riscv64)
+  $(error ARCH deve ser aarch64, riscv64 ou x86_64)
 endif
 
+
 BUILD  := build/$(ARCH)
-KERNEL := target/$(RUST_TARGET)/release/pulsar_kernel
+ifeq ($(ARCH),x86_64)
+  KERNEL := target/$(RUST_TARGET)/release/pulsar_kernel.elf32
+else
+  KERNEL := target/$(RUST_TARGET)/release/pulsar_kernel
+endif
 DISK   := $(BUILD)/disk.img
 
-CC      := clang $(CLANG_TARGET) -ffreestanding -nostdlib -fno-stack-protector -ffp-contract=off -Os -Wall
+CC      := clang $(CLANG_TARGET) -ffreestanding -nostdlib -fno-stack-protector -ffp-contract=off -O2 -Wall
 AR      := $(shell command -v llvm-ar-18 || command -v llvm-ar || echo ar)
 LD      := ld.lld
 
@@ -68,6 +81,9 @@ all: kernel user disk
 kernel:
 	@echo "== Kernel Pulsar ($(ARCH)) =="
 	@cargo build --release --target $(RUST_TARGET)
+ifeq ($(ARCH),x86_64)
+	@objcopy -O elf32-i386 target/$(RUST_TARGET)/release/pulsar_kernel $(KERNEL)
+endif
 
 user: user_rust user_c
 
@@ -357,13 +373,13 @@ LINUX_INC := $(addprefix -I$(SYSROOT)/include/,freetype2 harfbuzz cairo pango-1.
 $(BUILD)/linux/%: user/linux/%.c $(MUSL_LIBC) $(LINUX_GFX) $(GTK_LIBS) $(PULSAR_RT)
 	@mkdir -p $(BUILD)/linux
 	@$(LCC) $(LINUX_INC) -c $< -o $@.o
-	@$(LD) -static --eh-frame-hdr $(SYSROOT)/lib/crt1.o $(SYSROOT)/lib/crti.o $@.o $(GFX_LIBS) $(MUSL_LIBC) $(PULSAR_RT) $(BUILTINS) \
+	@$(LD) -static $(if $(filter x86_64,$(ARCH)),--image-base=0x10000000) --eh-frame-hdr $(SYSROOT)/lib/crt1.o $(SYSROOT)/lib/crti.o $@.o $(GFX_LIBS) $(MUSL_LIBC) $(PULSAR_RT) $(BUILTINS) \
 	    $(SYSROOT)/lib/crtn.o -o $@
 
 $(BUILD)/linux/%: user/linux/%.cpp $(MUSL_LIBC) $(LINUX_GFX) $(GTK_LIBS) $(PULSAR_RT)
 	@mkdir -p $(BUILD)/linux
 	@$(LCXX) $(LINUX_INC) -c $< -o $@.o
-	@$(LD) -static --eh-frame-hdr $(SYSROOT)/lib/crt1.o $(SYSROOT)/lib/crti.o $@.o $(GFX_LIBS) $(MUSL_LIBC) \
+	@$(LD) -static $(if $(filter x86_64,$(ARCH)),--image-base=0x10000000) --eh-frame-hdr $(SYSROOT)/lib/crt1.o $(SYSROOT)/lib/crti.o $@.o $(GFX_LIBS) $(MUSL_LIBC) \
 	    $(PULSAR_RT) $(BUILTINS) $(SYSROOT)/lib/crtn.o -o $@
 
 # programa GTK dinamico: driver do clang com --sysroot e o pkg-config do sysroot
@@ -434,9 +450,13 @@ ifeq ($(DISKFS),ext2)
 	@$(if $(FIREFOX_ENV),cp -a $(FIREFOX_ROOT)/. $(ROOTFS)/ && rm -f $(ROOTFS)/.pronto \
 	    $(ROOTFS)/usr/lib/firefox-esr/glxtest $(ROOTFS)/usr/lib/firefox-esr/vaapitest \
 	    $(ROOTFS)/usr/lib/firefox-esr/v4l2test $(ROOTFS)/usr/lib/firefox-esr/vulkantest \
-	    $(ROOTFS)/usr/lib/firefox-esr/crashreporter $(ROOTFS)/usr/lib/firefox-esr/pingsender)
+	    $(ROOTFS)/usr/lib/firefox-esr/crashreporter $(ROOTFS)/usr/lib/firefox-esr/pingsender \
+	    $(ROOTFS)/opt/firefox/glxtest $(ROOTFS)/opt/firefox/vaapitest \
+	    $(ROOTFS)/opt/firefox/v4l2test $(ROOTFS)/opt/firefox/vulkantest \
+	    $(ROOTFS)/opt/firefox/crashreporter $(ROOTFS)/opt/firefox/pingsender)
 	@find $(ROOTFS)/usr/share/fonts $(ROOTFS)/etc/fonts -exec touch -h -d "@1700000000" {} + 2>/dev/null || true
 	@fc-cache -s -f -y $(ROOTFS) 2>/dev/null || true
+	@ldconfig -r $(ROOTFS) 2>/dev/null || true
 	@find $(ROOTFS)/usr/share/fonts $(ROOTFS)/etc/fonts $(ROOTFS)/var/cache/fontconfig -exec touch -h -d "@1700000000" {} + 2>/dev/null || true
 	@rm -f $(DISK)
 	@$(MKE2FS) -q -F -t ext2 -b 4096 -O none,filetype,sparse_super,large_file \
@@ -447,7 +467,7 @@ endif
 
 QEMU_ARGS := -smp $(SMP) -m $(MEM) -serial mon:stdio \
 	-global virtio-mmio.force-legacy=false \
-	-device virtio-gpu-device -device virtio-keyboard-device -device virtio-tablet-device \
+	-device virtio-gpu-device,xres=$(XRES),yres=$(YRES) -device virtio-keyboard-device -device virtio-tablet-device \
 	-drive file=$(DISK),if=none,format=raw,cache=unsafe,aio=threads,id=hd0 -device virtio-blk-device,drive=hd0 \
 	-netdev user,id=n0 -device virtio-net-device,netdev=n0 \
 	-device virtio-rng-device

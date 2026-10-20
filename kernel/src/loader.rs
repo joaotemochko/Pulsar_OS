@@ -58,7 +58,11 @@ pub unsafe fn load_pulse(file: *const u8, file_len: usize) -> Option<Loaded> {
         let seg = unsafe { &*seg_table.add(i) };
         // Segmentos so na metade baixa de usuario, fora da regiao grafica.
         let end = seg.vaddr + seg.mem_size as u64;
-        if seg.vaddr < 0x0010_0000 || end > 0x4000_0000
+        #[cfg(target_arch = "x86_64")]
+        let min_vaddr = 0x0100_0000;
+        #[cfg(not(target_arch = "x86_64"))]
+        let min_vaddr = 0x0010_0000;
+        if seg.vaddr < min_vaddr || end > 0x4000_0000
             || seg.file_off as usize + seg.file_size as usize > file_len
             || seg.file_size > seg.mem_size
         {
@@ -125,6 +129,11 @@ pub fn sync_icache() {
         core::arch::asm!("fence.i", options(nostack, preserves_flags));
         crate::arch::sbi::remote_fence_i();
     }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("mfence", options(nostack, preserves_flags));
+    }
+
 }
 
 /// Le um arquivo do sistema de arquivos e o carrega como processo.

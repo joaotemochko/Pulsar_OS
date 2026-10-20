@@ -212,8 +212,44 @@ static void cmd_neofetch(void){
     }
 }
 
+static void cmd_resolucao(const char* a){
+    SysInfo si; sys_sysinfo(&si);
+    while(*a == ' ') a++;
+    if(!*a){
+        char b[COLS];
+        char* p = fmt_s(b, "Resolucao atual: ");
+        p = fmt_u(p, si.fb_w); p = fmt_s(p, "x"); fmt_u(p, si.fb_h);
+        out(b, 3);
+        out("Modos disponiveis: 1024x768  1280x720  1280x800  1366x768  1440x900", 0);
+        out("                   1600x900  1920x1080 1920x1200 2560x1440", 0);
+        out("Uso: resolucao <largura>x<altura>  (ex.: resolucao 1920x1080)", 1);
+        return;
+    }
+    u64 w = 0, h = 0;
+    while(*a >= '0' && *a <= '9') w = w * 10 + (u64)(*a++ - '0');
+    if(*a == 'x' || *a == 'X' || *a == ' ') a++;
+    while(*a == ' ') a++;
+    while(*a >= '0' && *a <= '9') h = h * 10 + (u64)(*a++ - '0');
+    if(w < 640 || h < 480 || w > SURF_W || h > SURF_H){
+        out("resolucao: modo invalido (limites: 640x480 ate 2560x1440)", 2);
+        return;
+    }
+    i64 wm = sys_lookup(SVC_WM);
+    if(wm >= 0){
+        Msg m = {WM_OP_SET_RES, {w, h, 0, 0, 0, 0}};
+        ipc_send((u64)wm, &m);
+    } else if(sys_fb_set_mode((u32)w, (u32)h) != 0){
+        out("resolucao: falha ao alterar modo de video", 2);
+        return;
+    }
+    char b[COLS];
+    char* p = fmt_s(b, "Resolucao alterada para ");
+    p = fmt_u(p, w); p = fmt_s(p, "x"); fmt_u(p, h);
+    out(b, 0);
+}
+
 static const char* CMDS[] = {"help", "clear", "echo", "ls", "cat", "ps", "kill", "open", "date",
-    "uptime", "free", "cpus", "uname", "neofetch", "history", "exit", "poweroff", 0};
+    "uptime", "free", "cpus", "uname", "neofetch", "resolucao", "res", "history", "exit", "poweroff", 0};
 
 /* ---- programas externos ---- */
 
@@ -281,11 +317,13 @@ static int run_external(const char* c){
                                 "XDG_RUNTIME_DIR=/run", "WAYLAND_DISPLAY=wayland-0",
                                 "XCOMPOSEFILE=/usr/share/pulsar/Compose",
                                 "GDK_BACKEND=wayland", "MOZ_ENABLE_WAYLAND=1", "NO_AT_BRIDGE=1",
-                                "GSETTINGS_BACKEND=memory", "MOZ_CRASHREPORTER_DISABLE=1",
-                                "MOZ_DISABLE_CONTENT_SANDBOX=1", "MOZ_DISABLE_GMP_SANDBOX=1",
-                                "MOZ_DISABLE_RDD_SANDBOX=1", "MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1",
-                                "LIBGL_ALWAYS_SOFTWARE=1", 0};
-    static u8 block[2048];
+                                "GSETTINGS_BACKEND=memory",
+                                "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/dbus-session",
+                                "AT_SPI_BUS_ADDRESS=unix:path=/run/null", "GTK_A11Y=none", "GTK_MODULES=",
+                                "MOZ_GFX_SPOOF_GL_RENDERER=llvmpipe", "MOZ_GFX_SPOOF_GL_VENDOR=Mesa", "MOZ_GFX_SPOOF_GL_VERSION=3.0",
+                                "MOZ_FORCE_DISABLE_E10S=1",
+                                "MOZ_CRASHREPORTER_DISABLE=1", "LIBGL_ALWAYS_SOFTWARE=1", 0};
+    static u8 block[4096];
     int envc = 0, n = 8;
     memcpy(block + n, argv, alen); n += alen;
     for(; env[envc]; envc++){ int l = strlen(env[envc]) + 1; memcpy(block + n, env[envc], l); n += l; }
@@ -314,7 +352,7 @@ static void run(void){
     if(word(c, "help")){
         out("Comandos disponiveis:", 3);
         out("  ls  cat <arq>  ps  kill <pid>  open <app>  date  uptime", 0);
-        out("  free  cpus  uname  neofetch  echo <txt>  history  clear  exit  poweroff", 0);
+        out("  free  cpus  uname  neofetch  resolucao [LxA]  echo <txt>  history  clear  exit  poweroff", 0);
         out("Apps: editor, calc, vela, netmon, sysmon, ball (ex.: open calc)", 0);
         out("Programas de /bin rodam pelo nome (ex.: posixtest, spawntest); ls /bin", 0);
         out("Setas: historico | Tab: completar | Ctrl+L: limpar", 0);
@@ -346,6 +384,7 @@ static void run(void){
     else if(word(c, "cpus")){ cmd_cpus(); }
     else if(word(c, "uname")){ cmd_uname(); }
     else if(word(c, "neofetch")){ cmd_neofetch(); }
+    else if(word(c, "resolucao") || word(c, "res")){ cmd_resolucao(arg1(c)); }
     else if(word(c, "history")){ for(int i = 0; i < nhist; i++) out(hist[i], 0); }
     else if(word(c, "exit")){ sys_exit(); }
     else if(word(c, "poweroff")){ sys_poweroff(); }

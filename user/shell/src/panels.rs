@@ -2,7 +2,7 @@
 //! Atalhos. Sao desenhadas direto no back buffer; cada desenho registra
 //! as areas clicaveis em `Hits`.
 use crate::catalog::*;
-use crate::config::{Config, DOCK_SIZES, WALLPAPERS};
+use crate::config::{Config, DOCK_SIZES, RESOLUTIONS, WALLPAPERS};
 use crate::ui::{self, Hits};
 use plib::icons::{self, Icon, Sym};
 use plib::*;
@@ -213,9 +213,10 @@ pub fn draw_files(c: &Ctx, r: Rect, st: &mut Panels, hits: &mut Hits) {
 
 // --------------------------------------------------------- Configuracoes
 
-const PAGES: [(&str, Sym, u32); 5] = [
+const PAGES: [(&str, Sym, u32); 6] = [
     ("Aparência", Sym::Sun, 0x0A84FF),
     ("Papel de Parede", Sym::Image, 0x30B0C7),
+    ("Tela e Resolução", Sym::Display, 0x5E5CE6),
     ("Dock e Barra de Menus", Sym::Dock, 0x636366),
     ("Teclado", Sym::Keyboard, 0x8E8E93),
     ("Sobre", Sym::Info, 0x8E8E93),
@@ -248,7 +249,7 @@ pub fn draw_settings(c: &Ctx, r: Rect, st: &Panels, hits: &mut Hits) {
     }
     let x = r.x + SIDEBAR_W + 24;
     let w = r.w - SIDEBAR_W - 48;
-    let page = PAGES[st.settings_page as usize % 5].0;
+    let page = PAGES[st.settings_page as usize % 6].0;
     c.scr.text(&FONT_TITLE, x, r.y + 14, page.as_bytes(), th.text);
     let mut y = r.y + 62;
     match st.settings_page {
@@ -318,6 +319,50 @@ pub fn draw_settings(c: &Ctx, r: Rect, st: &Panels, hits: &mut Hits) {
             }
         }
         2 => {
+            let cr = Rect::new(x, y, w, 100);
+            card(c, cr);
+            let mon = Rect::new(cr.x + 18, cr.y + 14, 104, 64);
+            blit_thumb(c, cfg.wallpaper as usize % 6, mon);
+            c.scr.round_border(mon, 8, th.text, 60);
+            c.scr.fill(Rect::new(mon.x + 44, mon.bottom(), 16, 8), th.text3);
+            c.scr.round_rect(Rect::new(mon.x + 30, mon.bottom() + 7, 44, 4), 2, th.text3);
+            let (cw, ch) = (c.sys.fb_w as u16, c.sys.fb_h as u16);
+            let desc = RESOLUTIONS.iter().find(|&&(rw, rh, _, _)| rw == cw && rh == ch)
+                .map(|&(_, _, _, d)| d).unwrap_or("Personalizada");
+            let mut cur_str = Buf::<64>::new();
+            cur_str.s("Tela VirtIO GPU · ").u(cw as u64).s(" × ").u(ch as u64).s(" (").s(desc).s(")");
+            c.scr.text(&FONT_UI_BOLD, mon.right() + 20, cr.y + 22, cur_str.get(), th.text);
+            c.scr.text(&FONT_SMALL, mon.right() + 20, cr.y + 46, "Escolha uma resolução abaixo para redimensionar".as_bytes(), th.text2);
+            c.scr.text(&FONT_SMALL, mon.right() + 20, cr.y + 64, "a tela ao vivo (salvo em pulsar.cfg).".as_bytes(), th.text2);
+
+            y += 114;
+            let cr = Rect::new(x, y, w, 272);
+            card(c, cr);
+            let cols = 3;
+            let gap = 12;
+            let tw = (cr.w - 32 - (cols - 1) * gap) / cols;
+            let th_tile = 72;
+            for (k, &(rw, rh, label, sub)) in RESOLUTIONS.iter().enumerate() {
+                let (col, row) = (k as i32 % cols, k as i32 / cols);
+                let t = Rect::new(cr.x + 16 + col * (tw + gap), cr.y + 14 + row * (th_tile + gap), tw, th_tile);
+                let active = cw == rw && ch == rh;
+                let hover = t.contains(c.mx, c.my);
+                if active {
+                    c.scr.round_rect_a(t, 8, th.accent, if th.dark { 45 } else { 28 });
+                    c.scr.round_border(t, 8, th.accent, 255);
+                    c.scr.round_border(t.inset(1), 7, th.accent, 180);
+                } else {
+                    c.scr.round_rect(t, 8, if hover { th.hover } else { th.ctrl_bg });
+                    c.scr.round_border(t, 8, th.ctrl_border, 255);
+                }
+                c.scr.text_center(&FONT_UI_BOLD, Rect::new(t.x, t.y + 14, t.w, 22),
+                    label.as_bytes(), if active { th.accent } else { th.text });
+                c.scr.text_center(&FONT_SMALL, Rect::new(t.x, t.y + 40, t.w, 18),
+                    sub.as_bytes(), th.text2);
+                hits.push(t, Action::SetResolution(rw, rh));
+            }
+        }
+        3 => {
             let cr = Rect::new(x, y, w, 4 * 50 + 4);
             card(c, cr);
             row_label(c, cr, cr.y + 18, "Tamanho", "");
@@ -349,7 +394,7 @@ pub fn draw_settings(c: &Ctx, r: Rect, st: &Panels, hits: &mut Hits) {
                 hits.push(t, *a);
             }
         }
-        3 => {
+        4 => {
             let cr = Rect::new(x, y, w, 60);
             card(c, cr);
             row_label(c, cr, cr.y + 30, "Layout do teclado", "");
@@ -442,7 +487,7 @@ pub fn draw_about(c: &Ctx, r: Rect, hits: &mut Hits) {
     hits.push(b1, Action::Launch(APP_MONITOR));
     let b2 = Rect::new(b1.right() + 10, b1.y, 140, 28);
     ui::button(c.scr, b2, "Configurações", th, true, b2.contains(c.mx, c.my));
-    hits.push(b2, Action::Settings(4));
+    hits.push(b2, Action::Settings(5));
 }
 
 // ---------------------------------------------------------------- Atalhos

@@ -18,6 +18,7 @@ use crate::frame_allocator;
 use crate::uart::Uart;
 use core::fmt::Write;
 
+pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
 pub const EIO: i64 = 5;
 pub const EEXIST: i64 = 17;
@@ -26,6 +27,7 @@ pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const EFBIG: i64 = 27;
 pub const ENOSPC: i64 = 28;
+pub const EMLINK: i64 = 31;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
@@ -41,6 +43,7 @@ pub const S_IFDIR: u16 = 0o040000;
 pub const S_IFLNK: u16 = 0o120000;
 
 // file_type das entradas de diretorio
+pub const FT_UNK: u8 = 0;
 pub const FT_REG: u8 = 1;
 pub const FT_DIR: u8 = 2;
 pub const FT_LNK: u8 = 7;
@@ -133,7 +136,12 @@ fn bdirty(b: u32) {
         if ss[i].valid && ss[i].blk == b {
             if !ss[i].dirty {
                 ss[i].dirty = true;
-                unsafe { DIRTY_COUNT += 1; }
+                unsafe {
+                    DIRTY_COUNT += 1;
+                    if DIRTY_COUNT >= 256 {
+                        flush_dirty();
+                    }
+                }
             }
             return;
         }
@@ -236,6 +244,10 @@ pub fn sync() -> bool {
         unsafe { SB_COUNTS = (f.free_blocks, f.free_inodes); }
     }
     flush_dirty() && ok
+}
+
+pub fn dirty_count() -> usize {
+    unsafe { DIRTY_COUNT }
 }
 
 fn cached(b: u32) -> bool {
@@ -1333,6 +1345,26 @@ pub fn release_inode(ino: u32) -> Res<()> {
     n.dtime = now();
     write_inode(ino, &n)?;
     free_inode(ino, dir)?;
+    Ok(())
+}
+
+/// link(2): cria um hard link novo (`new_path`) apontando para o inode de `old_path`.
+pub fn link(old_at: u32, old_path: &[u8], new_at: u32, new_path: &[u8], follow: bool) -> Res<()> {
+    let old_ino = resolve_at(old_at, old_path, follow)?;
+    let mut n = read_inode(old_ino)?;
+    if n.is_dir() { return Err(EPERM); }
+    let (ndir, nname) = parent_of(new_at, new_path)?;
+    if lookup(ndir, nname)?.is_some() { return Err(EEXIST); }
+    n.links = n.links.checked_add(1).ok_or(EMLINK)?;
+    n.ctime = now();
+    write_inode(old_ino, &n)?;
+    let ft = match n.kind() {
+        S_IFREG => FT_REG,
+        S_IFLNK => FT_LNK,
+        S_IFSOCK => FT_SOCK,
+        _ => FT_UNK,
+    };
+    dir_add(ndir, nname, old_ino, ft)?;
     Ok(())
 }
 

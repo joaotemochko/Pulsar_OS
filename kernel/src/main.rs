@@ -135,7 +135,15 @@ pub fn secondary_main(cpu: usize) -> ! {
 /// programa com argumentos, executado no boot com stdout/stderr no console
 /// serial. Linhas vazias e comecando com '#' sao ignoradas.
 fn autorun() {
-    let Ok((buf, frames, size)) = file::read_whole(ext2::ROOT_INO, b"/etc/autorun", 16 * 1024) else { return };
+    let mut u = uart::RawUart;
+    use core::fmt::Write;
+    let (buf, frames, size) = match file::read_whole(ext2::ROOT_INO, b"/etc/autorun", 16 * 1024) {
+        Ok(res) => res,
+        Err(e) => {
+            let _ = write!(u, "[autorun] read_whole(/etc/autorun) erro: {}\n", e);
+            return;
+        }
+    };
     let text = unsafe { core::slice::from_raw_parts(buf as *const u8, size as usize) };
     for line in text.split(|&c| c == b'\n') {
         let line = line.trim_ascii();
@@ -150,8 +158,10 @@ fn autorun() {
             argc += 1;
         }
         let prog = line.split(|&c| c == b' ').next().unwrap_or(b"");
-        let args = exec::Args { argv: &argv[..n], argc, envp: b"HOME=/home/user\0PATH=/bin\0XDG_RUNTIME_DIR=/run\0WAYLAND_DISPLAY=wayland-0\0XCOMPOSEFILE=/usr/share/pulsar/Compose\0LANG=C.UTF-8\0", envc: 6 };
-        let _ = exec::spawn(ext2::ROOT_INO, prog, &args);
+        let envp = b"HOME=/home/user\0PATH=/bin:/usr/bin\0USER=usuario\0LANG=C.UTF-8\0XDG_RUNTIME_DIR=/run\0WAYLAND_DISPLAY=wayland-0\0XCOMPOSEFILE=/usr/share/pulsar/Compose\0GDK_BACKEND=wayland\0MOZ_ENABLE_WAYLAND=1\0NO_AT_BRIDGE=1\0GSETTINGS_BACKEND=memory\0DBUS_SESSION_BUS_ADDRESS=unix:path=/run/dbus-session\0AT_SPI_BUS_ADDRESS=unix:path=/run/null\0GTK_A11Y=none\0GTK_MODULES=\0MOZ_GFX_SPOOF_GL_RENDERER=llvmpipe\0MOZ_GFX_SPOOF_GL_VENDOR=Mesa\0MOZ_GFX_SPOOF_GL_VERSION=3.0\0MOZ_FORCE_DISABLE_E10S=1\0MOZ_CRASHREPORTER_DISABLE=1\0LIBGL_ALWAYS_SOFTWARE=1\0";
+        let args = exec::Args { argv: &argv[..n], argc, envp, envc: 21 };
+        let res = exec::spawn(ext2::ROOT_INO, prog, &args);
+        let _ = write!(u, "[autorun] spawn '{}' resultado: {:?}\n", core::str::from_utf8(prog).unwrap_or("?"), res);
     }
     frame_allocator::free_contig(buf, frames);
 }

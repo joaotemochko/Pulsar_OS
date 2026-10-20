@@ -227,6 +227,8 @@ static const struct { const char* name; int type; u32 version; } GLOBALS[] = {
 };
 #define NGLOBALS (sizeof GLOBALS / sizeof GLOBALS[0])
 
+static u32 out_w, out_h;
+
 static void bind_global(u32 name, const char* iface, u32 version, u32 id) {
     if (name < 1 || name > NGLOBALS || strcmp(iface, GLOBALS[name - 1].name) != 0)
         protocol_error(1, 0, "global invalido");
@@ -241,6 +243,7 @@ static void bind_global(u32 name, const char* iface, u32 version, u32 id) {
         if (version >= 2) { e = ev_begin(id, 1); put_str("seat0"); ev_end(e); }
     } else if (o->type == T_OUTPUT) {
         SysInfo si; sys_sysinfo(&si);
+        out_w = si.fb_w; out_h = si.fb_h;
         Ev e = ev_begin(id, 0);
         put_u32(0); put_u32(0); put_u32(340); put_u32(215); put_u32(0);
         put_str("Pulsar"); put_str("Tela"); put_u32(0);
@@ -1141,6 +1144,20 @@ static void ptr_button(u32 now, u32 button, int pressed) {
 static void handle_wm(WmEvent e) {
     u32 now = (u32)sys_time_ms();
     if (e.close && top_level) { Ev v = ev_begin(top_level, 1); ev_end(v); }
+    if (e.changed && out_w) {
+        SysInfo si; sys_sysinfo(&si);
+        if (si.fb_w != out_w || si.fb_h != out_h) {
+            out_w = si.fb_w; out_h = si.fb_h;
+            for (int i = 0; i < MAXOBJ; i++) {
+                if (objs[i].type == T_OUTPUT) {
+                    Ev v = ev_begin(objs[i].id, 1);
+                    put_u32(3); put_u32(out_w); put_u32(out_h); put_u32(60000);
+                    ev_end(v);
+                    if (objs[i].version >= 2) { v = ev_begin(objs[i].id, 2); ev_end(v); }
+                }
+            }
+        }
+    }
     if (app.w != cfg_w || app.h != cfg_h) { cfg_w = app.w; cfg_h = app.h; send_configure(); }
     if (e.focused != win_focused) {
         win_focused = e.focused;
@@ -1203,7 +1220,7 @@ int main(void) {
     wd0 = wd1 = 0; wd2 = wd3 = -1;
     for (;;) {
         PPollFd pf = { CONN, P_POLLIN, 0 };
-        PTimespec ts = { 0, have_app ? 8000000 : 200000000 };
+        PTimespec ts = { 0, have_app ? 8000000 : 10000000 };
         sys_ppoll(&pf, 1, &ts);
         if (pf.revents & (P_POLLIN | P_POLLHUP | P_POLLERR)) {
             for (;;) {

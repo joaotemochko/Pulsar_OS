@@ -46,6 +46,17 @@ pub fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     ret
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!("syscall", inlateout("rax") num => ret, in("rdi") a0, in("rsi") a1, in("rdx") a2,
+             out("rcx") _, out("r11") _, options(nostack));
+    }
+    ret
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -67,6 +78,18 @@ pub fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     }
     ret
 }
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!("syscall", inlateout("rax") num => ret, in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3,
+             out("rcx") _, out("r11") _, options(nostack));
+    }
+    ret
+}
+
 
 #[inline]
 fn syscall2(num: u64, a0: u64, a1: u64) -> u64 { syscall3(num, a0, a1, 0) }
@@ -92,6 +115,10 @@ pub fn fb_present(r: Rect) {
     if r.is_empty() || r.x < 0 || r.y < 0 { return; }
     syscall2(6, ((r.x as u64) << 32) | r.y as u64, ((r.w as u64) << 32) | r.h as u64);
 }
+/// Altera a resolucao da tela (virtio-gpu scanout 0). Retorna true se aplicou.
+pub fn fb_set_mode(w: u32, h: u32) -> bool {
+    syscall2(90, w as u64, h as u64) == 0
+}
 pub fn fs_count() -> usize { syscall0(8) as usize }
 /// Preenche `buf` com a entrada `idx`: name[32] start u32 size u32 kind u32.
 pub fn fs_stat(idx: usize, buf: &mut [u8; 44]) -> i64 {
@@ -108,14 +135,17 @@ pub const APP_ENV: &[&str] = &[
     "HOME=/home/user", "PATH=/bin:/usr/bin", "USER=usuario", "LANG=C.UTF-8",
     "XDG_RUNTIME_DIR=/run", "WAYLAND_DISPLAY=wayland-0", "XCOMPOSEFILE=/usr/share/pulsar/Compose",
     "GDK_BACKEND=wayland", "MOZ_ENABLE_WAYLAND=1", "NO_AT_BRIDGE=1", "GSETTINGS_BACKEND=memory",
-    "MOZ_CRASHREPORTER_DISABLE=1", "MOZ_DISABLE_CONTENT_SANDBOX=1", "MOZ_DISABLE_GMP_SANDBOX=1",
-    "MOZ_DISABLE_RDD_SANDBOX=1", "MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1", "LIBGL_ALWAYS_SOFTWARE=1",
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/dbus-session",
+    "AT_SPI_BUS_ADDRESS=unix:path=/run/null", "GTK_A11Y=none", "GTK_MODULES=",
+    "MOZ_GFX_SPOOF_GL_RENDERER=llvmpipe", "MOZ_GFX_SPOOF_GL_VENDOR=Mesa", "MOZ_GFX_SPOOF_GL_VERSION=3.0",
+    "MOZ_FORCE_DISABLE_E10S=1",
+    "MOZ_CRASHREPORTER_DISABLE=1", "LIBGL_ALWAYS_SOFTWARE=1",
 ];
 
 /// Executa o programa do caminho absoluto `path` (ELF Linux ou .pulse), sem
 /// argumentos e com APP_ENV (SPAWN_EX). Ret pid ou <0.
 pub fn spawn_path(path: &str) -> i64 {
-    let mut b = [0u8; 1024];
+    let mut b = [0u8; 2048];
     let mut n = 8;
     let mut put = |s: &str| {
         if n + s.len() + 1 > b.len() { return false; }
@@ -576,14 +606,14 @@ pub fn utf8_encode(cp: u32, out: &mut [u8; 4]) -> usize {
 // Mesmo VA nas duas arquiteturas (ver kernel/src/fb.rs).
 
 pub const FB_UVA: u64 = 0x4600_0000;
-pub const WALL_ADDR: u64 = FB_UVA + 8 * 1024 * 1024;
-pub const WALLBLUR_ADDR: u64 = FB_UVA + 16 * 1024 * 1024;
-pub const SURF_ADDR: u64 = FB_UVA + 24 * 1024 * 1024;
-pub const SURF_SLOT_BYTES: u64 = 4 * 1024 * 1024;
+pub const WALL_ADDR: u64 = FB_UVA + 16 * 1024 * 1024;
+pub const WALLBLUR_ADDR: u64 = FB_UVA + 32 * 1024 * 1024;
+pub const SURF_ADDR: u64 = FB_UVA + 48 * 1024 * 1024;
+pub const SURF_SLOT_BYTES: u64 = 16 * 1024 * 1024;
 pub const SURF_SLOTS: usize = 8;
-/// Stride e altura maxima das superficies dos apps.
-pub const SURF_W: i32 = 1280;
-pub const SURF_H: i32 = 816;
+/// Stride e altura maxima das superficies dos apps (ate 2560x1440).
+pub const SURF_W: i32 = 2560;
+pub const SURF_H: i32 = 1440;
 
 /// Abre a tela (back buffer) — usado pelo compositor.
 pub fn screen_open() -> Fb {
@@ -616,6 +646,8 @@ pub const WM_OP_TITLE: u64 = 4;
 pub const KIND_LINUX: usize = 99;
 /// O app fecha a propria janela (vai terminar): sem aviso de encerramento.
 pub const WM_OP_BYE: u64 = 5;
+/// Altera a resolucao da tela pelo WM: data[0]=w, data[1]=h.
+pub const WM_OP_SET_RES: u64 = 6;
 
 /// data[2] opcional do COMMIT: retangulo alterado da superficie. Bit 63 =
 /// presente; x nos bits 48..62 (15 bits), y em 32..47, w em 16..31 e h em

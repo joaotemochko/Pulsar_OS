@@ -27,6 +27,7 @@ const VIRTIO_ID_GPU: u32 = 16;
 // Tipos de comando/resposta
 const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
+const CMD_RESOURCE_UNREF: u32 = 0x0102;
 const CMD_SET_SCANOUT: u32 = 0x0103;
 const CMD_RESOURCE_FLUSH: u32 = 0x0104;
 const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
@@ -92,6 +93,13 @@ struct ResourceCreate2D {
     format: u32,
     width: u32,
     height: u32,
+}
+
+#[repr(C)]
+struct ResourceUnref {
+    hdr: CtrlHdr,
+    resource_id: u32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -393,6 +401,85 @@ fn present_locked(gpu: &mut Gpu, x: u32, y: u32, rw: u32, rh: u32) {
         _pad: 0,
     };
     unsafe { do_cmd(gpu, &req, size_of::<CtrlHdr>() as u32) };
+}
+
+/// Altera dinamicamente a resolucao do scanout 0 no virtio-gpu.
+pub fn set_resolution(w: u32, h: u32) -> bool {
+    let w = w & !1;
+    let h = h & !1;
+    if w < 640 || h < 480 || w as u64 > crate::fb::SURF_W || h as u64 > crate::fb::SURF_H {
+        return false;
+    }
+    let fb_bytes = w as u64 * h as u64 * 4;
+    if fb_bytes > crate::fb::MAX_FB_BYTES {
+        return false;
+    }
+    let ok = with_gpu(|gpu| {
+        if gpu.width == w && gpu.height == h {
+            return true;
+        }
+        unsafe {
+            // 1) Desliga scanout 0 antes de destruir o recurso antigo
+            let req = SetScanout {
+                hdr: CtrlHdr::cmd(CMD_SET_SCANOUT),
+                r: Rect::default(),
+                scanout_id: 0,
+                resource_id: 0,
+            };
+            let _ = do_cmd(gpu, &req, size_of::<CtrlHdr>() as u32);
+
+            // 2) Destroi o recurso antigo
+            let req = ResourceUnref {
+                hdr: CtrlHdr::cmd(CMD_RESOURCE_UNREF),
+                resource_id: RESOURCE_ID,
+                _pad: 0,
+            };
+            let _ = do_cmd(gpu, &req, size_of::<CtrlHdr>() as u32);
+
+            // 3) Cria novo recurso 2D com a nova resolucao
+            let req = ResourceCreate2D {
+                hdr: CtrlHdr::cmd(CMD_RESOURCE_CREATE_2D),
+                resource_id: RESOURCE_ID,
+                format: FORMAT_B8G8R8X8_UNORM,
+                width: w,
+                height: h,
+            };
+            if do_cmd(gpu, &req, size_of::<CtrlHdr>() as u32) != RESP_OK_NODATA {
+                return false;
+            }
+
+            // 4) Associa o back buffer em RAM
+            let req = AttachBacking {
+                hdr: CtrlHdr::cmd(CMD_RESOURCE_ATTACH_BACKING),
+                resource_id: RESOURCE_ID,
+                nr_entries: 1,
+                addr: crate::fb::BACK_PA,
+                length: fb_bytes as u32,
+                _pad: 0,
+            };
+            if do_cmd(gpu, &req, size_of::<CtrlHdr>() as u32) != RESP_OK_NODATA {
+                return false;
+            }
+
+            // 5) Liga o novo recurso ao scanout 0 (o QEMU redimensiona a janela)
+            let req = SetScanout {
+                hdr: CtrlHdr::cmd(CMD_SET_SCANOUT),
+                r: Rect { x: 0, y: 0, width: w, height: h },
+                scanout_id: 0,
+                resource_id: RESOURCE_ID,
+            };
+            if do_cmd(gpu, &req, size_of::<CtrlHdr>() as u32) != RESP_OK_NODATA {
+                return false;
+            }
+        }
+        gpu.width = w;
+        gpu.height = h;
+        crate::fb::init(w, h);
+        let mut serial = Uart;
+        let _ = write!(serial, "[gpu] resolucao alterada para {}x{}\n", w, h);
+        true
+    }).unwrap_or(false);
+    ok
 }
 
 /// Apresenta a tela inteira (usado pelo splash do kernel).

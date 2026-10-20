@@ -107,6 +107,9 @@ fn after_close(ino: u32) {
             *s = 0;
         }
     }
+    if ext2::dirty_count() >= 64 {
+        ext2::sync();
+    }
 }
 
 // ------------------------------------------------------------ pipes
@@ -251,7 +254,9 @@ pub(crate) fn drop_ref(f: OpenFile) {
 /// Texto gerado na abertura (arquivos de /proc): somente leitura.
 /// Paginas do texto: /proc/self/maps de um programa grande (o Firefox tem
 /// centenas de bibliotecas) passa de 100 KB; a glibc acha a pilha nele.
-fn mem_pages(which: &str) -> usize { if which == "maps" { 64 } else { 4 } }
+fn mem_pages(which: &str) -> usize {
+    if which == "maps" { 64 } else if which == "sys_cpu_online" { 1 } else { 4 }
+}
 #[derive(Clone, Copy)]
 struct MemFile { buf: u64, len: u64, refs: u32, pages: u32 }
 static mut MEMS: [MemFile; 128] = [MemFile { buf: 0, len: 0, refs: 0, pages: 0 }; 128];
@@ -289,6 +294,7 @@ fn special(path: &[u8]) -> Option<Special> {
         b"/proc/meminfo" => Special::Proc("meminfo"),
         b"/proc/version" => Special::Proc("version"),
         b"/proc/mounts" => Special::Proc("mounts"),
+        b"/sys/devices/system/cpu/online" => Special::Proc("sys_cpu_online"),
         _ => match proc_self(path)? {
             b"mounts" => Special::Proc("mounts"),
             b"mountinfo" => Special::Proc("mountinfo"),
@@ -307,14 +313,26 @@ fn proc_text(which: &str, out: &mut [u8]) -> usize {
     use core::fmt::Write;
     let mut t = Text { buf: out, len: 0 };
     match which {
+        "sys_cpu_online" => {
+            let n = process::online_cpus();
+            if n > 1 {
+                let _ = write!(t, "0-{}\n", n - 1);
+            } else {
+                let _ = write!(t, "0\n");
+            }
+        }
         "cpuinfo" => {
-            for c in 0..process::online_cpus() {
+            let ncpus = process::online_cpus();
+            for c in 0..ncpus {
                 #[cfg(target_arch = "aarch64")]
                 let _ = write!(t, "processor\t: {}\nBogoMIPS\t: 125.00\nFeatures\t: fp asimd evtstrm cpuid\n\
                     CPU implementer\t: 0x41\nCPU architecture: 8\nCPU part\t: 0xd03\n\n", c);
                 #[cfg(target_arch = "riscv64")]
                 let _ = write!(t, "processor\t: {}\nhart\t\t: {}\nisa\t\t: rv64imafdc\nmmu\t\t: sv39\n\n", c, c);
+                #[cfg(target_arch = "x86_64")]
+                let _ = write!(t, "processor\t: {}\nvendor_id\t: GenuineIntel\nmodel name\t: Pulsar Virtual CPU\nmhz\t\t: 2000.000\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss syscall nx lm constant_tsc rep_good nopl cpuid pni pclmulqdq ssse3 cx16 sse4_1 sse4_2 x2apic popcnt aes xsave avx rdrand hypervisor\n\n", c);
             }
+
         }
         "meminfo" => {
             let total = crate::frame_allocator::total_count() * 4;
@@ -1014,6 +1032,20 @@ pub fn symlink(target: &[u8], at: u32, path: &[u8]) -> Res<u64> {
     Ok(0)
 }
 
+pub fn link(old_at: u32, old_path: &[u8], new_at: u32, new_path: &[u8], follow: bool) -> Res<u64> {
+    need_ext2()?;
+    let _g = FS.guard();
+    ext2::link(old_at, old_path, new_at, new_path, follow)?;
+    crate::fs::legacy_dirty();
+    Ok(0)
+}
+
+pub fn mknod_socket(at: u32, path: &[u8], perm: u16) -> Res<u64> {
+    need_ext2()?;
+    let _g = FS.guard();
+    ext2::mknod_socket(at, path, perm).map(|ino| ino as u64)
+}
+
 pub fn readlink(at: u32, path: &[u8], dst: u64, len: u64) -> Res<u64> {
     need_ext2()?;
     let mut exe = [0u8; 256];
@@ -1312,7 +1344,16 @@ fn unix_key(l: usize, a: &SockAddr, create: bool) -> Res<unix::Key> {
             if create {
                 return match ext2::mknod_socket(at, path, 0o755) {
                     Ok(ino) => { crate::fs::legacy_dirty(); Ok(unix::Key::Ino(ino)) }
-                    Err(ext2::EEXIST) => Err(EADDRINUSE),
+                    Err(ext2::EEXIST) => {
+                        let ino = ext2::resolve_at(at, path, true)?;
+                        if ext2::read_inode(ino)?.kind() == ext2::S_IFSOCK {
+                            let k = unix::Key::Ino(ino);
+                            if !unix::is_bound(&k) {
+                                return Ok(k);
+                            }
+                        }
+                        Err(EADDRINUSE)
+                    }
                     Err(e) => Err(e),
                 };
             }

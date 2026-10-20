@@ -14,6 +14,7 @@
 # Em tempo de execucao os caminhos sao os do Linux: /etc/fonts,
 # /usr/share/fonts e /var/cache/fontconfig.
 set -e
+[ -f "$HOME/pulsar-env.sh" ] && . "$HOME/pulsar-env.sh"
 ARCH=$1; SYSROOT=$(cd "$2" && pwd); RTLIB=$(cd "$(dirname "$3")" && pwd)/$(basename "$3"); B=$4; ROOT=$5
 TP=$(cd "$(dirname "$0")/../user/third_party" && pwd)
 TOOLS=$(cd "$(dirname "$0")" && pwd)

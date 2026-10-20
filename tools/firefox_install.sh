@@ -18,24 +18,32 @@ TOOLS=$(cd "$(dirname "$0")" && pwd)
 VER=153.5.0esr
 LANG_FF=pt-BR
 SHA_aarch64=520eba74f41692a856367130dfc1bee9bae64060609e864c6869b2513a6067e5
+SHA_x86_64=dcc1700081dde48a89c1ec1ca7c77b7db8d0f449cab5c3762a63a75f8e260deb
 
 rm -rf "$ROOT" && mkdir -p "$ROOT/usr/bin" "$ROOT/usr/share/pulsar/icons"
 case $ARCH in
-aarch64)
+aarch64|x86_64)
+    if [ "$ARCH" = "aarch64" ]; then
+        M_ARCH="linux-aarch64"
+        SHA=$SHA_aarch64
+    else
+        M_ARCH="linux-x86_64"
+        SHA=$SHA_x86_64
+    fi
     T=$CACHE/firefox-$VER-$ARCH-$LANG_FF.tar.xz
     mkdir -p "$CACHE"
     if [ ! -f "$T" ]; then
         curl -sfo "$T.part" \
-            "https://archive.mozilla.org/pub/firefox/releases/$VER/linux-aarch64/$LANG_FF/firefox-$VER.tar.xz"
+            "https://archive.mozilla.org/pub/firefox/releases/$VER/$M_ARCH/$LANG_FF/firefox-$VER.tar.xz"
         mv "$T.part" "$T"
     fi
-    echo "$SHA_aarch64  $T" | sha256sum -c --quiet || { echo "firefox: SHA-256 nao confere"; exit 1; }
+    echo "$SHA  $T" | sha256sum -c --quiet || { echo "firefox: SHA-256 nao confere"; exit 1; }
     mkdir -p "$ROOT/opt" && tar xJf "$T" -C "$ROOT/opt"
     rm -f "$ROOT/opt/firefox/glxtest" "$ROOT/opt/firefox/vaapitest" "$ROOT/opt/firefox/v4l2test" \
           "$ROOT/opt/firefox/vulkantest" "$ROOT/opt/firefox/crashreporter" "$ROOT/opt/firefox/pingsender" \
           "$ROOT/opt/firefox/updater"
     PREF_DIR="$ROOT/opt/firefox/defaults/pref"
-    ln -s /opt/firefox/firefox "$ROOT/usr/bin/firefox"
+    ln -s /opt/firefox/firefox-bin "$ROOT/usr/bin/firefox"
     ICON=$ROOT/opt/firefox/browser/chrome/icons/default/default128.png
     ;;
 riscv64)
@@ -57,6 +65,20 @@ esac
 mkdir -p "$PREF_DIR"
 cat > "$PREF_DIR/pulsar.js" << 'EOF'
 // Preferencias de desempenho do Firefox para o Pulsar OS
+pref("browser.tabs.remote.autostart", false);
+pref("javascript.options.parallel_parsing", true);
+pref("webgl.disabled", true);
+pref("gfx.canvas.accelerated", false);
+pref("layers.acceleration.force-enabled", false);
+pref("browser.cache.disk.enable", false);
+pref("browser.cache.memory.enable", true);
+pref("browser.cache.memory.capacity", 32768);
+pref("network.process.enabled", false);
+pref("dom.ipc.forkserver.enable", false);
+pref("media.rdd-process.enabled", false);
+pref("media.utility-process.enabled", false);
+pref("webgl.out-of-process", false);
+pref("layers.gpu-process.enabled", false);
 pref("fission.autostart", false);
 pref("dom.ipc.processCount", 1);
 pref("dom.ipc.processCount.webIsolated", 1);
@@ -65,7 +87,7 @@ pref("dom.ipc.processCount.privilegedabout", 1);
 pref("dom.ipc.processCount.privilegedmozilla", 1);
 pref("dom.ipc.processCount.file", 1);
 pref("dom.ipc.processPrelaunch.enabled", false);
-pref("gfx.webrender.all", true);
+pref("gfx.webrender.all", false);
 pref("gfx.webrender.software", true);
 pref("layers.acceleration.disabled", true);
 pref("media.hardware-video-decoding.enabled", false);
@@ -96,6 +118,73 @@ pref("network.http.speculative-parallel-limit", 0);
 pref("network.prefetch-next", false);
 pref("accessibility.force_disabled", 1);
 EOF
+
+# Tambem instala em browser/defaults/preferences (localizacao padrao do Gecko moderno)
+case $ARCH in
+aarch64|x86_64)
+    mkdir -p "$ROOT/opt/firefox/browser/defaults/preferences" "$ROOT/opt/firefox/distribution"
+    cp "$PREF_DIR/pulsar.js" "$ROOT/opt/firefox/browser/defaults/preferences/pulsar.js"
+    cat > "$ROOT/opt/firefox/distribution/policies.json" << 'EOF'
+{
+  "policies": {
+    "DisableAppUpdate": true,
+    "DisableTelemetry": true,
+    "DisableFeedbackCommands": true,
+    "DisableFirefoxStudies": true,
+    "DisablePocket": true,
+    "Preferences": {
+      "fission.autostart": false,
+      "browser.tabs.remote.autostart": false,
+      "dom.ipc.processCount": 1,
+      "dom.ipc.processCount.webIsolated": 1,
+      "network.process.enabled": false,
+      "media.rdd-process.enabled": false,
+      "media.utility-process.enabled": false,
+      "layers.gpu-process.enabled": false,
+      "webgl.out-of-process": false,
+      "javascript.options.parallel_parsing": true,
+      "gfx.webrender.all": false,
+      "gfx.webrender.software": true,
+      "accessibility.force_disabled": 1
+    }
+  }
+}
+EOF
+    ;;
+riscv64)
+    mkdir -p "$ROOT/usr/lib/firefox-esr/browser/defaults/preferences" \
+             "$ROOT/usr/lib/firefox-esr/distribution" \
+             "$ROOT/etc/firefox-esr/policies"
+    cp "$PREF_DIR/pulsar.js" "$ROOT/usr/lib/firefox-esr/browser/defaults/preferences/pulsar.js"
+    cat > "$ROOT/usr/lib/firefox-esr/distribution/policies.json" << 'EOF'
+{
+  "policies": {
+    "DisableAppUpdate": true,
+    "DisableTelemetry": true,
+    "DisableFeedbackCommands": true,
+    "DisableFirefoxStudies": true,
+    "DisablePocket": true,
+    "Preferences": {
+      "fission.autostart": false,
+      "browser.tabs.remote.autostart": false,
+      "dom.ipc.processCount": 1,
+      "dom.ipc.processCount.webIsolated": 1,
+      "network.process.enabled": false,
+      "media.rdd-process.enabled": false,
+      "media.utility-process.enabled": false,
+      "layers.gpu-process.enabled": false,
+      "webgl.out-of-process": false,
+      "javascript.options.parallel_parsing": true,
+      "gfx.webrender.all": false,
+      "gfx.webrender.software": true,
+      "accessibility.force_disabled": 1
+    }
+  }
+}
+EOF
+    cp "$ROOT/usr/lib/firefox-esr/distribution/policies.json" "$ROOT/etc/firefox-esr/policies/policies.json"
+    ;;
+esac
 
 python3 "$TOOLS/png2icn.py" "$ICON" "$ROOT/usr/share/pulsar/icons/firefox.icn"
 echo "[firefox] $ARCH: instalado em $ROOT"

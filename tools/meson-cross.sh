@@ -13,6 +13,7 @@
 # -lgcc_eh (vazia: o unwinder esta na libc++) e crtbegin/crtend (os do
 # compiler-rt; a musl roda os construtores por .init_array).
 set -e
+[ -f "$HOME/pulsar-env.sh" ] && . "$HOME/pulsar-env.sh"
 ARCH=$1; SYSROOT=$(cd "$2" && pwd); RTLIB=$(cd "$(dirname "$3")" && pwd)/$(basename "$3"); D=$4
 TOOLS=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$D"; D=$(cd "$D" && pwd)
@@ -65,6 +66,7 @@ buildtype = 'release'
 wrap_mode = 'nodownload'
 
 [properties]
+needs_exe_wrapper = true
 # respostas que o glib obteria rodando programas de teste (musl):
 have_c99_vsnprintf = true
 have_c99_snprintf = true

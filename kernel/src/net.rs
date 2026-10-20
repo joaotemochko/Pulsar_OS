@@ -142,23 +142,26 @@ fn arp(op: u16, target_mac: &[u8; 6], target_ip: &[u8; 4], dst: &[u8; 6]) {
     send_frame(dst, 0x0806, &a);
 }
 
-/// Resolve o MAC do gateway (bloqueia no maximo ~2 s, so no primeiro uso).
+static mut LAST_ARP_FAIL: u64 = 0;
+
+/// Resolve o MAC do gateway (rapido, com cache de falha para nao travar o sistema).
 pub fn resolve_gateway() -> Option<[u8; 6]> {
     if let Some(m) = unsafe { GW_MAC } { return Some(m); }
-    for _ in 0..4 {
-        arp(1, &[0; 6], &GW_IP, &[0xFF; 6]);
-        let t0 = crate::time::now_ms();
-        while crate::time::now_ms() - t0 < 500 {
-            poll();
-            if let Some(m) = unsafe { GW_MAC } {
-                let _ = write!(Uart, "[net] gateway {}.{}.{}.{} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-                    GW_IP[0], GW_IP[1], GW_IP[2], GW_IP[3], m[0], m[1], m[2], m[3], m[4], m[5]);
-                return Some(m);
-            }
-            core::hint::spin_loop();
+    let now = crate::time::now_ms();
+    if unsafe { now < LAST_ARP_FAIL + 5000 } { return None; }
+    arp(1, &[0; 6], &GW_IP, &[0xFF; 6]);
+    let t0 = crate::time::now_ms();
+    while crate::time::now_ms() - t0 < 50 {
+        poll();
+        if let Some(m) = unsafe { GW_MAC } {
+            let _ = write!(Uart, "[net] gateway {}.{}.{}.{} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                GW_IP[0], GW_IP[1], GW_IP[2], GW_IP[3], m[0], m[1], m[2], m[3], m[4], m[5]);
+            return Some(m);
         }
+        core::hint::spin_loop();
     }
-    let _ = write!(Uart, "[net] ARP do gateway sem resposta\n");
+    unsafe { LAST_ARP_FAIL = crate::time::now_ms(); }
+    let _ = write!(Uart, "[net] ARP do gateway sem resposta (em cache por 5s)\n");
     None
 }
 

@@ -241,6 +241,10 @@ fn find_listener(key: &Key) -> Option<usize> {
     listeners().iter().position(|l| l.used && l.key == *key)
 }
 
+pub fn is_bound(key: &Key) -> bool {
+    find_listener(key).is_some()
+}
+
 /// listen(): registra o endereco. EADDRINUSE se ja ha alguem nele.
 pub fn listen(key: Key, packet: bool) -> Result<usize, i64> {
     if find_listener(&key).is_some() { return Err(EADDRINUSE); }

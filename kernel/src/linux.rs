@@ -12,6 +12,7 @@
 //! sinal como status de wait().
 use crate::arch::{self, Context};
 use crate::file::{self, AT_FDCWD};
+use crate::frame_allocator;
 use crate::process;
 use crate::syscall::user_ok;
 use crate::uart::Uart;
@@ -139,6 +140,9 @@ fn open_flags(f: u64) -> Result<u32, i64> {
     let (dir, nofollow) = (0o40000u32, 0o100000u32);
     #[cfg(target_arch = "riscv64")]
     let (dir, nofollow) = (0o200000u32, 0o400000u32);
+    #[cfg(target_arch = "x86_64")]
+    let (dir, nofollow) = (0o200000u32, 0o400000u32);
+
     const O_PATH: u32 = 0o10000000;
     const O_TMPFILE_BIT: u32 = 0o20000000;
     if f & O_TMPFILE_BIT != 0 { return Err(EOPNOTSUPP); }
@@ -170,8 +174,61 @@ fn stat_at(dirfd: u64, path: u64, flags: u64) -> Result<file::Stat, i64> {
     }
 }
 
+fn put_stat(statbuf: u64, st: file::Stat) -> R {
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct StatX86 {
+            dev: u64,
+            ino: u64,
+            nlink: u64,
+            mode: u32,
+            uid: u32,
+            gid: u32,
+            _pad0: u32,
+            rdev: u64,
+            size: i64,
+            blksize: i64,
+            blocks: i64,
+            atime: i64,
+            atime_ns: u64,
+            mtime: i64,
+            mtime_ns: u64,
+            ctime: i64,
+            ctime_ns: u64,
+            _unused: [i64; 3],
+        }
+        let sx = StatX86 {
+            dev: st.dev,
+            ino: st.ino,
+            nlink: st.nlink as u64,
+            mode: st.mode,
+            uid: st.uid,
+            gid: st.gid,
+            _pad0: 0,
+            rdev: st.rdev,
+            size: st.size,
+            blksize: st.blksize as i64,
+            blocks: st.blocks,
+            atime: st.atime,
+            atime_ns: st.atime_ns,
+            mtime: st.mtime,
+            mtime_ns: st.mtime_ns,
+            ctime: st.ctime,
+            ctime_ns: st.ctime_ns,
+            _unused: [0; 3],
+        };
+        put(statbuf, sx)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        put(statbuf, st)
+    }
+}
+
 fn fstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> R {
-    put(statbuf, stat_at(dirfd, path, flags)?)
+    put_stat(statbuf, stat_at(dirfd, path, flags)?)
 }
 
 /// statx(dirfd, caminho, flags, mascara, buf): a glibc usa no RISC-V (e a
@@ -232,7 +289,15 @@ fn uname(buf: u64) -> R {
     let mut u = [0u8; 65 * 6];
     let fields: [&[u8]; 6] = [
         b"Linux", b"pulsar", b"6.1.0-pulsar", b"Pulsar OS (personalidade Linux)",
-        if cfg!(target_arch = "aarch64") { b"aarch64" } else { b"riscv64" }, b"(none)",
+        if cfg!(target_arch = "aarch64") {
+            b"aarch64"
+        } else if cfg!(target_arch = "x86_64") {
+            b"x86_64"
+        } else {
+            b"riscv64"
+        },
+        b"(none)",
+
     ];
     for (i, f) in fields.iter().enumerate() {
         u[i * 65..i * 65 + f.len()].copy_from_slice(f);
@@ -278,12 +343,348 @@ fn statfs(buf: u64) -> R {
 /// uid/gid dos processos da camada Linux (o usuario do Pulsar).
 pub const USER_ID: u32 = 1000;
 
+fn capget(hdrp: u64, datap: u64) -> R {
+    if hdrp != 0 {
+        ubuf(hdrp, 8, true)?;
+        put(hdrp, 0x20080522u32)?; // _LINUX_CAPABILITY_VERSION_3
+    }
+    if datap != 0 {
+        ubuf(datap, 24, true)?;
+        for i in 0..2 {
+            put(datap + (i * 12) as u64, [0xFFFF_FFFFu32, 0xFFFF_FFFFu32, 0u32])?;
+        }
+    }
+    Ok(0)
+}
+
+fn prctl(op: u64, a1: u64, _a2: u64, _a3: u64, _a4: u64) -> R {
+    match op {
+        15 => { // PR_SET_NAME
+            let mut name = [0u8; crate::ext2::PATH_MAX];
+            let s = cstr(a1, &mut name)?;
+            process::set_current_name(s);
+            Ok(0)
+        }
+        16 => { // PR_GET_NAME
+            ubuf(a1, 16, true)?;
+            let name = process::current_name();
+            let mut buf = [0u8; 16];
+            let n = name.len().min(15);
+            buf[..n].copy_from_slice(&name.as_bytes()[..n]);
+            unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), a1 as *mut u8, 16); }
+            Ok(0)
+        }
+        21 => Ok(0), // PR_GET_SECCOMP
+        22 => Ok(0), // PR_SET_SECCOMP
+        23 => { // PR_CAPBSET_READ
+            if a1 <= 40 { Ok(1) } else { Err(EINVAL) }
+        }
+        38 => Ok(0), // PR_SET_NO_NEW_PRIVS
+        39 => Ok(0), // PR_GET_NO_NEW_PRIVS
+        193 | 194 => Ok(1), // PR_SET_DUMPABLE / PR_GET_DUMPABLE
+        0x59616d61 => Ok(0), // PR_SET_PTRACER
+        _ => Ok(0),
+    }
+}
+
 // ------------------------------------------------------------ despacho
+
+#[cfg(target_arch = "x86_64")]
+fn x86_to_generic(nr: u64, frame: *mut Context) -> Option<u64> {
+    let ctx = unsafe { &mut *frame };
+    match nr {
+        158 => {
+            // arch_prctl(code, addr)
+            let code = ctx.arg(0);
+            let addr = ctx.arg(1);
+            match code {
+                0x1001 => { // ARCH_SET_GS
+                    unsafe {
+                        let lo = addr as u32;
+                        let hi = (addr >> 32) as u32;
+                        core::arch::asm!("wrmsr", in("ecx") 0xC0000101u32, in("eax") lo, in("edx") hi, options(nomem, nostack));
+                    }
+                    ctx.set_ret(0);
+                }
+                0x1002 => { // ARCH_SET_FS
+                    ctx.set_tls(addr);
+                    ctx.set_ret(0);
+                }
+                0x1003 => { // ARCH_GET_FS
+                    let _ = put(addr, ctx.fs_base);
+                    ctx.set_ret(0);
+                }
+                0x1004 => { // ARCH_GET_GS
+                    let lo: u32;
+                    let hi: u32;
+                    unsafe {
+                        core::arch::asm!("rdmsr", in("ecx") 0xC0000101u32, out("eax") lo, out("edx") hi, options(nomem, nostack));
+                    }
+                    let gs = ((hi as u64) << 32) | (lo as u64);
+                    let _ = put(addr, gs);
+                    ctx.set_ret(0);
+                }
+                _ => ctx.set_ret((-EINVAL) as u64),
+            }
+            None
+        }
+        2 => {
+            // open(path, flags, mode) -> openat(AT_FDCWD, path, flags, mode)
+            ctx.r10 = ctx.rdx;
+            ctx.rdx = ctx.rsi;
+            ctx.rsi = ctx.rdi;
+            ctx.rdi = AT_FDCWD as u64;
+            Some(56)
+        }
+        4 => {
+            // stat(path, statbuf) -> newfstatat(AT_FDCWD, path, statbuf, 0)
+            ctx.r10 = 0;
+            ctx.rdx = ctx.rsi;
+            ctx.rsi = ctx.rdi;
+            ctx.rdi = AT_FDCWD as u64;
+            Some(79)
+        }
+        6 => {
+            // lstat(path, statbuf) -> newfstatat(AT_FDCWD, path, statbuf, AT_SYMLINK_NOFOLLOW=0x100)
+            ctx.r10 = 0x100;
+            ctx.rdx = ctx.rsi;
+            ctx.rsi = ctx.rdi;
+            ctx.rdi = AT_FDCWD as u64;
+            Some(79)
+        }
+        21 => {
+            // access(path, mode) -> faccessat(AT_FDCWD, path, mode, 0)
+            ctx.r10 = 0;
+            ctx.rdx = ctx.rsi;
+            ctx.rsi = ctx.rdi;
+            ctx.rdi = AT_FDCWD as u64;
+            Some(48)
+        }
+        56 => {
+            // clone(flags, stack, ptid, ctid, tls) no x86_64
+            // generico: (flags, stack, ptid, tls, ctid)
+            let ctid = ctx.r10;
+            let tls = ctx.r8;
+            ctx.r10 = tls;
+            ctx.r8 = ctid;
+            Some(220)
+        }
+        57 => {
+            // fork() -> clone(SIGCHLD=17, 0, 0, 0, 0)
+            ctx.rdi = 17;
+            ctx.rsi = 0;
+            ctx.rdx = 0;
+            ctx.r10 = 0;
+            ctx.r8 = 0;
+            Some(220)
+        }
+        58 => {
+            // vfork() -> clone(CLONE_VFORK=0x4000 | CLONE_VM=0x100 | SIGCHLD=17, 0, 0, 0, 0)
+            ctx.rdi = 0x4111;
+            ctx.rsi = 0;
+            ctx.rdx = 0;
+            ctx.r10 = 0;
+            ctx.r8 = 0;
+            Some(220)
+        }
+        82 => {
+            // rename(old, new) -> renameat(AT_FDCWD, old, AT_FDCWD, new)
+            ctx.r10 = ctx.rsi;
+            ctx.rdx = AT_FDCWD as u64;
+            ctx.rsi = ctx.rdi;
+            ctx.rdi = AT_FDCWD as u64;
+            Some(38)
+        }
+        83 => {
+            // mkdir(path, mode) -> mkdirat(AT_FDCWD, path, mode)
+            ctx.rdx = ctx.rsi;
+            ctx.rsi = ctx.rdi;
+            ctx.rdi = AT_FDCWD as u64;
+            Some(34)
+        }
+        84 => {
+            // rmdir(path) -> unlinkat(AT_FDCWD, path, AT_REMOVEDIR=0x200)
+            ctx.rdx = 0x200;
+            ctx.rsi = ctx.rdi;
+            ctx.rdi = AT_FDCWD as u64;
+            Some(35)
+        }
+        86 => {
+            // link(old, new) -> linkat(AT_FDCWD, old, AT_FDCWD, new, 0)
+            ctx.r8 = 0;
+            ctx.r10 = ctx.rsi;
+            ctx.rdx = AT_FDCWD as u64;
+            ctx.rsi = ctx.rdi;
+            ctx.rdi = AT_FDCWD as u64;
+            Some(37)
+        }
+        87 => {
+            // unlink(path) -> unlinkat(AT_FDCWD, path, 0)
+            ctx.rdx = 0;
+            ctx.rsi = ctx.rdi;
+            ctx.rdi = AT_FDCWD as u64;
+            Some(35)
+        }
+        88 => {
+            // symlink(target, linkpath) -> symlinkat(target, AT_FDCWD, linkpath)
+            ctx.rdx = ctx.rsi;
+            ctx.rsi = AT_FDCWD as u64;
+            Some(36)
+        }
+        89 => {
+            // readlink(path, buf, bufsz) -> readlinkat(AT_FDCWD, path, buf, bufsz)
+            ctx.r10 = ctx.rdx;
+            ctx.rdx = ctx.rsi;
+            ctx.rsi = ctx.rdi;
+            ctx.rdi = AT_FDCWD as u64;
+            Some(78)
+        }
+        0 => Some(63),   // read
+        1 => Some(64),   // write
+        3 => Some(57),   // close
+        5 => Some(80),   // fstat
+        7 => Some(1007), // poll
+        8 => Some(62),   // lseek
+        9 => Some(222),  // mmap
+        10 => Some(226), // mprotect
+        11 => Some(215), // munmap
+        12 => Some(214), // brk
+        13 => Some(134), // rt_sigaction
+        14 => Some(135), // rt_sigprocmask
+        15 => Some(139), // rt_sigreturn
+        16 => Some(29),  // ioctl
+        17 => Some(67),  // pread64
+        18 => Some(68),  // pwrite64
+        19 => Some(65),  // readv
+        20 => Some(66),  // writev
+        22 => { ctx.rsi = 0; Some(59) } // pipe -> pipe2(fd, 0)
+        23 => Some(1023), // select
+        24 => Some(124), // sched_yield
+        25 => Some(216), // mremap
+        28 => Some(233), // madvise
+        32 => Some(23),  // dup
+        33 => Some(24),  // dup2
+        35 => Some(101), // nanosleep
+        38 => Some(103), // setitimer
+        39 => Some(172), // getpid
+        41 => Some(198), // socket
+        42 => Some(203), // connect
+        43 => Some(242), // accept
+        44 => Some(206), // sendto
+        45 => Some(207), // recvfrom
+        46 => Some(211), // sendmsg
+        47 => Some(212), // recvmsg
+        48 => Some(210), // shutdown
+        49 => Some(200), // bind
+        50 => Some(201), // listen
+        51 => Some(204), // getsockname
+        52 => Some(205), // getpeername
+        53 => Some(199), // socketpair
+        54 => Some(208), // setsockopt
+        55 => Some(209), // getsockopt
+        59 => Some(221), // execve
+        60 => Some(93),  // exit
+        61 => Some(260), // wait4
+        62 => Some(129), // kill
+        63 => Some(160), // uname
+        72 => Some(25),  // fcntl
+        73 => Some(32),  // flock
+        74 => Some(82),  // fsync
+        75 => Some(83),  // fdatasync
+        76 => Some(45),  // truncate
+        77 => Some(46),  // ftruncate
+        78 => Some(61),  // getdents
+        79 => Some(17),  // getcwd
+        80 => Some(49),  // chdir
+        95 => Some(166), // umask
+        96 => Some(169), // gettimeofday
+        97 => Some(163), // getrlimit
+        98 => Some(165), // getrusage
+        99 => Some(179), // sysinfo
+        102 => Some(174), // getuid
+        104 => Some(176), // getgid
+        105 => Some(146), // setuid
+        106 => Some(144), // setgid
+        107 => Some(175), // geteuid
+        108 => Some(177), // getegid
+        109 => Some(154), // setpgid
+        110 => Some(173), // getppid
+        111 => Some(173), // getpgrp
+        112 => Some(157), // setsid
+        118 => Some(148), // getresuid
+        120 => Some(150), // getresgid
+        121 => Some(155), // getpgid
+        124 => Some(158), // getsid
+        127 => Some(136), // rt_sigpending
+        130 => Some(133), // rt_sigsuspend
+        131 => Some(132), // sigaltstack
+        137 => Some(43),  // statfs
+        138 => Some(44),  // fstatfs
+        157 => Some(167), // prctl
+        160 => Some(164), // setrlimit
+        162 => Some(81),  // sync
+        186 => Some(178), // gettid
+        187 => Some(213), // readahead
+        200 => Some(130), // tkill
+        202 => Some(98),  // futex
+        203 => Some(122), // sched_setaffinity
+        204 => Some(123), // sched_getaffinity
+        217 => Some(61),  // getdents64
+        218 => Some(96),  // set_tid_address
+        221 => Some(223), // fadvise64
+        228 => Some(113), // clock_gettime
+        229 => Some(114), // clock_getres
+        230 => Some(115), // clock_nanosleep
+        231 => Some(94),  // exit_group
+        232 => Some(22),  // epoll_wait -> epoll_pwait
+        233 => Some(21),  // epoll_ctl
+        234 => Some(131), // tgkill
+        247 => Some(95),  // waitid
+        257 => Some(56),  // openat
+        258 => Some(34),  // mkdirat
+        260 => Some(54),  // fchownat
+        262 => Some(79),  // newfstatat
+        263 => Some(35),  // unlinkat
+        264 => Some(38),  // renameat
+        265 => Some(37),  // linkat
+        266 => Some(36),  // symlinkat
+        267 => Some(78),  // readlinkat
+        268 => Some(53),  // fchmodat
+        269 => Some(48),  // faccessat
+        270 => Some(72),  // pselect6
+        271 => Some(73),  // ppoll
+        273 => Some(99),  // set_robust_list
+        274 => { ctx.set_ret(0); return None; } // get_robust_list
+        280 => Some(88),  // utimensat
+        281 => Some(22),  // epoll_pwait
+        284 => { ctx.rsi = 0; Some(19) } // eventfd
+        285 => Some(47),  // fallocate
+        288 => Some(242), // accept4
+        290 => Some(19),  // eventfd2
+        291 => Some(20),  // epoll_create1
+        292 => Some(24),  // dup3
+        293 => Some(59),  // pipe2
+        295 => Some(69),  // preadv
+        296 => Some(70),  // pwritev
+        302 => Some(261), // prlimit64
+        318 => Some(278), // getrandom
+        319 => Some(279), // memfd_create
+        332 => Some(291), // statx
+        334 => { ctx.set_ret((-ENOSYS) as u64); return None; } // rseq (unsupported)
+        other => Some(other),
+    }
+}
 
 pub fn dispatch(frame: *mut Context) {
     let nr = unsafe { (*frame).syscall_num() };
+    #[cfg(target_arch = "x86_64")]
+    let nr = match x86_to_generic(nr, frame) {
+        Some(g_nr) => g_nr,
+        None => return,
+    };
     dispatch_nr(frame, nr);
 }
+
 
 /// Atende a syscall `nr` (numeracao do Linux) com os argumentos do frame.
 /// Tambem usada pela ABI nativa do Pulsar para os servicos que as duas
@@ -360,7 +761,7 @@ pub fn dispatch_nr(frame: *mut Context, nr: u64) {
             }
         }
         220 if a[0] & 0x10000 == 0 => return fork(frame, a),  // clone sem CLONE_THREAD
-        73 | 72 | 22 | 441 => return wait_ready(frame, nr, a), // ppoll, pselect6, epoll_pwait(2)
+        73 | 72 | 22 | 441 | 1007 | 1023 => return wait_ready(frame, nr, a), // ppoll, pselect6, epoll_pwait(2), poll, select
         221 => {                                        // execve(path, argv, envp)
             match execve(frame, a) {
                 Ok(()) => {}                            // frame ja e o da imagem nova
@@ -419,17 +820,39 @@ fn fork(frame: *mut Context, a: [u64; 6]) {
         if unsafe { process::fork(frame, None, stack, tls, clear) }.is_none() { ctx.set_ret((-EAGAIN) as u64); }
         return;
     }
-    let Some((_, root, _)) = process::current_space() else { ctx.set_ret((-EINVAL) as u64); return };
+    let Some((_, root, asid)) = process::current_space() else { ctx.set_ret((-EINVAL) as u64); return };
     let Some(new) = arch::mmu::clone_user_space(root) else { ctx.set_ret((-ENOMEM) as u64); return };
-    let asid = crate::loader::alloc_asid();
-    match unsafe { process::fork(frame, Some((new, asid)), stack, tls, clear) } {
+    arch::mmu::flush_asid(asid);
+    let child_asid = crate::loader::alloc_asid();
+    match unsafe { process::fork(frame, Some((new, child_asid)), stack, tls, clear) } {
         Some(pid) => {
-            if flags & CLONE_PARENT_SETTID != 0 {
-                unsafe { core::ptr::write_volatile(ptid as *mut u32, pid as u32) };
+            if flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
+                if user_ok(ptid, 4, true) {
+                    if let Some(pa) = arch::mmu::translate_user(root, ptid, true) {
+                        unsafe { core::ptr::write_volatile(pa as *mut u32, pid as u32) };
+                    }
+                }
             }
-            if flags & CLONE_CHILD_SETTID != 0 {
-                if let Some(pa) = arch::mmu::translate_user(new, ctid, true) {
-                    unsafe { core::ptr::write_volatile(pa as *mut u32, pid as u32) };
+            if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
+                let page = ctid & !4095;
+                if let Some(pa) = arch::mmu::translate_user(new, page, false) {
+                    let frame_pa = pa & !0xFFF;
+                    if frame_allocator::ref_count(frame_pa) > 1 {
+                        if let Some(new_f) = frame_allocator::alloc_frame() {
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(frame_pa as *const u8, new_f as *mut u8, 4096);
+                                if arch::mmu::map_page_in(new, page, new_f, arch::mmu::PageFlags::user_data()) {
+                                    frame_allocator::free_frame(frame_pa);
+                                    core::ptr::write_volatile((new_f + (ctid & 0xFFF)) as *mut u32, pid as u32);
+                                } else {
+                                    frame_allocator::free_frame(new_f);
+                                }
+                            }
+                        }
+                    } else {
+                        arch::mmu::protect_range(new, page, page + 4096, arch::mmu::PageFlags::user_data());
+                        unsafe { core::ptr::write_volatile((frame_pa + (ctid & 0xFFF)) as *mut u32, pid as u32) };
+                    }
                 }
             }
             ctx.set_ret(pid as u64);
@@ -543,7 +966,9 @@ fn kill(frame: *mut Context, nr: u64, a: [u64; 6]) {
 fn context_sp(f: &Context) -> u64 {
     #[cfg(target_arch = "aarch64")] { f.sp_el0 }
     #[cfg(target_arch = "riscv64")] { f.x[2] }
+    #[cfg(target_arch = "x86_64")] { f.rsp }
 }
+
 
 fn call(frame: *mut Context, nr: u64, a: [u64; 6]) -> R {
     let mut p1 = [0u8; crate::ext2::PATH_MAX];
@@ -563,7 +988,7 @@ fn call(frame: *mut Context, nr: u64, a: [u64; 6]) -> R {
         69 => rw_vec(a[0], a[1], a[2], false, Some(a[3])), // preadv
         70 => rw_vec(a[0], a[1], a[2], true, Some(a[3])),  // pwritev
         62 => file::lseek(a[0], a[1] as i64, a[2]),
-        80 => put(a[1], file::fstat(a[0])?),
+        80 => put_stat(a[1], file::fstat(a[0])?),
         79 => fstatat(a[0], a[1], a[2], a[3]),          // newfstatat
         291 => statx(a[0], a[1], a[2], a[4]),            // statx (a glibc usa no RISC-V)
         #[cfg(target_arch = "riscv64")]
@@ -591,7 +1016,24 @@ fn call(frame: *mut Context, nr: u64, a: [u64; 6]) -> R {
             ubuf(a[2], a[3], true)?;
             file::readlink(at_dir(a[0])?, path, a[2], a[3])
         }
-        37 => Err(EPERM),                               // linkat: sem hard links ainda
+        33 => {                                         // mknodat(dirfd, path, mode, dev)
+            let path = cstr(a[1], &mut p1)?;
+            let mode = a[2] as u16;
+            if (mode & 0o170000) == crate::ext2::S_IFSOCK {
+                file::mknod_socket(at_dir(a[0])?, path, mode & 0o7777).map(|_| 0)
+            } else {
+                file::open(at_dir(a[0])?, path, file::O_CREAT | file::O_EXCL | file::O_WRONLY, mode & 0o7777)
+                    .map(|fd| { let _ = file::close(fd); 0 })
+            }
+        }
+        37 => {                                         // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+            let mut p2 = [0u8; crate::ext2::PATH_MAX];
+            let old = cstr(a[1], &mut p1)?;
+            let new = cstr(a[3], &mut p2)?;
+            let follow = a[4] & 0x400 != 0;             // AT_SYMLINK_FOLLOW
+            file::link(at_dir(a[0])?, old, at_dir(a[2])?, new, follow)
+        }
+        39 | 40 | 41 | 51 => Ok(0),                     // umount2 / mount / pivot_root / chroot
         48 | 439 => {                                   // faccessat / faccessat2
             let path = cstr(a[1], &mut p1)?;
             let follow = !(nr == 439 && a[3] & AT_SYMLINK_NOFOLLOW != 0);
@@ -738,8 +1180,14 @@ fn call(frame: *mut Context, nr: u64, a: [u64; 6]) -> R {
             for p in [a[0], a[1], a[2]] { put(p, USER_ID)?; }
             Ok(0)
         }
+        143 | 144 | 145 | 146 | 147 | 149 | 151 | 152 => Ok(0), // setregid/setgid/setreuid/setuid/setresuid/setresgid/setfsuid/setfsgid
+        90 => capget(a[0], a[1]),
+        91 => Ok(0),                                    // capset
+        97 => Ok(0),                                    // unshare (isolamento do Firefox)
+        268 => Ok(0),                                   // setns
+        277 => Ok(0),                                   // seccomp
         154 | 155 | 157 => Ok(process::current_ids().1 as u64), // setpgid/getpgid/setsid
-        167 => Ok(0),                                   // prctl
+        167 => prctl(a[0], a[1], a[2], a[3], a[4]),
         213 => Ok(0),                                   // readahead: so uma dica
         141 => Ok(20),                                  // getpriority: nice 0 (o kernel devolve 20 - nice)
         140 => Ok(0),                                   // setpriority: aceito, sem efeito
@@ -842,7 +1290,15 @@ fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         2 => file::set_cloexec(fd, arg & 1 != 0),       // F_SETFD
         3 => Ok((file::get_flags(fd)? & (file::O_ACCMODE | file::O_APPEND | file::O_NONBLOCK)) as u64), // F_GETFL
         4 => file::set_flags(fd, arg as u32),           // F_SETFL
-        5 | 6 | 7 | 36 | 37 | 38 => Ok(0),              // travas de registro: sempre concedidas
+        5 | 12 | 36 => {
+            // F_GETLK / F_GETLK64 / F_OFD_GETLK: se passar ponteiro para struct flock,
+            // define l_type = F_UNLCK (2) indicando que nao ha trava conflitante
+            if arg != 0 {
+                let _ = put(arg, 2u16);
+            }
+            Ok(0)
+        }
+        6 | 7 | 13 | 14 | 37 | 38 => Ok(0), // F_SETLK/F_SETLKW/F_SETLK64/F_SETLKW64: sempre concedidas
         // F_ADD_SEALS/F_GET_SEALS: memfd aceita os selos (defesa extra do
         // Firefox; aqui nao sao impostos, como num memfd sem MFD_ALLOW_SEALING
         // que nao reclamasse). Outros descritores: EINVAL, como no Linux.
@@ -1073,6 +1529,24 @@ fn wait_ready(frame: *mut Context, nr: u64, a: [u64; 6]) {
     let tick = |ns: u64| ((ns as u128 * arch::timer_freq() as u128) / 1_000_000_000) as u64;
     // prazo pedido (u64::MAX = sem prazo)
     let timeout_ns: Result<Option<u64>, i64> = match nr {
+        1007 => {
+            let ms = a[2] as i32;
+            Ok(if ms < 0 { None } else { Some(ms as u64 * 1_000_000) })
+        }
+        1023 => {
+            if a[4] == 0 { Ok(None) } else {
+                match get::<[i64; 2]>(a[4]) {
+                    Ok(tv) => {
+                        if tv[0] < 0 || tv[1] < 0 || tv[1] >= 1_000_000 {
+                            Err(EINVAL)
+                        } else {
+                            Ok(Some((tv[0] as u64) * 1_000_000_000 + (tv[1] as u64) * 1_000))
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
         73 => if a[2] == 0 { Ok(None) } else { get::<Timespec>(a[2]).and_then(ns_of).map(Some) },
         72 => if a[4] == 0 { Ok(None) } else { get::<Timespec>(a[4]).and_then(ns_of).map(Some) },
         22 => Ok(if (a[3] as i32) < 0 { None } else { Some(a[3] as u32 as u64 * 1_000_000) }),
@@ -1082,8 +1556,8 @@ fn wait_ready(frame: *mut Context, nr: u64, a: [u64; 6]) {
     let now = arch::now();
     let deadline = process::io_deadline(match timeout_ns { None => u64::MAX, Some(ns) => now + tick(ns).max(1) });
     let scan = match nr {
-        73 => scan_poll(a[0], a[1]),
-        72 => scan_select(a[0], a[1], a[2], a[3]),
+        73 | 1007 => scan_poll(a[0], a[1]),
+        72 | 1023 => scan_select(a[0], a[1], a[2], a[3]),
         _ => {
             if a[2] == 0 || a[2] > 1024 { Err(EINVAL) }
             else { ubuf(a[1], a[2] * 16, true).and_then(|_| file::epoll_scan(a[0], a[1], a[2] as usize)) }
@@ -1094,7 +1568,7 @@ fn wait_ready(frame: *mut Context, nr: u64, a: [u64; 6]) {
         Ok((n, _, _, _)) if n > 0 => { process::io_deadline_clear(); ctx.set_ret(n as u64); }
         Ok(_) if deadline != u64::MAX && arch::now() >= deadline => {
             process::io_deadline_clear();
-            if nr == 72 { let _ = clear_sets(a[0], a[1], a[2], a[3]); }
+            if nr == 72 || nr == 1023 { let _ = clear_sets(a[0], a[1], a[2], a[3]); }
             ctx.set_ret(0);
         }
         Ok((_, net, mask, seen)) => {

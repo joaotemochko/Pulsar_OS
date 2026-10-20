@@ -407,7 +407,25 @@ pub fn fault(addr: u64, access: Access) -> bool {
         if !ok { return false; }
         let flags = PageFlags::user_prot(v.prot);
         if mmu::is_mapped(root, page) {
-            // outra thread chegou antes: so garante as permissoes
+            if access == Access::Write && (v.prot & PROT_WRITE != 0) {
+                if let Some(pa) = mmu::translate_user(root, page, false) {
+                    let frame_pa = pa & !0xFFF;
+                    if frame_allocator::ref_count(frame_pa) > 1 {
+                        let Some(new_f) = frame_allocator::alloc_frame() else { return false };
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(frame_pa as *const u8, new_f as *mut u8, 4096);
+                            if !mmu::map_page_in(root, page, new_f, flags) {
+                                frame_allocator::free_frame(new_f);
+                                return false;
+                            }
+                            frame_allocator::free_frame(frame_pa);
+                        }
+                        mmu::flush_range(asid, page, page + 4096);
+                        return true;
+                    }
+                }
+            }
+            // Se ref_count == 1 ou outra thread chegou antes: so garante as permissoes
             if mmu::protect_range(root, page, page + 4096, flags) > 0 {
                 mmu::flush_range(asid, page, page + 4096);
             }

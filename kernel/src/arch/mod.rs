@@ -23,6 +23,11 @@ mod imp;
 #[path = "riscv64/mod.rs"]
 mod imp;
 
+#[cfg(target_arch = "x86_64")]
+#[path = "x86_64/mod.rs"]
+mod imp;
+
+
 pub use imp::*;
 
 /// Topo da pilha de kernel da CPU `cpu` (pilhas estaticas por CPU).

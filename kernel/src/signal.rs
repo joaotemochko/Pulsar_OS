@@ -139,6 +139,13 @@ static SIGPAGE: SigPage = SigPage({
     c[1] = 0x0000_0073; // ecall
     c
 });
+#[cfg(target_arch = "x86_64")]
+static SIGPAGE: SigPage = SigPage({
+    let mut c = [0u32; 1024];
+    c[0] = 0x0000_0FB8; // mov $15, %eax (b8 0f 00 00 00)
+    c[1] = 0x9005_0F00; // syscall (0f 05) + nop (90)
+    c
+});
 
 /// Mapeia a pagina de retorno no espaco `root` (processos Linux).
 pub fn map_sigpage(root: u64) {
@@ -155,8 +162,11 @@ const UC_MCTX: u64 = 176;
 const MCTX_SIZE: u64 = 288 + 4096;
 #[cfg(target_arch = "riscv64")]
 const MCTX_SIZE: u64 = 256 + 528;
+#[cfg(target_arch = "x86_64")]
+const MCTX_SIZE: u64 = 200 + 528;
 /// rt_sigframe (+ registro de quadro fp/lr no aarch64), multiplo de 16.
 const FRAME_SIZE: u64 = (SI_SIZE + UC_MCTX + MCTX_SIZE + 16 + 15) & !15;
+
 
 #[cfg(target_arch = "aarch64")]
 const FPSIMD_MAGIC: u32 = 0x4650_8001;
@@ -195,6 +205,36 @@ unsafe fn save_mcontext(mc: u64, f: &Context, fp: &FpState, fault: u64) {
             for i in 0..32 { w64(r + i as u64 * 8, fp.f[i]); }
             w32(r + 256, fp.fcsr as u32);
         }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let gregs = mc;
+            w64(gregs + 0 * 8, f.r8);
+            w64(gregs + 1 * 8, f.r9);
+            w64(gregs + 2 * 8, f.r10);
+            w64(gregs + 3 * 8, f.r11);
+            w64(gregs + 4 * 8, f.r12);
+            w64(gregs + 5 * 8, f.r13);
+            w64(gregs + 6 * 8, f.r14);
+            w64(gregs + 7 * 8, f.r15);
+            w64(gregs + 8 * 8, f.rdi);
+            w64(gregs + 9 * 8, f.rsi);
+            w64(gregs + 10 * 8, f.rbp);
+            w64(gregs + 11 * 8, f.rbx);
+            w64(gregs + 12 * 8, f.rdx);
+            w64(gregs + 13 * 8, f.rax);
+            w64(gregs + 14 * 8, f.rcx);
+            w64(gregs + 15 * 8, f.rsp);
+            w64(gregs + 16 * 8, f.rip);
+            w64(gregs + 17 * 8, f.rflags);
+            w64(gregs + 18 * 8, f.cs);
+            w64(gregs + 19 * 8, f.err_code);
+            w64(gregs + 20 * 8, f.vector);
+            w64(gregs + 22 * 8, fault);
+            let fpptr = mc + 23 * 8;
+            let fpbuf = (fpptr + 16) & !15;
+            w64(fpptr, fpbuf);
+            core::ptr::copy_nonoverlapping(fp.buf.as_ptr(), fpbuf as *mut u8, 512);
+        }
     }
 }
 
@@ -223,6 +263,33 @@ unsafe fn load_mcontext(mc: u64, f: &mut Context, fp: &mut FpState) {
             for i in 0..32 { fp.f[i] = r64(r + i as u64 * 8); }
             fp.fcsr = r32(r + 256) as u64;
         }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let gregs = mc;
+            f.r8  = r64(gregs + 0 * 8);
+            f.r9  = r64(gregs + 1 * 8);
+            f.r10 = r64(gregs + 2 * 8);
+            f.r11 = r64(gregs + 3 * 8);
+            f.r12 = r64(gregs + 4 * 8);
+            f.r13 = r64(gregs + 5 * 8);
+            f.r14 = r64(gregs + 6 * 8);
+            f.r15 = r64(gregs + 7 * 8);
+            f.rdi = r64(gregs + 8 * 8);
+            f.rsi = r64(gregs + 9 * 8);
+            f.rbp = r64(gregs + 10 * 8);
+            f.rbx = r64(gregs + 11 * 8);
+            f.rdx = r64(gregs + 12 * 8);
+            f.rax = r64(gregs + 13 * 8);
+            f.rcx = r64(gregs + 14 * 8);
+            f.rsp = r64(gregs + 15 * 8);
+            f.rip = r64(gregs + 16 * 8);
+            f.rflags = (r64(gregs + 17 * 8) & 0xCD5) | 0x202;
+            let fpptr = r64(mc + 23 * 8);
+            if fpptr != 0 {
+                core::ptr::copy_nonoverlapping(fpptr as *const u8, fp.buf.as_mut_ptr(), 512);
+            }
+        }
+
     }
 }
 
@@ -299,6 +366,7 @@ pub fn deliver(frame: *mut Context) {
 fn context_sp(f: &Context) -> u64 {
     #[cfg(target_arch = "aarch64")] { f.sp_el0 }
     #[cfg(target_arch = "riscv64")] { f.x[2] }
+    #[cfg(target_arch = "x86_64")] { f.rsp }
 }
 
 unsafe fn build_frame(frame: *mut Context, sig: u32, act: &Action, old_mask: u64,
@@ -328,7 +396,7 @@ unsafe fn build_frame(frame: *mut Context, sig: u32, act: &Action, old_mask: u64
         w64(uc + UC_SIGMASK, old_mask);
         save_mcontext(uc + UC_MCTX, f, &fp, info.1);
     }
-    let restorer = if cfg!(target_arch = "aarch64") && act.flags & SA_RESTORER != 0 { act.restorer } else { SIGPAGE_VA };
+    let restorer = if (cfg!(target_arch = "aarch64") || cfg!(target_arch = "x86_64")) && act.flags & SA_RESTORER != 0 { act.restorer } else { SIGPAGE_VA };
     #[cfg(target_arch = "aarch64")]
     {
         // registro de quadro (fp, lr) para quem percorre a pilha
@@ -352,6 +420,17 @@ unsafe fn build_frame(frame: *mut Context, sig: u32, act: &Action, old_mask: u64
         f.x[11] = si;
         f.x[12] = uc;
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let ret_sp = base - 8;
+        unsafe { w64(ret_sp, restorer); }
+        f.rsp = ret_sp;
+        f.rip = act.handler;
+        f.rdi = sig as u64;
+        f.rsi = si;
+        f.rdx = uc;
+    }
+
     let _ = SA_SIGINFO; // x1/x2 vao sempre; tratadores simples os ignoram
     true
 }

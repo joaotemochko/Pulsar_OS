@@ -46,3 +46,7 @@ cld __multc3(ld a, ld b, ld c, ld d) {
     __imag__ z = im;
     return z;
 }
+
+cld __mulxc3(ld a, ld b, ld c, ld d) {
+    return __multc3(a, b, c, d);
+}

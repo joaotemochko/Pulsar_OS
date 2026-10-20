@@ -34,11 +34,12 @@ SCANNER=$HOST/wayland-scanner
 
 # ---------------------------------------------------------------- libffi
 case $ARCH in
-    aarch64) FT=AARCH64; FD=aarch64 ;;
-    riscv64) FT=RISCV;   FD=riscv ;;
+    aarch64) FT=AARCH64; FD=aarch64; ARCH_C="ffi.c"; ARCH_S="sysv.S" ;;
+    riscv64) FT=RISCV;   FD=riscv;   ARCH_C="ffi.c"; ARCH_S="sysv.S" ;;
+    x86_64)  FT=X86_64;  FD=x86;     ARCH_C="ffi64.c ffiw64.c"; ARCH_S="unix64.S win64.S" ;;
     *) echo "arquitetura desconhecida: $ARCH"; exit 1 ;;
 esac
-F=$B/ffi; mkdir -p "$F/obj"
+F=$B/ffi; rm -rf "$F/obj" && mkdir -p "$F/obj"
 sed -e 's/@VERSION@/3.4.6/' -e "s/@TARGET@/$FT/" -e 's/@HAVE_LONG_DOUBLE@/1/' \
     -e 's/@HAVE_LONG_DOUBLE_VARIANT@/0/' -e 's/@FFI_EXEC_TRAMPOLINE_TABLE@/0/' \
     "$TP/libffi/include/ffi.h.in" > "$F/ffi.h"
@@ -48,6 +49,7 @@ cat > "$F/fficonfig.h" <<'EOF'
  * detectaria; trampolins estaticos desligados: closures usam mmap). */
 #define HAVE_ALLOCA_H 1
 #define HAVE_AS_CFI_PSEUDO_OP 1
+#define HAVE_AS_X86_PCREL 1
 #define HAVE_HIDDEN_VISIBILITY_ATTRIBUTE 1
 #define HAVE_INTTYPES_H 1
 #define HAVE_LONG_DOUBLE 1
@@ -77,8 +79,12 @@ FCC="$CC -fPIC -I$F -I$TP/libffi/include -I$TP/libffi/src/$FD -DFFI_STATIC_BUILD
 for s in prep_cif types raw_api java_raw_api closures tramp; do
     $FCC -c "$TP/libffi/src/$s.c" -o "$F/obj/$s.o"
 done
-$FCC -c "$TP/libffi/src/$FD/ffi.c" -o "$F/obj/arch_ffi.o"
-$FCC -c "$TP/libffi/src/$FD/sysv.S" -o "$F/obj/arch_sysv.o"
+for c in $ARCH_C; do
+    $FCC -c "$TP/libffi/src/$FD/$c" -o "$F/obj/arch_${c%.c}.o"
+done
+for s in $ARCH_S; do
+    $FCC -c "$TP/libffi/src/$FD/$s" -o "$F/obj/arch_${s%.S}.o"
+done
 rm -f "$SYSROOT/lib/libffi.a"; $AR rcs "$SYSROOT/lib/libffi.a" "$F"/obj/*.o
 # e a compartilhada (glib/gobject dinamicos), pelo driver do clang: libc.so
 # da musl e o compiler-rt do sysroot (__clear_cache dos trampolins)

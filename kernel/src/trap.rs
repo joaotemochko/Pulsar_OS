@@ -35,7 +35,10 @@ pub fn on_user_fault_sig(frame: *mut Context, what: &str, addr: u64, sig: u32, c
         let lr = unsafe { (*frame).x[30] };
         #[cfg(target_arch = "riscv64")]
         let lr = unsafe { (*frame).x[1] };     // ra
+        #[cfg(target_arch = "x86_64")]
+        let lr = 0u64;
         let _ = write!(Uart, "[falha] pid {} ({}) {} em {:#x} pc={:#x} lr={:#x}\n",
+
             process::current_pid(), process::current_name(), what, addr, pc, lr);
     }
     if signal::fault_signal(sig, code, addr) {

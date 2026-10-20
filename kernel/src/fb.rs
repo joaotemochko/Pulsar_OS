@@ -1,27 +1,24 @@
 //! Regiao grafica compartilhada + primitivas de desenho do kernel (splash).
 //!
-//! Layout (64 MiB a partir de FB_PA; o userspace a ve em FB_UVA):
-//!   +0      back buffer: e o backing do recurso da GPU. O compositor
-//!           desenha aqui e o present faz TRANSFER_TO_HOST do retangulo
-//!           alterado (a copia e um snapshot: nao ha tearing e nao existe
-//!           mais um "front buffer" a ser copiado a cada quadro).
-//!   +8 MiB  wallpaper cacheado (WM)
-//!   +16 MiB wallpaper desfocado (vidro fosco da barra de menus e do dock)
-//!   +24 MiB superficies dos apps: SURF_SLOTS x 4 MiB, stride SURF_W
+//! Layout (176 MiB a partir de FB_PA; o userspace a ve em FB_UVA):
+//!   +0       back buffer: e o backing do recurso da GPU (ate 16 MiB, 2560x1440).
+//!   +16 MiB  wallpaper cacheado (WM)
+//!   +32 MiB  wallpaper desfocado (vidro fosco da barra de menus e do dock)
+//!   +48 MiB  superficies dos apps: SURF_SLOTS x 16 MiB, stride SURF_W
 //! Pixels: u32 0x00RRGGBB (formato B8G8R8X8 do virtio-gpu).
 use crate::arch::platform::{FB_PA, FB_REGION_BYTES, FB_UVA};
 use core::ptr::write_volatile;
 
 pub const BACK_OFFSET: u64 = 0;
-// (+8 MiB e +16 MiB: wallpapers, usados so pelo compositor em userspace)
-pub const SURF_OFFSET: u64 = 24 * 1024 * 1024;
-pub const SURF_SLOT_BYTES: u64 = 4 * 1024 * 1024;
+// (+16 MiB e +32 MiB: wallpapers, usados so pelo compositor em userspace)
+pub const SURF_OFFSET: u64 = 48 * 1024 * 1024;
+pub const SURF_SLOT_BYTES: u64 = 16 * 1024 * 1024;
 pub const SURF_SLOTS: u64 = 8;
-/// Superficie: stride de 1280 px, ate 816 linhas (cabe em 4 MiB).
-pub const SURF_W: u64 = 1280;
-pub const SURF_H: u64 = 816;
-/// Maior tela suportada pelo back buffer de 8 MiB.
-pub const MAX_FB_BYTES: u64 = 8 * 1024 * 1024;
+/// Superficie: stride de 2560 px, ate 1440 linhas (cabe em 16 MiB).
+pub const SURF_W: u64 = 2560;
+pub const SURF_H: u64 = 1440;
+/// Maior tela suportada pelo back buffer de 16 MiB.
+pub const MAX_FB_BYTES: u64 = 16 * 1024 * 1024;
 
 const _: () = assert!(SURF_OFFSET + SURF_SLOTS * SURF_SLOT_BYTES <= FB_REGION_BYTES);
 
@@ -48,13 +45,16 @@ pub fn size() -> (u32, u32) {
 
 fn map_user(off: u64, len: u64) {
     let root = crate::process::current_root();
-    let mut o = off;
-    while o < off + len {
-        unsafe {
-            crate::arch::mmu::map_page_in(root, FB_UVA + o, FB_PA + o,
-                crate::arch::mmu::PageFlags::user_shared());
+    let flags = crate::arch::mmu::PageFlags::user_shared();
+    {
+        let _g = crate::sync::MMU.guard();
+        let mut o = off;
+        while o < off + len {
+            unsafe {
+                crate::arch::mmu::map_page_locked(root, FB_UVA + o, FB_PA + o, flags);
+            }
+            o += 4096;
         }
-        o += 4096;
     }
     crate::arch::mmu::sync_new_pages();
 }

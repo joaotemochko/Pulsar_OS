@@ -35,7 +35,7 @@ pub mod platform {
     /// Endereco da regiao grafica no espaco de usuario (igual ao AArch64,
     /// assim o mesmo binario de userspace funciona nas duas arquiteturas).
     pub const FB_UVA: u64 = 0x4600_0000;
-    pub const FB_REGION_BYTES: u64 = 64 * 1024 * 1024;
+    pub const FB_REGION_BYTES: u64 = 176 * 1024 * 1024;
 
     /// Base virtual da janela de MMIO (VA alto, sinal estendido do bit 38).
     pub const MMIO_VA: u64 = 0xFFFF_FFC0_0000_0000;
