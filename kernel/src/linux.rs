@@ -351,8 +351,29 @@ fn capget(hdrp: u64, datap: u64) -> R {
     if datap != 0 {
         ubuf(datap, 24, true)?;
         for i in 0..2 {
-            put(datap + (i * 12) as u64, [0xFFFF_FFFFu32, 0xFFFF_FFFFu32, 0u32])?;
+            // processo de usuario comum: nenhuma capacidade efetiva ou permitida
+            put(datap + (i * 12) as u64, [0u32, 0u32, 0u32])?;
         }
+    }
+    Ok(0)
+}
+
+/// set*id: aceita so o proprio id (ou -1, "nao mudar").
+fn ids_ok(ids: &[u64]) -> R {
+    for &id in ids {
+        let id = id as u32;
+        if id != u32::MAX && id != USER_ID { return Err(EPERM); }
+    }
+    Ok(0)
+}
+
+/// capset: sem capacidades, so e possivel pedir o conjunto vazio.
+fn capset(datap: u64) -> R {
+    if datap == 0 { return Err(EFAULT); }
+    ubuf(datap, 24, false)?;
+    for i in 0..6u64 {
+        let v = unsafe { core::ptr::read_unaligned((datap + i * 4) as *const u32) };
+        if v != 0 { return Err(EPERM); }
     }
     Ok(0)
 }
@@ -374,8 +395,9 @@ fn prctl(op: u64, a1: u64, _a2: u64, _a3: u64, _a4: u64) -> R {
             unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), a1 as *mut u8, 16); }
             Ok(0)
         }
-        21 => Ok(0), // PR_GET_SECCOMP
-        22 => Ok(0), // PR_SET_SECCOMP
+        // sem seccomp: responder como um Linux com CONFIG_SECCOMP=n, nunca
+        // fingir que o filtro foi instalado
+        21 | 22 => Err(EINVAL), // PR_GET_SECCOMP / PR_SET_SECCOMP
         23 => { // PR_CAPBSET_READ
             if a1 <= 40 { Ok(1) } else { Err(EINVAL) }
         }
@@ -948,7 +970,18 @@ fn kill(frame: *mut Context, nr: u64, a: [u64; 6]) {
     let (target, sig) = match nr { 131 => (a[1], a[2]), _ => (a[0], a[1]) };
     if sig > 64 { ctx.set_ret((-EINVAL) as u64); return; }
     let (tid, me, _) = process::current_ids();
-    let target = if nr == 129 && target == 0 { me as u64 } else { target };  // grupo = o proprio
+    let _ = me;
+    // kill(0, s) e kill(-g, s): todos os processos do grupo
+    if nr == 129 && (target == 0 || ((target as i64) < -1)) {
+        let g = if target == 0 { 0 } else { (-(target as i64)) as usize };
+        let mut pids = [0usize; process::MAX_PROCS];
+        let n = process::group_pids(g, &mut pids);
+        if n == 0 { ctx.set_ret((-ESRCH) as u64); return; }
+        ctx.set_ret(0);
+        if sig == 0 { return; }
+        for &p in &pids[..n] { let _ = crate::signal::send(frame, p, sig as u32, false); }
+        return;
+    }
     if (target as i64) <= 0 { ctx.set_ret((-EPERM) as u64); return; }
     if sig == 0 {
         let alive = target as usize == me || process::is_own_thread(target as usize) || process::is_alive(target as usize);
@@ -1033,7 +1066,7 @@ fn call(frame: *mut Context, nr: u64, a: [u64; 6]) -> R {
             let follow = a[4] & 0x400 != 0;             // AT_SYMLINK_FOLLOW
             file::link(at_dir(a[0])?, old, at_dir(a[2])?, new, follow)
         }
-        39 | 40 | 41 | 51 => Ok(0),                     // umount2 / mount / pivot_root / chroot
+        39 | 40 | 41 | 51 => Err(EPERM),                // umount2 / mount / pivot_root / chroot: exigem privilegio
         48 | 439 => {                                   // faccessat / faccessat2
             let path = cstr(a[1], &mut p1)?;
             let follow = !(nr == 439 && a[3] & AT_SYMLINK_NOFOLLOW != 0);
@@ -1180,13 +1213,28 @@ fn call(frame: *mut Context, nr: u64, a: [u64; 6]) -> R {
             for p in [a[0], a[1], a[2]] { put(p, USER_ID)?; }
             Ok(0)
         }
-        143 | 144 | 145 | 146 | 147 | 149 | 151 | 152 => Ok(0), // setregid/setgid/setreuid/setuid/setresuid/setresgid/setfsuid/setfsgid
+        // set*id: o unico usuario e USER_ID; trocar para outro id exigiria
+        // privilegio, que nenhum processo tem (EPERM, como no Linux)
+        143 | 145 => ids_ok(&[a[0], a[1]]),                 // setregid / setreuid
+        144 | 146 => ids_ok(&[a[0]]),                       // setgid / setuid
+        147 | 149 => ids_ok(&[a[0], a[1], a[2]]),           // setresuid / setresgid
+        151 | 152 => Ok(USER_ID as u64),                    // setfsuid/setfsgid: devolvem o id anterior
         90 => capget(a[0], a[1]),
-        91 => Ok(0),                                    // capset
-        97 => Ok(0),                                    // unshare (isolamento do Firefox)
-        268 => Ok(0),                                   // setns
-        277 => Ok(0),                                   // seccomp
-        154 | 155 | 157 => Ok(process::current_ids().1 as u64), // setpgid/getpgid/setsid
+        91 => capset(a[1]),                             // capset: so pode ficar sem capacidades
+        97 => {                                         // unshare: sem namespaces (CONFIG_NAMESPACES=n)
+            const NS: u64 = 0x0002_0000 | 0x0200_0000 | 0x0400_0000 | 0x0800_0000 | 0x1000_0000
+                | 0x2000_0000 | 0x4000_0000 | 0x0000_0080; // NEWNS|CGROUP|UTS|IPC|USER|PID|NET|TIME
+            const NEWNS: u64 = 0x0002_0000;
+            if a[0] & NS & !NEWNS != 0 { Err(EINVAL) }      // tipo de namespace inexistente
+            else if a[0] & NEWNS != 0 { Err(EPERM) }        // NEWNS existe no Linux, mas exige CAP_SYS_ADMIN
+            else { Ok(0) }                                  // CLONE_FS/FILES/SYSVSEM: nada a separar
+        }
+        268 => Err(EINVAL),                             // setns: nao ha namespaces
+        277 => Err(ENOSYS),                             // seccomp: ausente (CONFIG_SECCOMP=n)
+        154 => process::setpgid(a[0] as usize, a[1] as usize).map(|_| 0), // setpgid
+        155 => process::getpgid(a[0] as usize).map(|g| g as u64),          // getpgid
+        156 => process::getsid(a[0] as usize).map(|g| g as u64),           // getsid
+        157 => process::setsid().map(|g| g as u64),                        // setsid
         167 => prctl(a[0], a[1], a[2], a[3], a[4]),
         213 => Ok(0),                                   // readahead: so uma dica
         141 => Ok(20),                                  // getpriority: nice 0 (o kernel devolve 20 - nice)

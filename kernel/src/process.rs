@@ -87,6 +87,8 @@ pub struct Process {
     pub in_poll: bool,   // entre reexecucoes de poll/select/epoll/pause (sinal -> EINTR)
     pub alarm_every: u64,// intervalo de repeticao (contador)
     pub sig: crate::signal::SigThread, // sinais pendentes/bloqueados desta thread
+    pub pgid: usize,     // grupo de processos (no lider; 0 = o proprio pid)
+    pub sid: usize,      // sessao (no lider; 0 = herdada do kernel: o proprio pid)
     pub name: [u8; NAME_LEN],
 }
 
@@ -97,7 +99,7 @@ impl Process {
             inbox: Message::zero(), reply: Message::zero(), peer: 0, send_to: 0,
             msg_ptr: 0, wake_at: 0, cpu: 0, cpu_time: 0, killed: false, brk: HEAP_BASE,
             leader: 0, mm: 0, members: 0, vfork_parent: IDLE, io_key: 0, io_mask: 0, futex_addr: 0, abi: ABI_PULSAR, parent: usize::MAX,
-            status: 0, wait_pid: 0, wait_ptr: 0, clear_tid: 0, io_deadline: 0, in_poll: false, alarm_at: 0, alarm_every: 0, sig: crate::signal::SigThread::new(),
+            status: 0, wait_pid: 0, wait_ptr: 0, clear_tid: 0, io_deadline: 0, in_poll: false, alarm_at: 0, alarm_every: 0, sig: crate::signal::SigThread::new(), pgid: 0, sid: 0,
             name: [0; NAME_LEN],
         }
     }
@@ -118,6 +120,8 @@ pub fn exit_status(code: u64) -> u32 { ((code & 0xFF) as u32) << 8 }
 /// VA alto (64 GiB), longe do codigo e da regiao grafica, com ate 4 GiB.
 pub const HEAP_BASE: u64 = 0x10_0000_0000;
 pub const HEAP_LIMIT: u64 = HEAP_BASE + 0x1_0000_0000;
+/// Fim atual do heap do espaco `mm` (sem trava: leitura de um u64).
+pub fn heap_end_of(mm: usize) -> u64 { procs()[mm].brk }
 pub const IDLE: usize = usize::MAX;
 
 static mut PROCS: [Process; MAX_PROCS] = [Process::empty(); MAX_PROCS];
@@ -299,6 +303,79 @@ pub fn current_ids() -> (usize, usize, usize) {
     let l = procs()[s].leader;
     let ppid = procs()[l].parent;
     (procs()[s].pid, procs()[l].pid, if ppid == usize::MAX { 0 } else { ppid })
+}
+
+fn pgid_eff(l: usize) -> usize { let p = &procs()[l]; if p.pgid == 0 { p.pid } else { p.pgid } }
+fn sid_eff(l: usize) -> usize { let p = &procs()[l]; if p.sid == 0 { p.pid } else { p.sid } }
+
+/// Lider do processo `pid` (0 = o corrente).
+fn leader_of(pid: usize) -> Option<usize> {
+    let s = cur_slot();
+    if s == IDLE { return None; }
+    if pid == 0 { return Some(procs()[s].leader); }
+    slot_of(pid).map(|t| procs()[t].leader)
+}
+
+/// setpgid(pid, pgid): o proprio processo ou um filho; pgid 0 = o pid alvo.
+pub fn setpgid(pid: usize, pgid: usize) -> Result<(), i64> {
+    let _g = SCHED.guard();
+    let me = leader_of(0).ok_or(3)?;
+    let t = leader_of(pid).ok_or(3)?;                       // ESRCH
+    let ps = procs();
+    if t != me && ps[t].parent != ps[me].pid { return Err(3); }
+    if sid_eff(t) == ps[t].pid && pgid_eff(t) == ps[t].pid && pgid != 0 && pgid != ps[t].pid {
+        return Err(1);                                      // lider de sessao: EPERM
+    }
+    let new = if pgid == 0 { ps[t].pid } else { pgid };
+    // o grupo precisa existir na mesma sessao (ou ser o proprio pid)
+    if new != ps[t].pid {
+        let ok = (0..MAX_PROCS).any(|i| ps[i].leader == i && !matches!(ps[i].state, State::Unused | State::Zombie)
+            && pgid_eff(i) == new && sid_eff(i) == sid_eff(t));
+        if !ok { return Err(1); }
+    }
+    ps[t].pgid = new;
+    Ok(())
+}
+
+pub fn getpgid(pid: usize) -> Result<usize, i64> {
+    let _g = SCHED.guard();
+    let t = leader_of(pid).ok_or(3)?;
+    Ok(pgid_eff(t))
+}
+
+pub fn getsid(pid: usize) -> Result<usize, i64> {
+    let _g = SCHED.guard();
+    let t = leader_of(pid).ok_or(3)?;
+    Ok(sid_eff(t))
+}
+
+/// setsid: falha (EPERM) se o processo ja lidera um grupo.
+pub fn setsid() -> Result<usize, i64> {
+    let _g = SCHED.guard();
+    let me = leader_of(0).ok_or(3)?;
+    let ps = procs();
+    let pid = ps[me].pid;
+    let leads = (0..MAX_PROCS).any(|i| i != me && ps[i].leader == i
+        && !matches!(ps[i].state, State::Unused | State::Zombie) && pgid_eff(i) == pid);
+    if pgid_eff(me) == pid && leads { return Err(1); }
+    ps[me].pgid = pid;
+    ps[me].sid = pid;
+    Ok(pid)
+}
+
+/// pids dos processos vivos do grupo `g` (0 = o grupo do corrente).
+pub fn group_pids(g: usize, out: &mut [usize; MAX_PROCS]) -> usize {
+    let _g = SCHED.guard();
+    let g = if g == 0 { match leader_of(0) { Some(m) => pgid_eff(m), None => return 0 } } else { g };
+    let ps = procs();
+    let mut n = 0;
+    for i in 0..MAX_PROCS {
+        if ps[i].leader == i && !matches!(ps[i].state, State::Unused | State::Zombie) && pgid_eff(i) == g {
+            out[n] = ps[i].pid;
+            n += 1;
+        }
+    }
+    n
 }
 
 /// set_tid_address: guarda o endereco a zerar na saida; retorna o tid.
@@ -678,7 +755,7 @@ fn record_exit(s: usize) {
     let ps = procs();
     let (pid, parent, status) = (ps[s].pid, ps[s].parent, ps[s].status);
 
-    if ps[s].abi == ABI_LINUX {
+    if ps[s].abi == ABI_LINUX && !crate::QUIET_PROC_LOG {
         use core::fmt::Write;
         let _ = write!(crate::uart::Uart, "[linux] '{}' (pid {}) terminou: {}\n", name_str(&ps[s].name), pid,
             if status & 0x7F != 0 { "sinal" } else { "saida" });
@@ -849,9 +926,10 @@ fn drop_mm(s: usize) -> bool {
 
 fn free_mm(m: usize) {
     let ps = procs();
-    if ps[m].root != 0 { arch::mmu::free_user_space(ps[m].root); }
+    if ps[m].root != 0 { arch::mmu::free_user_space(ps[m].root); crate::loader::free_asid(ps[m].asid); }
     crate::vm::release(m);
     ps[m].root = 0;
+    crate::file::reap_orphans();
 }
 
 /// Acorda o pai suspenso por vfork (o filho fez execve ou terminou).
@@ -1218,6 +1296,9 @@ pub unsafe fn fork(frame: *mut Context, new_root: Option<(u64, u16)>, stack: u64
     c.name = ps[l].name;
     c.brk = ps[m].brk;
     c.clear_tid = clear_tid;
+    // fork herda o grupo e a sessao do pai
+    c.pgid = pgid_eff(l);
+    c.sid = sid_eff(l);
     match new_root {
         Some((root, asid)) => {
             c.root = root;

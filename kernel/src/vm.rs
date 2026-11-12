@@ -398,6 +398,11 @@ pub fn fault(addr: u64, access: Access) -> bool {
     let page = addr & !4095;
     let (v, fault_pages) = {
         let _g = VM.guard();
+        // heap do SBRK/brk: fica fora da tabela de VMAs, mas o fork marca as
+        // paginas dele como copy-on-write; sem isto a escrita vira SIGSEGV.
+        if access == Access::Write && page >= process::HEAP_BASE && page < process::heap_end_of(l) {
+            return cow_page(root, asid, page, PageFlags::user_data());
+        }
         let Some(v) = space(l).find(addr) else { return false };
         let ok = match access {
             Access::Read => v.prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0,
@@ -439,7 +444,9 @@ pub fn fault(addr: u64, access: Access) -> bool {
             mmu::sync_new_pages();
             return true;
         }
-        if page < MMAP_BASE || page >= MMAP_END { return false; }
+        // faltas sob demanda valem para qualquer VMA (mmap, pilha e, com a
+        // carga preguicosa do execve, os segmentos do ELF abaixo de MMAP_BASE)
+        if page < 0x1_0000 || page >= MMAP_END { return false; }
         if v.ino == 0 {
             let Some(frame) = frame_allocator::alloc_frame() else { return false };
             unsafe {
@@ -502,6 +509,7 @@ pub fn fault(addr: u64, access: Access) -> bool {
         }
     }
     mmu::sync_new_pages();
+    if cur_v.prot & PROT_EXEC != 0 { crate::loader::sync_icache(); }
     true
 }
 
@@ -582,6 +590,16 @@ pub fn clone_space(src: usize, dst: usize) {
 /// Como add_region, mas por cima do que ja houver na faixa (segmentos de
 /// um ELF que dividem uma pagina). Fora da regiao do mmap tambem vale:
 /// assim mprotect/munmap funcionam nos segmentos carregados pelo kernel.
+/// Como add_region_over, mas a faixa e o arquivo `ino` a partir da pagina
+/// `pgoff` (segmento de um ELF carregado sob demanda).
+pub fn add_file_region_over(l: usize, start: u64, end: u64, prot: u64, ino: u32, pgoff: u64) {
+    let _g = VM.guard();
+    let sp = space(l);
+    if start >= end || !sp.reserve(2) { return; }
+    sp.carve(start, end);
+    sp.add_vma(Vma { start, end, prot, obj: 0, ino, pgoff });
+}
+
 pub fn add_region_over(l: usize, start: u64, end: u64, prot: u64) {
     let _g = VM.guard();
     let sp = space(l);
@@ -598,4 +616,24 @@ pub fn release(l: usize) {
     for v in sp.vmas().iter() { obj_ref(v.obj, -1); }
     if sp.table != 0 { frame_allocator::free_contig(sp.table, sp.pages); }
     *sp = Space::empty();
+}
+
+/// Resolve uma falta de escrita numa pagina copy-on-write ja mapeada.
+fn cow_page(root: u64, asid: u16, page: u64, flags: PageFlags) -> bool {
+    if !mmu::is_mapped(root, page) { return false; }
+    if let Some(pa) = mmu::translate_user(root, page, false) {
+        let frame_pa = pa & !0xFFF;
+        if frame_allocator::ref_count(frame_pa) > 1 {
+            let Some(new_f) = frame_allocator::alloc_frame() else { return false };
+            unsafe {
+                core::ptr::copy_nonoverlapping(frame_pa as *const u8, new_f as *mut u8, 4096);
+                if !mmu::map_page_in(root, page, new_f, flags) { frame_allocator::free_frame(new_f); return false; }
+                frame_allocator::free_frame(frame_pa);
+            }
+            mmu::flush_range(asid, page, page + 4096);
+            return true;
+        }
+    }
+    if mmu::protect_range(root, page, page + 4096, flags) > 0 { mmu::flush_range(asid, page, page + 4096); }
+    true
 }

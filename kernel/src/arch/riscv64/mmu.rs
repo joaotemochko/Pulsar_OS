@@ -179,6 +179,10 @@ pub fn free_user_space(root: u64) {
 pub fn switch_space(root: u64, asid: u16) {
     let satp = SATP_SV39 | ((asid as u64) << 44) | (root >> 12);
     unsafe { asm!("csrw satp, {}", in(reg) satp, options(nostack)) };
+    // ASID 0 compartilhado (espacos sem ASID proprio): invalida nesta hart
+    if asid == 0 && root != kernel_root() {
+        unsafe { asm!("sfence.vma zero, zero", options(nostack)) };
+    }
 }
 
 /// Torna visiveis novas entradas de tabela nesta hart (entradas novas

@@ -82,7 +82,7 @@ static CWD: [AtomicU32; MAX_PROCS] = [const { AtomicU32::new(ext2::ROOT_INO) }; 
 pub const AT_FDCWD: i64 = -100;
 
 /// Inodes sem links mas ainda abertos: liberados no ultimo close.
-static mut ORPHANS: [u32; 32] = [0; 32];
+static mut ORPHANS: [u32; 256] = [0; 256];
 
 fn table(l: usize) -> &'static mut [OpenFile; MAX_FDS] {
     unsafe { &mut (*(&raw mut FDS))[l] }
@@ -95,7 +95,32 @@ fn is_open(ino: u32) -> bool {
 
 fn add_orphan(ino: u32) {
     let o = unsafe { &mut *(&raw mut ORPHANS) };
-    if let Some(s) = o.iter_mut().find(|s| **s == 0) { *s = ino; }
+    if o.contains(&ino) { return; }
+    if let Some(s) = o.iter_mut().find(|s| **s == 0) { *s = ino; return; }
+    // tabela cheia: antes o inode ficava sem links e sem dono para sempre
+    reap_locked();
+    if let Some(s) = o.iter_mut().find(|s| **s == 0) { *s = ino; return; }
+    use core::fmt::Write;
+    let _ = write!(crate::uart::Uart, "[file] tabela de orfaos cheia: inode {} vaza\n", ino);
+}
+
+/// Libera os orfaos que ninguem mais abre nem mapeia (com FS presa).
+fn reap_locked() {
+    let o = unsafe { &mut *(&raw mut ORPHANS) };
+    for s in o.iter_mut() {
+        if *s != 0 && !is_open(*s) {
+            let _ = ext2::release_inode(*s);
+            *s = 0;
+        }
+    }
+}
+
+/// Um espaco de enderecamento acabou: arquivos apagados que so continuavam
+/// vivos por um mmap (inclusive um executavel em uso) podem ser liberados.
+pub fn reap_orphans() {
+    if !crate::fs::is_ext2() { return; }
+    let _g = FS.guard();
+    reap_locked();
 }
 
 /// O descritor saiu: se era o ultimo aberto de um orfao, libera o inode.
@@ -1078,6 +1103,28 @@ pub fn realpath(path: &[u8], out: &mut [u8; ext2::PATH_MAX]) -> Res<usize> {
     need_ext2()?;
     let _g = FS.guard();
     ext2::realpath(path, out)
+}
+
+/// Le so o inicio de um executavel (cabecalhos), para a carga sob demanda.
+/// Retorna (inode, buffer, frames, bytes lidos, tamanho do arquivo).
+pub fn read_head(at: u32, path: &[u8], head: u64) -> Res<(u32, u64, usize, u64, u64)> {
+    need_ext2()?;
+    let _g = FS.guard();
+    let ino = ext2::resolve_at(at, path, true)?;
+    let n = ext2::read_inode(ino)?;
+    if n.is_dir() { return Err(EISDIR); }
+    if n.kind() != ext2::S_IFREG { return Err(EINVAL); }
+    let size = n.size();
+    let len = size.min(head);
+    let frames = (len.div_ceil(4096) + 1) as usize;
+    let buf = crate::frame_allocator::alloc_contig(frames).ok_or(ext2::ENOSPC)?;
+    if len > 0 {
+        if let Err(e) = ext2::read(ino, 0, buf as *mut u8, len as usize) {
+            crate::frame_allocator::free_contig(buf, frames);
+            return Err(e);
+        }
+    }
+    Ok((ino, buf, frames, len, size))
 }
 
 pub fn read_whole(at: u32, path: &[u8], max: u64) -> Res<(u64, usize, u64)> {

@@ -16,11 +16,43 @@ pub struct Loaded {
 static NEXT_ASID: AtomicU32 = AtomicU32::new(0);
 
 pub fn alloc_asid() -> u16 {
-    let a = (NEXT_ASID.fetch_add(1, Ordering::Relaxed) % 255) as u16 + 1;
-    // Em caso de reuso (wrap), garante que nao ha traducoes velhas.
-    mmu::flush_asid(a);
-    a
+    // Bitmap dos ASIDs em uso (1..=255): um ASID so volta ao jogo quando o
+    // espaco que o usava e destruido (free_asid). Antes, um contador modulo
+    // 255 reusava o ASID de processos vivos depois de 255 criacoes.
+    let _g = ASID_LOCK.guard();
+    let start = NEXT_ASID.load(Ordering::Relaxed) as usize;
+    for k in 0..ASID_COUNT {
+        let a = (start + k) % ASID_COUNT + 1;
+        let (w, b) = (a / 64, a % 64);
+        unsafe {
+            if ASID_USED[w] & (1 << b) == 0 {
+                ASID_USED[w] |= 1 << b;
+                NEXT_ASID.store(a as u32, Ordering::Relaxed);
+                mmu::flush_asid(a as u16);
+                return a as u16;
+            }
+        }
+    }
+    // Esgotado (mais espacos vivos que ASIDs): o espaco fica com o ASID 0,
+    // compartilhado e nao marcado; switch_space invalida a TLB local desse
+    // ASID a cada troca, o que e correto para qualquer numero de espacos.
+    0
 }
+
+/// Devolve o ASID de um espaco destruido.
+pub fn free_asid(a: u16) {
+    if a == 0 || a > 255 { return; }
+    let _g = ASID_LOCK.guard();
+    let (w, b) = (a as usize / 64, a as usize % 64);
+    unsafe { ASID_USED[w] &= !(1 << b); }
+    mmu::flush_asid(a);
+}
+
+static mut ASID_USED: [u64; 4] = [0; 4];
+/// ASIDs distribuidos (1..=ASID_COUNT). PULSAR_ASID_TEST reduz para 8 e
+/// forca o caminho de esgotamento nos testes.
+const ASID_COUNT: usize = if option_env!("PULSAR_ASID_TEST").is_some() { 8 } else { 255 };
+static ASID_LOCK: crate::sync::SpinLock = crate::sync::SpinLock::new();
 
 /// Carrega um arquivo .pulse (v2) a partir de um buffer na memoria.
 /// Mapeia os segmentos com W^X e a stack de usuario abaixo de `stack_top`.

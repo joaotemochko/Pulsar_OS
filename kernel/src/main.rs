@@ -166,6 +166,9 @@ fn autorun() {
     frame_allocator::free_contig(buf, frames);
 }
 
+/// Silencia o log de execve/termino (builds de medicao: PULSAR_QUIET=1).
+pub const QUIET_PROC_LOG: bool = option_env!("PULSAR_QUIET").is_some();
+
 fn halt() -> ! {
     loop { arch::wait_for_interrupt(); }
 }

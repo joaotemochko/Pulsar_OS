@@ -79,19 +79,59 @@ struct Image {
 
 /// Faixas (inicio, fim, prot) alinhadas a pagina dos segmentos carregados.
 #[derive(Clone, Copy)]
-pub struct Segs { pub r: [(u64, u64, u64); 24], pub n: usize }
+pub struct Segs { pub r: [(u64, u64, u64, u32, u64); 32], pub n: usize }
 impl Segs {
-    const EMPTY: Segs = Segs { r: [(0, 0, 0); 24], n: 0 };
+    const EMPTY: Segs = Segs { r: [(0, 0, 0, 0, 0); 32], n: 0 };
     fn push(&mut self, va: u64, len: u64, prot: u64) {
         if self.n < self.r.len() {
-            self.r[self.n] = (va & !4095, (va + len + 4095) & !4095, prot);
+            self.r[self.n] = (va & !4095, (va + len + 4095) & !4095, prot, 0, 0);
+            self.n += 1;
+        }
+    }
+    /// Faixa [start, end) (alinhada) lida sob demanda do arquivo `ino`.
+    fn push_file(&mut self, start: u64, end: u64, prot: u64, ino: u32, pgoff: u64) {
+        if self.n < self.r.len() && start < end {
+            self.r[self.n] = (start, end, prot, ino, pgoff);
             self.n += 1;
         }
     }
     /// Registra as faixas como VMAs do slot (com SCHED presa, no setup).
     pub fn register(&self, slot: usize) {
-        for &(a, b, prot) in &self.r[..self.n] { crate::vm::add_region_over(slot, a, b, prot); }
+        for &(a, b, prot, ino, pgoff) in &self.r[..self.n] {
+            if ino != 0 { crate::vm::add_file_region_over(slot, a, b, prot, ino, pgoff); }
+            else { crate::vm::add_region_over(slot, a, b, prot); }
+        }
     }
+}
+
+/// Carga sob demanda dos segmentos (como o Linux faz com mmap do arquivo).
+/// PULSAR_EAGER_EXEC=1 na compilacao volta a ler o executavel inteiro.
+const LAZY_EXEC: bool = option_env!("PULSAR_EAGER_EXEC").is_none();
+/// Bytes lidos do inicio do executavel para os cabecalhos.
+const HEAD: u64 = 64 * 1024;
+
+/// Os cabecalhos permitem a carga sob demanda? (todos os PT_LOAD com
+/// p_offset e p_vaddr congruentes modulo 4096 e sem dividir paginas.)
+fn lazy_ok(head: &[u8], fsize: u64) -> bool {
+    if head.len() < 64 || &head[..4] != b"\x7fELF" { return false; }
+    let phoff = rd64(head, 32) as usize;
+    let (phent, phnum) = (rd16(head, 54) as usize, rd16(head, 56) as usize);
+    if phent != 56 || phoff + phnum * phent > head.len() { return false; }
+    let mut prev_end = 0u64;
+    for i in 0..phnum {
+        let p = &head[phoff + i * phent..phoff + (i + 1) * phent];
+        let t = rd32(p, 0);
+        if t == PT_INTERP {
+            let (off, sz) = (rd64(p, 8) as usize, rd64(p, 32) as usize);
+            if off.saturating_add(sz) > head.len() { return false; }
+        }
+        if t != PT_LOAD || rd64(p, 40) == 0 { continue; }
+        let (off, va, fsz, msz) = (rd64(p, 8), rd64(p, 16), rd64(p, 32), rd64(p, 40));
+        if off % 4096 != va % 4096 || off.saturating_add(fsz) > fsize { return false; }
+        if (va & !4095) < prev_end { return false; }
+        prev_end = (va + msz + 4095) & !4095;
+    }
+    true
 }
 
 /// Base de carga do ligador dinamico (PT_INTERP, ex.: ld-musl).
@@ -135,7 +175,7 @@ fn copy_into(root: u64, va: u64, data: &[u8], prot: u64, mem_len: u64) -> bool {
 
 /// Mapeia os PT_LOAD de `file` em `root` (ET_DYN em `dyn_base`).
 /// Retorna (entrada, AT_PHDR, phnum, faixa do caminho PT_INTERP no arquivo).
-fn map_elf(root: u64, file: &[u8], dyn_base: u64, segs: &mut Segs) -> Res<(u64, u64, u64, Option<(usize, usize)>)> {
+fn map_elf(root: u64, file: &[u8], fsize: u64, lazy: Option<u32>, dyn_base: u64, segs: &mut Segs) -> Res<(u64, u64, u64, Option<(usize, usize)>)> {
     if file.len() < 64 || &file[..4] != b"\x7fELF" || file[4] != 2 || file[5] != 1 {
         return Err(ENOEXEC);
     }
@@ -167,7 +207,7 @@ fn map_elf(root: u64, file: &[u8], dyn_base: u64, segs: &mut Segs) -> Res<(u64, 
         let memsz = rd64(p, 40);
         if memsz == 0 { continue; }
         if va < USER_LO || va.checked_add(memsz).is_none_or(|e| e > USER_HI)
-            || off.checked_add(filesz).is_none_or(|e| e > file.len()) || filesz as u64 > memsz
+            || off.checked_add(filesz).is_none_or(|e| e as u64 > fsize) || filesz as u64 > memsz
         {
             return Err(ENOEXEC);
         }
@@ -175,8 +215,38 @@ fn map_elf(root: u64, file: &[u8], dyn_base: u64, segs: &mut Segs) -> Res<(u64, 
         // p_flags: X=1 W=2 R=4  ->  prot: R=1 W=2 X=4
         let prot = (if flags & 4 != 0 { 1 } else { 0 }) | (if flags & 2 != 0 { 2 } else { 0 })
             | (if flags & 1 != 0 { 4 } else { 0 });
-        if !copy_into(root, va, &file[off..off + filesz], prot, memsz) { return Err(ENOSPC); }
-        segs.push(va, memsz, prot);
+        if let Some(ino) = lazy {
+            // so cabecalhos na memoria: o conteudo vira VMA de arquivo
+            let lo = va & !4095;
+            let fend = va + filesz as u64;
+            let mend = va + memsz;
+            let pgoff = (off as u64 & !4095) / 4096;
+            if memsz > filesz as u64 && fend % 4096 != 0 {
+                // a ultima pagina mistura arquivo e .bss: le agora e zera o resto
+                let part = fend & !4095;
+                segs.push_file(lo, part, prot, ino, pgoff);
+                let Some(f) = frame_allocator::alloc_frame() else { return Err(ENOSPC) };
+                unsafe { core::ptr::write_bytes(f as *mut u8, 0, 4096) };
+                if crate::file::read_ino_pages(ino, off as u64 + (part - va), &[f]).is_err() {
+                    frame_allocator::free_frame(f);
+                    return Err(ENOEXEC);
+                }
+                let keep = (fend - part) as usize;
+                unsafe { core::ptr::write_bytes((f as usize + keep) as *mut u8, 0, 4096 - keep) };
+                if !unsafe { mmu::map_page_in(root, part, f, PageFlags::user_prot(prot)) } {
+                    frame_allocator::free_frame(f);
+                    return Err(ENOSPC);
+                }
+                segs.push(part, mend - part, prot);
+            } else {
+                let fpage = (fend + 4095) & !4095;
+                segs.push_file(lo, fpage, prot, ino, pgoff);
+                if mend > fpage { segs.push(fpage, mend - fpage, prot); }
+            }
+        } else {
+            if !copy_into(root, va, &file[off..off + filesz], prot, memsz) { return Err(ENOSPC); }
+            segs.push(va, memsz, prot);
+        }
     }
     // sem PT_PHDR: os cabecalhos estao no primeiro segmento carregado
     if phdr_va == 0 {
@@ -190,23 +260,37 @@ fn map_elf(root: u64, file: &[u8], dyn_base: u64, segs: &mut Segs) -> Res<(u64, 
 /// Carrega um ELF. Se ele pede um interpretador (PT_INTERP, binario
 /// dinamico), carrega tambem o interpretador, que comeca a execucao e
 /// recebe o programa pelo auxv (AT_BASE, AT_ENTRY, AT_PHDR).
-fn load_elf(file: &[u8]) -> Res<Image> {
+fn load_elf(file: &[u8], fsize: u64, lazy: Option<u32>) -> Res<Image> {
     let root = mmu::create_user_space().ok_or(ENOSPC)?;
     let fail = |e| { mmu::free_user_space(root); Err(e) };
     let mut segs = Segs::EMPTY;
-    let (entry, phdr, phnum, interp) = match map_elf(root, file, PIE_BASE, &mut segs) {
+    let (entry, phdr, phnum, interp) = match map_elf(root, file, fsize, lazy, PIE_BASE, &mut segs) {
         Ok(v) => v,
         Err(e) => return fail(e),
     };
     let mut img = Image { entry, phdr, phnum, root, base: 0, prog_entry: entry, segs: Segs::EMPTY };
     if let Some((a, b)) = interp {
-        let (buf, frames, size) = match crate::file::read_whole(crate::ext2::ROOT_INO, &file[a..b], MAX_IMAGE) {
-            Ok(v) => v,
-            Err(e) => return fail(e),
+        let r = if LAZY_EXEC && lazy.is_some() {
+            let (iino, buf, frames, len, isize) = match crate::file::read_head(crate::ext2::ROOT_INO, &file[a..b], HEAD) {
+                Ok(v) => v,
+                Err(e) => return fail(e),
+            };
+            let ihead = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
+            let r = if lazy_ok(ihead, isize) {
+                map_elf(root, ihead, isize, Some(iino), INTERP_BASE, &mut segs)
+            } else { Err(ENOEXEC) };
+            frame_allocator::free_contig(buf, frames);
+            r
+        } else {
+            let (buf, frames, size) = match crate::file::read_whole(crate::ext2::ROOT_INO, &file[a..b], MAX_IMAGE) {
+                Ok(v) => v,
+                Err(e) => return fail(e),
+            };
+            let ifile = unsafe { core::slice::from_raw_parts(buf as *const u8, size as usize) };
+            let r = map_elf(root, ifile, size, None, INTERP_BASE, &mut segs);
+            frame_allocator::free_contig(buf, frames);
+            r
         };
-        let ifile = unsafe { core::slice::from_raw_parts(buf as *const u8, size as usize) };
-        let r = map_elf(root, ifile, INTERP_BASE, &mut segs);
-        frame_allocator::free_contig(buf, frames);
         match r {
             Ok((ientry, _, _, None)) => { img.entry = ientry; img.base = INTERP_BASE; }
             Ok(_) => return fail(ENOEXEC),          // interpretador que pede outro
@@ -334,9 +418,9 @@ fn load_pulse_linux(file: &[u8]) -> Res<Image> {
 
 /// Carrega qualquer executavel: ELF (ABI Linux), .pulse v3 (ABI Linux,
 /// convertido de um ELF) ou .pulse nativo. Retorna (raiz, entrada, sp, ABI).
-fn load_image(file: &[u8], path: &[u8], args: &Args) -> Res<(u64, u64, u64, u8, Segs)> {
+fn load_image(file: &[u8], fsize: u64, lazy: Option<u32>, path: &[u8], args: &Args) -> Res<(u64, u64, u64, u8, Segs)> {
     let linux = if file.len() >= 4 && &file[..4] == b"\x7fELF" {
-        Some(load_elf(file)?)
+        Some(load_elf(file, fsize, lazy)?)
     } else if file.len() >= 6 && rd16(file, 4) == 3 {
         Some(load_pulse_linux(file)?)
     } else {
@@ -355,13 +439,29 @@ fn load_image(file: &[u8], path: &[u8], args: &Args) -> Res<(u64, u64, u64, u8, 
     }
 }
 
-/// Executa `path` como um novo processo filho do corrente. Retorna o pid.
-pub fn spawn(at: u32, path: &[u8], args: &Args) -> Res<usize> {
+/// Le e carrega `path`: so os cabecalhos quando a carga sob demanda e
+/// possivel, o arquivo inteiro caso contrario (.pulse, ELF fora do padrao).
+fn load_path(at: u32, path: &[u8], args: &Args) -> Res<(u64, u64, u64, u8, Segs)> {
+    if LAZY_EXEC {
+        let (ino, buf, frames, len, size) = crate::file::read_head(at, path, HEAD)?;
+        let head = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
+        if lazy_ok(head, size) {
+            let r = load_image(head, size, Some(ino), path, args);
+            frame_allocator::free_contig(buf, frames);
+            return r;
+        }
+        frame_allocator::free_contig(buf, frames);
+    }
     let (buf, frames, size) = crate::file::read_whole(at, path, MAX_IMAGE)?;
     let file = unsafe { core::slice::from_raw_parts(buf as *const u8, size as usize) };
-    let loaded = load_image(file, path, args);
+    let r = load_image(file, size, None, path, args);
     frame_allocator::free_contig(buf, frames);
-    let (root, entry, sp, abi, segs) = loaded?;
+    r
+}
+
+/// Executa `path` como um novo processo filho do corrente. Retorna o pid.
+pub fn spawn(at: u32, path: &[u8], args: &Args) -> Res<usize> {
+    let (root, entry, sp, abi, segs) = load_path(at, path, args)?;
     // o filho herda o diretorio corrente e os descritores (menos os
     // close-on-exec), como num fork + exec
     let parent = process::current_leader();
@@ -405,12 +505,8 @@ fn canon_exe<'a>(path: &'a [u8], buf: &'a mut [u8; crate::ext2::PATH_MAX]) -> &'
 /// execve(): carrega `path` e troca a imagem do processo corrente. So
 /// retorna em caso de erro (com o processo intacto).
 pub fn execve(frame: *mut crate::arch::Context, at: u32, path: &[u8], args: &Args) -> Res<()> {
-    let (buf, frames, size) = crate::file::read_whole(at, path, MAX_IMAGE)?;
-    let file = unsafe { core::slice::from_raw_parts(buf as *const u8, size as usize) };
     let name = basename(path);
-    let loaded = load_image(file, path, args);
-    frame_allocator::free_contig(buf, frames);
-    let (root, entry, sp, abi, segs) = loaded?;
+    let (root, entry, sp, abi, segs) = load_path(at, path, args)?;
     let mut cbuf = [0u8; crate::ext2::PATH_MAX];
     let exe = canon_exe(path, &mut cbuf);
     let asid = crate::loader::alloc_asid();
@@ -428,6 +524,6 @@ pub fn execve(frame: *mut crate::arch::Context, at: u32, path: &[u8], args: &Arg
         mmu::free_user_space(root);
         return Err(EAGAIN);
     }
-    let _ = write!(Uart, "[exec] execve '{}' (pid {})\n", core::str::from_utf8(path).unwrap_or("?"), process::current_pid());
+    if !crate::QUIET_PROC_LOG { let _ = write!(Uart, "[exec] execve '{}' (pid {})\n", core::str::from_utf8(path).unwrap_or("?"), process::current_pid()); }
     Ok(())
 }

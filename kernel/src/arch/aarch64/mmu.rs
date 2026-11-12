@@ -341,6 +341,12 @@ pub fn switch_space(l0_pa: u64, asid: u16) {
         asm!("msr ttbr0_el1, {v}", "isb",
             v = in(reg) (l0_pa | ((asid as u64) << 48)),
             options(nostack, preserves_flags));
+        // ASID 0 e compartilhado pelos espacos que ficaram sem ASID proprio:
+        // as entradas do espaco anterior nesta CPU nao podem ser reusadas
+        if asid == 0 && l0_pa != kernel_root() {
+            asm!("dsb nshst", "tlbi aside1, {v}", "dsb nsh", "isb",
+                v = in(reg) 0u64, options(nostack, preserves_flags));
+        }
     }
 }
 
