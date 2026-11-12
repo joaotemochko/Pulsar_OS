@@ -1,0 +1,8 @@
+/bin/posixtest primeiro
+/bin/spawntest
+/bin/sigtest
+/bin/iotest semrede
+/bin/unixtest arg1
+/bin/oopstest
+/bin/stubtest
+/bin/forkloop 300

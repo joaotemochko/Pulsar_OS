@@ -1,0 +1,1 @@
+/bin/lbench 1 pingpong_pipe,pingpong_unix,mmap_touch_munmap,page_fault,thread_create_join

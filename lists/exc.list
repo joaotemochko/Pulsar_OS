@@ -1,0 +1,2 @@
+/bin/execsz
+/bin/lbench 1 fork_exit_wait,fork_exec_wait

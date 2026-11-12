@@ -1,0 +1,1 @@
+/bin/lbench 1 fork_exit_wait,fork_exec_wait,file_rw_1MiB

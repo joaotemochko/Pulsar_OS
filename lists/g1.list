@@ -1,0 +1,1 @@
+/bin/lbench 1 getppid,clock_gettime,read_dev_zero,write_dev_null,stat,open_close,pipe_rw_1B,mutex_uncontended

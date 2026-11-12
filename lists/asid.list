@@ -1,0 +1,5 @@
+/bin/asidtest 40 100
+/bin/forkloop 600
+/bin/posixtest primeiro
+/bin/spawntest
+/bin/sigtest
