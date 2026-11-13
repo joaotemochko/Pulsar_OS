@@ -229,11 +229,14 @@ pub fn user_ok(ptr: u64, len: u64, write: bool) -> bool {
     let access = if write { crate::vm::Access::Write } else { crate::vm::Access::Read };
     while va < end {
         // paginas de mmap ainda nao tocadas sao criadas aqui, como no fault
-        if arch::mmu::translate_user(root, va, write).is_none()
-            && !(crate::vm::fault(va, access) && arch::mmu::translate_user(root, va, write).is_some())
-        {
-            return false;
+        // com SMP, um fork de outra thread pode tornar a pagina copy-on-write
+        // de novo entre a falta resolvida e a conferencia: tenta outra vez
+        let mut ok = false;
+        for _ in 0..16 {
+            if arch::mmu::translate_user(root, va, write).is_some() { ok = true; break; }
+            if !crate::vm::fault(va, access) { break; }
         }
+        if !ok { return false; }
         va += 4096;
     }
     true

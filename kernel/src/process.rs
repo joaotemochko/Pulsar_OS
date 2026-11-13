@@ -132,7 +132,7 @@ static mut CUR_ABI: [u8; MAX_CPUS] = [ABI_PULSAR; MAX_CPUS];
 
 /// Processos terminados que ainda nao foram colhidos por wait():
 /// (pid, pid do pai, status). Os mais antigos sao descartados.
-const EXITS_MAX: usize = 64;
+const EXITS_MAX: usize = 256;
 static mut EXITS: [(usize, usize, u32); EXITS_MAX] = [(usize::MAX, 0, 0); EXITS_MAX];
 static mut EXITS_NEXT: usize = 0;
 static mut RR_NEXT: usize = 0;
@@ -766,7 +766,20 @@ fn record_exit(s: usize) {
         if p.state == State::WaitChild && p.pid != pid && procs_pid_of_leader(p) == parent
             && (p.wait_pid == -1 || p.wait_pid == pid as i64)
         {
-            if p.wait_ptr == WAIT_REDO {
+            // wait4 com status numa pagina que outra thread acabou de tornar
+            // copy-on-write (fork): antes o pid voltava e o status se perdia.
+            // Agora o waiter roda a syscall de novo e colhe o registro abaixo
+            // no proprio contexto, onde a falta de COW e resolvida.
+            // resolve a copia no espaco do waiter e grava daqui mesmo; so se
+            // ainda assim nao der, o waiter roda a syscall de novo
+            let mut cow = false;
+            if p.wait_ptr != 0 && p.wait_ptr != WAIT_REDO
+                && arch::mmu::translate_user(p.root, p.wait_ptr, true).is_none()
+            {
+                let _ = crate::vm::fault_in(p.mm, p.root, p.asid, p.wait_ptr, crate::vm::Access::Write);
+                cow = arch::mmu::translate_user(p.root, p.wait_ptr, true).is_none();
+            }
+            if p.wait_ptr == WAIT_REDO || cow {
                 // waitid: roda de novo e acha o registro abaixo (talvez sem colher)
                 p.ctx.rewind_syscall();
                 p.state = State::Ready;

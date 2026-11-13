@@ -12,6 +12,22 @@ pub fn install_vectors() {
     }
 }
 
+/// Falta do kernel ao copiar de/para memoria de usuario. Com SMP, outro
+/// nucleo pode ter marcado a pagina copy-on-write (fork) entre a validacao do
+/// ponteiro e a copia. Resolve pela via normal de faltas e repete a instrucao;
+/// so quando nenhuma trava de memoria esta presa nesta CPU (senao seria um
+/// auto-deadlock) e quando o endereco e de usuario.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_el1_user_fault(esr: u64, far: u64) -> u64 {
+    let ec = (esr >> 26) & 0x3F;
+    let dfsc = esr & 0x3F;
+    if ec != 0x25 { return 0; }
+    // so faltas de traducao (0x04..0x07) ou de permissao (0x0D..0x0F)
+    if !((0x04..=0x07).contains(&dfsc) || (0x0D..=0x0F).contains(&dfsc)) { return 0; }
+    let write = (esr >> 6) & 1 == 1;
+    if crate::vm::kernel_user_fault(far, write) { 1 } else { 0 }
+}
+
 /// Excecao que o kernel nao sabe tratar (bug em EL1): reporta e trata como
 /// oops (ver o panic handler).
 #[unsafe(no_mangle)]

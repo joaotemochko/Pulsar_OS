@@ -31,6 +31,12 @@ pub extern "C" fn rust_trap(frame: *mut Context) {
     }
 
     if !from_user {
+        // Falta de pagina do kernel em memoria de usuario (com SUM): pode ser
+        // uma pagina que outro hart acabou de tornar copy-on-write. Resolve e
+        // volta com sret, que repete a instrucao.
+        if (scause == 13 || scause == 15) && crate::vm::kernel_user_fault(stval, scause == 15) {
+            return;
+        }
         // Excecao dentro do kernel: bug.
         let mut serial = crate::uart::RawUart;
         use core::fmt::Write;

@@ -67,6 +67,11 @@
     b       el0_sync_entry
 .endm
 
+.macro VEC_EL1_SYNC
+.balign 0x80
+    b       el1_sync_entry
+.endm
+
 .macro VEC_IRQ
 .balign 0x80
     b       irq_entry
@@ -79,7 +84,7 @@ vector_table:
     VEC_UNHANDLED 1    /* 0x080  EL atual SP0,  IRQ      */
     VEC_UNHANDLED 2    /* 0x100  EL atual SP0,  FIQ      */
     VEC_UNHANDLED 3    /* 0x180  EL atual SP0,  SError   */
-    VEC_UNHANDLED 4    /* 0x200  EL atual SPx,  Sincrona */
+    VEC_EL1_SYNC       /* 0x200  EL atual SPx,  Sincrona <- falta do kernel em memoria de usuario */
     VEC_IRQ            /* 0x280  EL atual SPx,  IRQ      <- timer enquanto kernel roda */
     VEC_UNHANDLED 6    /* 0x300  EL atual SPx,  FIQ      */
     VEC_UNHANDLED 7    /* 0x380  EL atual SPx,  SError   */
@@ -103,6 +108,24 @@ unhandled_entry:
     bl      rust_exception_dispatch
 1:  wfe
     b       1b
+
+/* Falta sincrona em EL1. Se for um acesso do kernel a memoria de usuario
+   que outro nucleo tornou copy-on-write (ou ainda nao materializou), a falta
+   e resolvida e a instrucao repetida; senao vira oops como antes. */
+el1_sync_entry:
+    SAVE_CONTEXT
+    mrs     x0, esr_el1
+    mrs     x1, far_el1
+    bl      rust_el1_user_fault
+    cbz     x0, 2f
+    RESTORE_CONTEXT
+    eret
+2:  mov     x0, #4
+    mrs     x1, esr_el1
+    mrs     x2, elr_el1
+    bl      rust_exception_dispatch
+3:  wfe
+    b       3b
 
 /* Syscall / fault de EL0. */
 el0_sync_entry:

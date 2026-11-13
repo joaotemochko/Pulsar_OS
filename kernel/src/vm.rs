@@ -395,6 +395,12 @@ pub fn mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u64) -> i64 {
 /// o acesso, aloca a pagina e retorna true. False = acesso invalido.
 pub fn fault(addr: u64, access: Access) -> bool {
     let Some((l, root, asid)) = process::current_space() else { return false };
+    fault_in(l, root, asid, addr, access)
+}
+
+/// Resolve uma falta no espaco `l` (que pode nao ser o corrente): usado pelo
+/// exit para gravar o status de um wait4 numa pagina copy-on-write do pai.
+pub fn fault_in(l: usize, root: u64, asid: u16, addr: u64, access: Access) -> bool {
     let page = addr & !4095;
     let (v, fault_pages) = {
         let _g = VM.guard();
@@ -511,6 +517,19 @@ pub fn fault(addr: u64, access: Access) -> bool {
     mmu::sync_new_pages();
     if cur_v.prot & PROT_EXEC != 0 { crate::loader::sync_icache(); }
     true
+}
+
+/// Falta do kernel ao acessar memoria de usuario (AArch64 e RISC-V). Com SMP,
+/// outro nucleo pode ter tornado a pagina copy-on-write (fork) entre a
+/// validacao do ponteiro e a copia. Resolve pela via normal e deixa a
+/// instrucao ser repetida; recusa se esta CPU segura uma trava de memoria
+/// (seria um auto-deadlock) ou se o endereco nao e de usuario.
+pub fn kernel_user_fault(addr: u64, write: bool) -> bool {
+    if addr < 0x1_0000 || addr >= MMAP_END { return false; }
+    if crate::sync::held_here(&[&VM, &crate::shm::SHM, &crate::frame_allocator::FRAME, &crate::sync::MMU]) {
+        return false;
+    }
+    fault(addr, if write { Access::Write } else { Access::Read })
 }
 
 /// Ha alguma VMA mapeando o inode `ino`? (Usado em unlink/rename para nao

@@ -41,6 +41,15 @@ pub fn force_release_all() -> usize {
     }
 }
 
+/// Esta CPU segura alguma destas travas?
+pub fn held_here(locks: &[&SpinLock]) -> bool {
+    let c = crate::arch::cpu_id();
+    unsafe {
+        let n = NHELD[c].min(MAX_HELD);
+        locks.iter().any(|l| HELD[c][..n].contains(&(*l as *const SpinLock as usize)))
+    }
+}
+
 pub struct SpinLock {
     locked: AtomicBool,
 }

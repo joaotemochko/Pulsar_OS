@@ -4,7 +4,7 @@
 use crate::arch::platform::{FB_PA, FB_REGION_BYTES, HEAP_SIZE, HEAP_START};
 use crate::sync::SpinLock;
 
-static FRAME: SpinLock = SpinLock::new();
+pub static FRAME: SpinLock = SpinLock::new();
 
 const PAGE_SIZE: u64 = 4096;
 const NUM_FRAMES: usize = (HEAP_SIZE / PAGE_SIZE) as usize;
