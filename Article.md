@@ -1,7 +1,6 @@
 # Reproducing the experiments of the article
 
 ## Contents
-- `pulsar-kernel-fixes.patch`: every kernel change evaluated in the article (security stubs, process groups and sessions, demand paging in `execve`, copy-on-write for the `brk` heap, ASID allocator, orphan-inode reclamation, UART log switch). Apply it with `git apply` at the root of the Pulsar tree.
 - `src/`: test and benchmark programs (static, musl).
 - `scripts/`: disk image creation, QEMU runs, measurement campaigns and classifiers.
 - `lists/`: run lists and the LTP selection (80 directories, 490 test cases).
@@ -12,7 +11,7 @@
 export PULSAR_DIR=/path/to/Pulsar_OS      # tree with the patch applied
 export BENCH_DIR=/path/to/this/package
 export LINUX_IMAGE=/path/to/linux/arch/arm64/boot/Image
-export LTP_DIR=/path/to/ltp               # LTP commit e74f6d6
+export LTP_DIR=/path/to/ltp
 export LTP_BIN=$BENCH_DIR/ltp_bin
 ```
 
